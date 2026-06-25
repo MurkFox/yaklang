@@ -16,16 +16,13 @@ import (
 	uuid "github.com/google/uuid"
 	"github.com/jinzhu/gorm"
 	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 )
 
 //go:embed templates/portal.html templates/login.html templates/index.html templates/ops_portal.html templates/static/*
 var templatesFS embed.FS
 
-// ==================== Helper Functions ====================
-
-// formatBytes converts bytes to human-readable format (KB, MB, GB, etc.)
+// formatBytes 把字节数转换为人类可读的格式 (KB, MB, GB, etc.)
 func formatBytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
@@ -111,6 +108,13 @@ type ModelInfo struct {
 
 // ==================== Session Management ====================
 
+// SessionLifetime 是 admin / OPS 登录 session 的有效时长。
+// 创建和续期都会把 ExpiresAt 顺延 SessionLifetime。
+// 前端只要页面开着，会按 RefreshSessionEndpoint 定时调用后端续期，
+// 因此用户感觉不到登出，只有完全关闭页面后才会自然过期。
+// 关键词: SessionLifetime session expire 续期 默认 30 分钟
+const SessionLifetime = 30 * time.Minute
+
 // Session represents a user session (application level, not DB schema)
 type Session struct {
 	ID        string
@@ -135,9 +139,9 @@ func (sm *SessionManager) CreateSession() string {
 // CreateSessionWithRole creates a new session with user role information
 func (sm *SessionManager) CreateSessionWithRole(userID uint, username, role string) string {
 	sessionID := uuid.New().String()
-	expiresAt := time.Now().Add(30 * time.Minute) // 30 minutes expiration
+	expiresAt := time.Now().Add(SessionLifetime)
 
-	dbSession := schema.LoginSession{
+	dbSession := LoginSession{
 		SessionID: sessionID,
 		ExpiresAt: expiresAt,
 		UserID:    userID,
@@ -157,7 +161,7 @@ func (sm *SessionManager) CreateSessionWithRole(userID uint, username, role stri
 
 // GetSession retrieves a session from the database and checks its validity
 func (sm *SessionManager) GetSession(sessionID string) *Session {
-	var dbSession schema.LoginSession
+	var dbSession LoginSession
 	err := GetDB().Where("session_id = ?", sessionID).First(&dbSession).Error
 	if err != nil {
 		if err != gorm.ErrRecordNotFound {
@@ -181,10 +185,59 @@ func (sm *SessionManager) GetSession(sessionID string) *Session {
 	}
 }
 
+// RefreshSession 把已存在且尚未过期的 session 的 ExpiresAt 顺延到
+// now + SessionLifetime。前端会按 10 分钟左右一次定时调用对应的
+// /portal/api/session/refresh 或 /ops/api/session/refresh 接口，
+// 只要页面开着就不会触发过期。
+//
+// 行为约定：
+//   - sessionID 为空或在数据库找不到，返回 nil。
+//   - session 已过期（DB 里 expires_at < now），同样返回 nil，
+//     并异步删除残留行，避免被反复续到一个本应失效的 session 上。
+//   - 续期成功返回更新后的 Session 视图。
+//
+// 关键词: RefreshSession session 续期 keep alive 自动续 token
+func (sm *SessionManager) RefreshSession(sessionID string) *Session {
+	if sessionID == "" {
+		return nil
+	}
+	var dbSession LoginSession
+	err := GetDB().Where("session_id = ?", sessionID).First(&dbSession).Error
+	if err != nil {
+		if err != gorm.ErrRecordNotFound {
+			log.Errorf("Error retrieving session %s for refresh: %v", sessionID, err)
+		}
+		return nil
+	}
+
+	if time.Now().After(dbSession.ExpiresAt) {
+		log.Infof("Session %s already expired at %s, refusing refresh",
+			sessionID, dbSession.ExpiresAt.Format(time.RFC3339))
+		go sm.DeleteSession(sessionID)
+		return nil
+	}
+
+	newExpiry := time.Now().Add(SessionLifetime)
+	if err := GetDB().Model(&LoginSession{}).
+		Where("session_id = ?", sessionID).
+		Update("expires_at", newExpiry).Error; err != nil {
+		log.Errorf("Failed to refresh session %s: %v", sessionID, err)
+		return nil
+	}
+
+	log.Debugf("Refreshed session %s, new expires_at: %s",
+		sessionID, newExpiry.Format(time.RFC3339))
+	return &Session{
+		ID:        dbSession.SessionID,
+		CreatedAt: dbSession.CreatedAt,
+		ExpiresAt: newExpiry,
+	}
+}
+
 // DeleteSession removes a session from the database
 func (sm *SessionManager) DeleteSession(sessionID string) {
 	log.Infof("Deleting session %s from database", sessionID)
-	result := GetDB().Where("session_id = ?", sessionID).Delete(&schema.LoginSession{})
+	result := GetDB().Where("session_id = ?", sessionID).Delete(&LoginSession{})
 	if result.Error != nil {
 		log.Errorf("Failed to delete session %s from database: %v", sessionID, result.Error)
 	} else if result.RowsAffected == 0 {
@@ -198,7 +251,7 @@ func (sm *SessionManager) DeleteSession(sessionID string) {
 func (sm *SessionManager) CleanupExpiredSessions() {
 	log.Infof("Running cleanup for expired sessions...")
 	now := time.Now()
-	result := GetDB().Where("expires_at < ?", now).Delete(&schema.LoginSession{})
+	result := GetDB().Where("expires_at < ?", now).Delete(&LoginSession{})
 	if result.Error != nil {
 		log.Errorf("Error cleaning up expired sessions: %v", result.Error)
 	} else if result.RowsAffected > 0 {
@@ -385,11 +438,64 @@ func (c *ServerConfig) processLogin(conn net.Conn, request *http.Request) {
 
 	session := c.SessionManager.CreateSession()
 
+	// Clear any stale ops_session cookie so the next request resolves
+	// to this fresh admin session unambiguously.
 	header := "HTTP/1.1 303 See Other\r\n" +
 		"Location: /portal\r\n" +
 		"Set-Cookie: admin_session=" + session + "; Path=/; HttpOnly; SameSite=Strict\r\n" +
+		"Set-Cookie: ops_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n" +
 		"\r\n"
 	conn.Write([]byte(header))
+}
+
+// handleSessionRefresh 提供给前端定时调用以续期当前 session。
+//
+// 工作流程：
+//  1. 复用 getAuthInfo 解析当前 cookie，拿到 SessionID。
+//  2. 调 SessionManager.RefreshSession 把 ExpiresAt 顺延 SessionLifetime。
+//  3. 返回新的过期时间，方便前端做就地展示或 debug。
+//
+// 设计要点：
+//   - 该接口同时服务于 /portal/api/session/refresh（admin）和
+//     /ops/api/session/refresh（OPS）。两者都已被 AuthMiddleware 的
+//     通配规则覆盖，无需额外配置。
+//   - 如果不是基于 cookie 的会话（比如 OPS 通过 X-Ops-Key header
+//     访问 API），SessionID 为空，这种情况下没有 cookie session 可续，
+//     直接返回 refreshed=false 即可，不需要报错。
+//
+// 关键词: handleSessionRefresh 续期接口 keep alive
+func (c *ServerConfig) handleSessionRefresh(conn net.Conn, request *http.Request) {
+	authInfo := c.getAuthInfo(request)
+	if authInfo == nil || !authInfo.Authenticated {
+		c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]string{
+			"error": "Unauthorized",
+		})
+		return
+	}
+	if authInfo.SessionID == "" {
+		c.writeJSONResponse(conn, http.StatusOK, map[string]interface{}{
+			"success":   true,
+			"refreshed": false,
+			"message":   "no cookie session to refresh",
+		})
+		return
+	}
+
+	sess := c.SessionManager.RefreshSession(authInfo.SessionID)
+	if sess == nil {
+		c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]string{
+			"error": "Session expired",
+		})
+		return
+	}
+
+	c.writeJSONResponse(conn, http.StatusOK, map[string]interface{}{
+		"success":            true,
+		"refreshed":          true,
+		"expires_at":         sess.ExpiresAt.Format(time.RFC3339),
+		"expires_in_seconds": int64(time.Until(sess.ExpiresAt).Seconds()),
+		"lifetime_seconds":   int64(SessionLifetime / time.Second),
+	})
 }
 
 // handleLogout handles logout requests
@@ -402,9 +508,11 @@ func (c *ServerConfig) handleLogout(conn net.Conn, request *http.Request) {
 		}
 	}
 
+	// Also clear ops_session to prevent cross-role residue.
 	header := "HTTP/1.1 303 See Other\r\n" +
 		"Location: /portal\r\n" +
 		"Set-Cookie: admin_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n" +
+		"Set-Cookie: ops_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n" +
 		"\r\n"
 	conn.Write([]byte(header))
 }
@@ -509,6 +617,12 @@ func (c *ServerConfig) HandlePortalRequest(conn net.Conn, request *http.Request,
 
 	// ========== Public Routes (No Auth Required) ==========
 
+	// Serve login page (GET) without authentication
+	if uriIns.Path == "/portal/login" && request.Method == "GET" {
+		c.serveLoginPage(conn)
+		return
+	}
+
 	// Process login POST request
 	if uriIns.Path == "/portal/login" && request.Method == "POST" {
 		c.processLogin(conn, request)
@@ -530,10 +644,19 @@ func (c *ServerConfig) HandlePortalRequest(conn net.Conn, request *http.Request,
 		c.logDebug("Auth: user=%s, role=%s, path=%s", authInfo.Username, authInfo.Role, uriIns.Path)
 	}
 
-	// If not authenticated, redirect to login page
+	// If not authenticated, serve login page only for known page paths (GET),
+	// return 401 JSON for everything else (API endpoints, mutations, etc.)
 	if !authInfo.Authenticated {
-		c.logInfo("Unauthenticated request to %s, redirecting to login", uriIns.Path)
-		c.serveLoginPage(conn)
+		isPagePath := (request.Method == "GET" || request.Method == "HEAD") && isPortalPagePath(uriIns.Path)
+		if isPagePath {
+			c.logInfo("Unauthenticated page request to %s, serving login page", uriIns.Path)
+			c.serveLoginPage(conn)
+			return
+		}
+		c.logWarn("Unauthenticated request blocked: %s %s, returning 401", request.Method, uriIns.Path)
+		c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]string{
+			"error": "Unauthorized",
+		})
 		return
 	}
 
@@ -601,6 +724,13 @@ func (c *ServerConfig) HandlePortalRequest(conn net.Conn, request *http.Request,
 	case strings.HasPrefix(uriIns.Path, "/portal/check-health/") && request.Method == "POST":
 		c.handleCheckSingleHealth(conn, request, uriIns.Path)
 
+	// ========== Tool Calls Capability Probe Routes ==========
+	// 关键词: portal probe-tool-calls 路由, 手动触发工具调用能力探测
+	case strings.HasPrefix(uriIns.Path, "/portal/probe-tool-calls/") && request.Method == "POST":
+		c.handleProbeToolCallsSingle(conn, request, uriIns.Path)
+	case uriIns.Path == "/portal/probe-tool-calls-all" && request.Method == "POST":
+		c.handleProbeToolCallsAll(conn, request)
+
 	// ========== API Key Routes ==========
 	case uriIns.Path == "/portal/api-keys":
 		c.serveAPIKeysPage(conn)
@@ -628,6 +758,16 @@ func (c *ServerConfig) HandlePortalRequest(conn net.Conn, request *http.Request,
 		c.handleUpdateAPIKeyTrafficLimit(conn, request, uriIns.Path)
 	case strings.HasPrefix(uriIns.Path, "/portal/reset-api-key-traffic/") && request.Method == "POST":
 		c.handleResetAPIKeyTraffic(conn, request, uriIns.Path)
+	// API Key Token-dimension limit (推荐使用 Token 维度限额, 与流量限制并行)
+	// 关键词: portal api-key-token-limit reset-api-key-token 路由注册
+	case strings.HasPrefix(uriIns.Path, "/portal/api-key-token-limit/") && request.Method == "POST":
+		c.handleUpdateAPIKeyTokenLimit(conn, request, uriIns.Path)
+	case strings.HasPrefix(uriIns.Path, "/portal/reset-api-key-token/") && request.Method == "POST":
+		c.handleResetAPIKeyToken(conn, request, uriIns.Path)
+	// API Key 绑定用户信息（用户名/备注/metainfo）更新
+	// 关键词: portal api-key-meta 路由注册, Username Remark MetaInfo
+	case strings.HasPrefix(uriIns.Path, "/portal/api-key-meta/") && request.Method == "POST":
+		c.handleUpdateAPIKeyMeta(conn, request, uriIns.Path)
 
 	// ========== Web Search API Key Routes ==========
 	case uriIns.Path == "/portal/api/web-search-keys" && request.Method == "GET":
@@ -675,6 +815,18 @@ func (c *ServerConfig) HandlePortalRequest(conn net.Conn, request *http.Request,
 	case uriIns.Path == "/portal/update-model-meta" && request.Method == "POST":
 		c.handleUpdateModelMeta(conn, request)
 
+	// ========== Model Multiplier (实际模型计费 + 批量应用) Routes ==========
+	case uriIns.Path == "/portal/update-model-multiplier" && request.Method == "POST":
+		c.handleUpdateModelMultiplier(conn, request)
+	case uriIns.Path == "/portal/delete-model-multiplier" && request.Method == "POST":
+		c.handleDeleteModelMultiplier(conn, request)
+	case uriIns.Path == "/portal/set-global-default-multiplier" && request.Method == "POST":
+		c.handleSetGlobalDefaultMultiplier(conn, request)
+	case uriIns.Path == "/portal/apply-model-multiplier-by-pattern" && request.Method == "POST":
+		c.handleApplyModelMultiplierByPattern(conn, request)
+	case uriIns.Path == "/portal/apply-model-multiplier-to-models" && request.Method == "POST":
+		c.handleApplyModelMultiplierToModels(conn, request)
+
 	// ========== TOTP Routes ==========
 	case uriIns.Path == "/portal/totp-settings":
 		c.serveTOTPSettingsPage(conn)
@@ -682,6 +834,29 @@ func (c *ServerConfig) HandlePortalRequest(conn net.Conn, request *http.Request,
 		c.handleRefreshTOTP(conn, request)
 	case uriIns.Path == "/portal/get-totp-code":
 		c.handleGetTOTPCode(conn, request)
+
+	// ========== Rate Limit Config Routes ==========
+	case uriIns.Path == "/portal/api/rate-limit-config" && request.Method == "GET":
+		c.handleGetRateLimitConfig(conn, request)
+	case uriIns.Path == "/portal/api/rate-limit-config" && request.Method == "POST":
+		c.handleSetRateLimitConfig(conn, request)
+	case uriIns.Path == "/portal/api/rate-limit-status" && request.Method == "GET":
+		c.handleGetRateLimitStatus(conn, request)
+	case uriIns.Path == "/portal/api/rate-limit-model-stats" && request.Method == "GET":
+		c.handleGetRateLimitModelStats(conn, request)
+	// 一键限流 IP / 解除限流接口
+	// 关键词: portal /portal/api/throttle-ip /portal/api/unthrottle-ip 路由注册
+	case uriIns.Path == "/portal/api/throttle-ip" && request.Method == "POST":
+		c.handleThrottleIP(conn, request)
+	case uriIns.Path == "/portal/api/unthrottle-ip" && request.Method == "POST":
+		c.handleUnthrottleIP(conn, request)
+	// memfit-* 客户端版本统计接口
+	// 关键词: portal /portal/api/client-version-stats 路由注册
+	case uriIns.Path == "/portal/api/client-version-stats" && request.Method == "GET":
+		c.handleGetClientVersionStats(conn, request)
+	// 关键词: portal /portal/api/client-version-stats/clear 清空记录路由
+	case uriIns.Path == "/portal/api/client-version-stats/clear" && request.Method == "POST":
+		c.handleClearClientVersionStats(conn, request)
 
 	// ========== Portal Data API Routes ==========
 	case uriIns.Path == "/portal/api/data":
@@ -700,6 +875,8 @@ func (c *ServerConfig) HandlePortalRequest(conn net.Conn, request *http.Request,
 	// ========== Session Routes ==========
 	case uriIns.Path == "/portal/logout":
 		c.handleLogout(conn, request)
+	case uriIns.Path == "/portal/api/session/refresh" && request.Method == "POST":
+		c.handleSessionRefresh(conn, request)
 
 	// ========== OPS User Management Routes (Admin Only) ==========
 	case uriIns.Path == "/portal/api/ops-users" && request.Method == "GET":
@@ -720,6 +897,35 @@ func (c *ServerConfig) HandlePortalRequest(conn net.Conn, request *http.Request,
 		c.handleGetOpsLogs(conn, request)
 	case uriIns.Path == "/portal/api/ops-stats" && request.Method == "GET":
 		c.handleGetOpsStats(conn, request)
+
+	// ========== Mirror Rules Routes (Admin Only) ==========
+	// 关键词: portal mirror rules 路由注册, AiMirrorRule HTTP API
+	// _meta 必须放在 {id} 这种泛匹配之前, 避免被 PUT/DELETE 的 prefix 抢走.
+	case uriIns.Path == "/portal/api/mirror-rules/_meta" && request.Method == "GET":
+		c.handleGetMirrorMeta(conn, request)
+	case uriIns.Path == "/portal/api/mirror-rules" && request.Method == "GET":
+		c.handleListMirrorRules(conn, request)
+	case uriIns.Path == "/portal/api/mirror-rules" && request.Method == "POST":
+		c.handleCreateMirrorRule(conn, request)
+	case strings.HasPrefix(uriIns.Path, "/portal/api/mirror-rules/") && strings.HasSuffix(uriIns.Path, "/toggle") && request.Method == "POST":
+		c.handleToggleMirrorRule(conn, request, uriIns.Path)
+	case strings.HasPrefix(uriIns.Path, "/portal/api/mirror-rules/") && strings.HasSuffix(uriIns.Path, "/logs") && request.Method == "GET":
+		c.handleGetMirrorRuleLogs(conn, request, uriIns.Path)
+	case strings.HasPrefix(uriIns.Path, "/portal/api/mirror-rules/") && strings.HasSuffix(uriIns.Path, "/test") && request.Method == "POST":
+		c.handleTestMirrorRule(conn, request, uriIns.Path)
+	case strings.HasPrefix(uriIns.Path, "/portal/api/mirror-rules/") && request.Method == "PUT":
+		c.handleUpdateMirrorRule(conn, request, uriIns.Path)
+	case strings.HasPrefix(uriIns.Path, "/portal/api/mirror-rules/") && request.Method == "DELETE":
+		c.handleDeleteMirrorRule(conn, request, uriIns.Path)
+
+	// ========== Mirror Data Storage Routes (Admin Only) ==========
+	// 关键词: portal 镜像数据落盘路由注册, 落盘配置 + 最近记录查看
+	case uriIns.Path == "/portal/api/mirror-storage-config" && request.Method == "GET":
+		c.handleGetMirrorStorageConfig(conn, request)
+	case uriIns.Path == "/portal/api/mirror-storage-config" && request.Method == "POST":
+		c.handleSetMirrorStorageConfig(conn, request)
+	case uriIns.Path == "/portal/api/mirror-records/recent" && request.Method == "GET":
+		c.handleGetMirrorRecentRecords(conn, request)
 
 	// ========== Default ==========
 	default:
@@ -762,10 +968,19 @@ func (c *ServerConfig) HandleOpsPortalRequest(conn net.Conn, request *http.Reque
 		c.logDebug("OPS Auth: user=%s, role=%s, path=%s", authInfo.Username, authInfo.Role, uriIns.Path)
 	}
 
-	// If not authenticated, redirect to OPS login page
+	// If not authenticated, serve login page only for known OPS page paths (GET),
+	// return 401 JSON for everything else (API endpoints, mutations, etc.)
 	if !authInfo.Authenticated {
-		c.logInfo("Unauthenticated OPS request to %s, redirecting to login", uriIns.Path)
-		c.serveOpsLoginPage(conn)
+		isPagePath := (request.Method == "GET" || request.Method == "HEAD") && isOpsPagePath(uriIns.Path)
+		if isPagePath {
+			c.logInfo("Unauthenticated OPS page request to %s, serving login page", uriIns.Path)
+			c.serveOpsLoginPage(conn)
+			return
+		}
+		c.logWarn("Unauthenticated OPS request blocked: %s %s, returning 401", request.Method, uriIns.Path)
+		c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]string{
+			"error": "Unauthorized",
+		})
 		return
 	}
 
@@ -798,6 +1013,9 @@ func (c *ServerConfig) HandleOpsPortalRequest(conn net.Conn, request *http.Reque
 		c.handleOpsUpdateApiKey(conn, request, authInfo)
 	case uriIns.Path == "/ops/api/reset-traffic" && request.Method == "POST":
 		c.handleOpsResetApiKeyTraffic(conn, request, authInfo)
+	// 关键词: OPS reset-token 路由注册, OPS 用户重置自己 API Key Token 用量
+	case uriIns.Path == "/ops/api/reset-token" && request.Method == "POST":
+		c.handleOpsResetApiKeyToken(conn, request, authInfo)
 
 	// ========== OPS Self-Service ==========
 	case uriIns.Path == "/ops/my-info" && request.Method == "GET":
@@ -810,6 +1028,8 @@ func (c *ServerConfig) HandleOpsPortalRequest(conn net.Conn, request *http.Reque
 	// ========== OPS Logout ==========
 	case uriIns.Path == "/ops/logout":
 		c.handleOpsLogout(conn, request)
+	case uriIns.Path == "/ops/api/session/refresh" && request.Method == "POST":
+		c.handleSessionRefresh(conn, request)
 
 	// ========== Default ==========
 	default:
@@ -892,9 +1112,13 @@ func (c *ServerConfig) processOpsLogin(conn net.Conn, request *http.Request) {
 
 	log.Infof("OPS user logged in successfully: %s (ID: %d)", username, user.ID)
 
+	// Clear any stale admin_session cookie so that subsequent requests
+	// carrying both cookies resolve to this ops session, not a dangling
+	// admin one.
 	header := "HTTP/1.1 303 See Other\r\n" +
 		"Location: /ops/dashboard\r\n" +
 		"Set-Cookie: ops_session=" + session + "; Path=/; HttpOnly; SameSite=Strict\r\n" +
+		"Set-Cookie: admin_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n" +
 		"\r\n"
 	conn.Write([]byte(header))
 }
@@ -936,6 +1160,36 @@ func (c *ServerConfig) serveOpsPortal(conn net.Conn) {
 	conn.Write(htmlContent)
 }
 
+// portalPagePaths lists paths that render HTML pages (not JSON APIs) under /portal.
+// Only these paths will serve a login page for unauthenticated GET requests;
+// all other paths return 401 JSON.
+var portalPagePaths = map[string]bool{
+	"/portal":                 true,
+	"/portal/":                true,
+	"/portal/add-ai-provider": true,
+	"/portal/api-keys":        true,
+	"/portal/totp-settings":   true,
+	"/portal/autocomplete":    true,
+	"/portal/get-totp-code":   true,
+	"/portal/logout":          true,
+}
+
+func isPortalPagePath(path string) bool {
+	return portalPagePaths[path]
+}
+
+// opsPagePaths lists paths that render HTML pages (not JSON APIs) under /ops.
+var opsPagePaths = map[string]bool{
+	"/ops":           true,
+	"/ops/":          true,
+	"/ops/dashboard": true,
+	"/ops/logout":    true,
+}
+
+func isOpsPagePath(path string) bool {
+	return opsPagePaths[path]
+}
+
 // handleOpsLogout handles OPS user logout
 func (c *ServerConfig) handleOpsLogout(conn net.Conn, request *http.Request) {
 	cookies := request.Cookies()
@@ -946,9 +1200,11 @@ func (c *ServerConfig) handleOpsLogout(conn net.Conn, request *http.Request) {
 		}
 	}
 
+	// Clear both cookies so the browser is left in a clean state.
 	header := "HTTP/1.1 303 See Other\r\n" +
 		"Location: /ops/login\r\n" +
 		"Set-Cookie: ops_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n" +
+		"Set-Cookie: admin_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n" +
 		"\r\n"
 	conn.Write([]byte(header))
 }

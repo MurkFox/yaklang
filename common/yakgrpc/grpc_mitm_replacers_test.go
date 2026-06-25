@@ -6,12 +6,13 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/yaklang/yaklang/common/utils/lowhttp/poc"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/yaklang/yaklang/common/utils/lowhttp/poc"
 
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/schema"
@@ -139,6 +140,33 @@ func TestGRPCMUSTPASS_HookColorSkipsBinaryResponseBodyByContentType(t *testing.T
 
 	extractedData := replacer.HookColor([]byte(""), responseBytes, req, &schema.HTTPFlow{})
 	require.Len(t, extractedData, 0)
+}
+
+// 替换类规则（NoReplace=false）过去只走劫持替换，不写 extracted_data，导致 MITM 侧栏「规则」无数据。
+func TestGRPCMUSTPASS_HookColorHijackRuleStillExtractsForDB(t *testing.T) {
+	replacer := yakit.NewMITMReplacer()
+	replacer.SetRules(&ypb.MITMContentReplacer{
+		Rule:              `secret-key`,
+		NoReplace:         false,
+		Result:            `masked`,
+		EnableForResponse: true,
+		EnableForHeader:   true,
+		EnableForBody:     true,
+		VerboseName:       "hijack-extract-test",
+	})
+	responseBytes := []byte(`HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 10
+
+secret-key`)
+	req, err := http.NewRequest("GET", "https://www.baidu.com", nil)
+	require.NoError(t, err)
+	flow := &schema.HTTPFlow{HiddenIndex: "trace-hijack-extract"}
+	extracted := replacer.HookColor([]byte(""), responseBytes, req, flow)
+	require.Len(t, extracted, 1)
+	require.Equal(t, "secret-key", extracted[0].Data)
+	require.Equal(t, "hijack-extract-test", extracted[0].RuleVerbose)
+	require.Equal(t, "trace-hijack-extract", extracted[0].TraceId)
 }
 
 // TestMatchScope match scope rule: scope =  opt1 ∩ ( ∪ { opt2s... } ), opt1 ∈ {request, response}, opt2 ∈ {uri, header, body}
@@ -901,12 +929,12 @@ User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 	}()
 	replacer.Hook(true, false, "", requestBytes)
 	replacer.WaitTasks()
-	assert.Equal(t, "[重发]tag1|YAKIT_COLOR_red", tags)
+	assert.Equal(t, yakit.HTTPFlowTagResend+"tag1|YAKIT_COLOR_red", tags)
 	replacer.GetRawRules()[0].ExtraTag = nil
 	replacer.Hook(true, false, "", requestBytes)
 	tags = ""
 	replacer.WaitTasks()
-	assert.Equal(t, "[重发]|YAKIT_COLOR_red", tags)
+	assert.Equal(t, yakit.HTTPFlowTagResend+"|YAKIT_COLOR_red", tags)
 }
 
 func TestGRPCMUSTPASS_HookColorWithNoColorBefore(t *testing.T) {
@@ -954,7 +982,8 @@ Host: example.com
 	httpctx.SetMatchedRule(req, matchRules)
 
 	extractedData := replacer.HookColor(requestBytes, []byte(""), req, flow)
-	require.Len(t, extractedData, 1)
+	// 仅匹配规则 + 替换规则均命中时，二者都应写入提取数据（侧栏「规则」数据源）
+	require.Len(t, extractedData, 2)
 	require.Equal(t, "YAKIT_COLOR_RED|example", flow.Tags)
 }
 
@@ -1130,13 +1159,13 @@ secret-key: x`
 
 // hookColorModifiedPacketTestConfig 对修改后的包生效测试配置
 type hookColorModifiedPacketTestConfig struct {
-	name           string
-	replaceRule    string // 规则1：替换匹配内容
-	replaceResult  string // 替换结果
-	mirrorRule     string // 规则2：mirror 规则匹配（修改后才会出现的内容）
-	mirrorTag      string // mirror 规则的 ExtraTag
-	originalBody   string // 原始请求 body 中的内容
-	expectExtract  string // 期望 HookColor 提取的数据（来自修改后的包）
+	name          string
+	replaceRule   string // 规则1：替换匹配内容
+	replaceResult string // 替换结果
+	mirrorRule    string // 规则2：mirror 规则匹配（修改后才会出现的内容）
+	mirrorTag     string // mirror 规则的 ExtraTag
+	originalBody  string // 原始请求 body 中的内容
+	expectExtract string // 期望 HookColor 提取的数据（来自修改后的包）
 }
 
 func TestHookColorUsesModifiedPacket_Config(t *testing.T) {
@@ -1207,61 +1236,61 @@ Host: example.com
 
 // regexpResultTemplateTestConfig 模板格式 $1/\1/{1} 测试配置
 type regexpResultTemplateTestConfig struct {
-	name           string
-	rule           string
-	template       string
-	packetBody     string
-	expectResult   string
+	name            string
+	rule            string
+	template        string
+	packetBody      string
+	expectResult    string
 	testMatchPacket bool // true 测试 MatchPacket，false 测试 HookColor
 }
 
 func TestMITMReplaceRule_RegexpResultTemplate_Config(t *testing.T) {
 	for _, cfg := range []regexpResultTemplateTestConfig{
 		{
-			name:             "match_packet_dollar_syntax",
-			rule:             `(\w+)-(\w+)-(\w+)`,
-			template:         `$1个$2和$3`,
-			packetBody:       `HTTP/1.1 200 OK
+			name:     "match_packet_dollar_syntax",
+			rule:     `(\w+)-(\w+)-(\w+)`,
+			template: `$1个$2和$3`,
+			packetBody: `HTTP/1.1 200 OK
 Content-Type: text/plain
 Content-Length: 11
 
 abc-def-ghi`,
-			expectResult:     "abc个def和ghi",
-			testMatchPacket:  true,
+			expectResult:    "abc个def和ghi",
+			testMatchPacket: true,
 		},
 		{
-			name:             "match_packet_brace_syntax",
-			rule:             `(\d+):(\d+)`,
-			template:         `{1}时{2}分`,
-			packetBody:       `HTTP/1.1 200 OK
+			name:     "match_packet_brace_syntax",
+			rule:     `(\d+):(\d+)`,
+			template: `{1}时{2}分`,
+			packetBody: `HTTP/1.1 200 OK
 Content-Length: 5
 
 12:30`,
-			expectResult:     "12时30分",
-			testMatchPacket:  true,
+			expectResult:    "12时30分",
+			testMatchPacket: true,
 		},
 		{
-			name:             "hook_color_dollar_syntax",
-			rule:             `(a)(b)(c)`,
-			template:         `$1个$2和$3`,
-			packetBody:       `HTTP/1.1 200 OK
+			name:     "hook_color_dollar_syntax",
+			rule:     `(a)(b)(c)`,
+			template: `$1个$2和$3`,
+			packetBody: `HTTP/1.1 200 OK
 Content-Type: application/json
 Content-Length: 3
 
 abc`,
-			expectResult:     "a个b和c",
-			testMatchPacket:  false,
+			expectResult:    "a个b和c",
+			testMatchPacket: false,
 		},
 		{
-			name:             "hook_color_backslash_syntax",
-			rule:             `(x)(y)`,
-			template:         `\1-\2`,
-			packetBody:       `HTTP/1.1 200 OK
+			name:     "hook_color_backslash_syntax",
+			rule:     `(x)(y)`,
+			template: `\1-\2`,
+			packetBody: `HTTP/1.1 200 OK
 Content-Length: 2
 
 xy`,
-			expectResult:     "x-y",
-			testMatchPacket:  false,
+			expectResult:    "x-y",
+			testMatchPacket: false,
 		},
 	} {
 		t.Run(cfg.name, func(t *testing.T) {
@@ -1302,6 +1331,250 @@ xy`,
 				extractedData := replacer.HookColor([]byte(""), []byte(cfg.packetBody), req, &schema.HTTPFlow{})
 				require.Len(t, extractedData, 1)
 				require.Equal(t, cfg.expectResult, extractedData[0].Data)
+			}
+		})
+	}
+}
+
+func TestMITMReplaceRule_SecondaryRegexp_GlobalJoin(t *testing.T) {
+	rule := &yakit.MITMReplaceRule{
+		MITMContentReplacer: &ypb.MITMContentReplacer{
+			Rule:                 `(foo)(\d+)`,
+			EnableForResponse:    true,
+			EnableForBody:        true,
+			EnableForRequest:     false,
+			EnableForHeader:      false,
+			EnableForURI:         false,
+			RegexpResultTemplate: `$1:$2`,
+			SecondaryStages: []*ypb.RegexOutputStage{
+				{
+					Regexp:         `foo:(\d+)`,
+					ResultTemplate: `$1`,
+					Joiner:         `,`,
+				},
+			},
+		},
+	}
+	_, results, err := rule.MatchPacket([]byte(`HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 9
+
+foo1 foo2`), false)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.Equal(t, "1", results[0].MatchResult)
+	require.Equal(t, "2", results[1].MatchResult)
+}
+
+func TestMITMReplaceRule_SecondaryStages_ThreeStages(t *testing.T) {
+	rule := &yakit.MITMReplaceRule{
+		MITMContentReplacer: &ypb.MITMContentReplacer{
+			Rule:                 `(foo)(\d+)`,
+			EnableForResponse:    true,
+			EnableForBody:        true,
+			EnableForRequest:     false,
+			EnableForHeader:      false,
+			EnableForURI:         false,
+			RegexpResultTemplate: `$1:$2`,
+			SecondaryStages: []*ypb.RegexOutputStage{
+				{
+					Regexp:         `foo:(\d+)`,
+					ResultTemplate: `$1`,
+					Joiner:         `,`,
+				},
+				{
+					Regexp:         `(\d+)`,
+					ResultTemplate: `num=$1`,
+					Joiner:         `|`,
+				},
+				{
+					Regexp:         `num=(2)`,
+					ResultTemplate: `only$1`,
+					Joiner:         `,`,
+				},
+			},
+		},
+	}
+	_, results, err := rule.MatchPacket([]byte(`HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 9
+
+foo1 foo2`), false)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, "only2", results[0].MatchResult)
+}
+
+func TestMITMReplaceRule_SecondaryRegexp_Disabled_BackCompat(t *testing.T) {
+	rule := &yakit.MITMReplaceRule{
+		MITMContentReplacer: &ypb.MITMContentReplacer{
+			Rule:                 `(foo)(\d+)`,
+			EnableForResponse:    true,
+			EnableForBody:        true,
+			RegexpResultTemplate: `$1:$2`,
+		},
+	}
+	_, results, err := rule.MatchPacket([]byte(`HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 9
+
+foo1 foo2`), false)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.Equal(t, "foo:1", results[0].MatchResult)
+	require.Equal(t, "foo:2", results[1].MatchResult)
+}
+
+// TestMITMReplaceRule_SecondaryStages_PrimaryRegexpGroupZero 对应 Yakit 规则 UI：
+// 主正则 1a(2a)、按组号提取 0（整段匹配），二次正则 (2a) 仅在主阶段输出串上继续匹配。
+// 主阶段输出应为 1a2a，二次阶段默认取捕获组 1，得到 2a。
+//
+// MatchPacket 的 isReq 必须与真实报文一致：下列为请求包且命中在 URI（如 /?a=1a2a），须 isReq=true；
+// 若误用 isReq=false，会按响应解析且 EnableForURI 对响应无效，body 又为空，则无任何匹配。
+func TestMITMReplaceRule_SecondaryStages_PrimaryRegexpGroupZero(t *testing.T) {
+	reqPacket := []byte(`GET /?a=1a2a HTTP/1.1
+Host: baidu.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+Accept-Encoding: gzip, deflate
+Accept-Language: zh-CN,zh;q=0.9
+Upgrade-Insecure-Requests: 1
+
+`)
+	rule := &yakit.MITMReplaceRule{
+		MITMContentReplacer: &ypb.MITMContentReplacer{
+			Rule:              `1a(2a)`,
+			RegexpGroups:      []int64{0},
+			EnableForRequest:  true,
+			EnableForURI:      true,
+			EnableForResponse: false,
+			EnableForHeader:   false,
+			EnableForBody:     false,
+			SecondaryStages: []*ypb.RegexOutputStage{
+				{
+					Regexp: `(2a)`,
+				},
+			},
+		},
+	}
+	_, results, err := rule.MatchPacket(reqPacket, true)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, "2a", results[0].MatchResult)
+	require.NotNil(t, results[0].Match, "多阶段输出应携带最后一级 regexp2.Match，供 ExtractedData 索引")
+}
+
+// 二次正则命中时 Match 为 nil，ExtractedDataFromHTTPFlow 不得 panic，否则 HookColor 返回空、无高亮数据
+func TestGRPCMUSTPASS_HookColor_SecondaryStageProducesExtractedData(t *testing.T) {
+	replacer := yakit.NewMITMReplacer()
+	replacer.SetRules(&ypb.MITMContentReplacer{
+		Rule:              `1a(2a)`,
+		RegexpGroups:      []int64{0},
+		NoReplace:         true,
+		Color:             "red",
+		EnableForRequest:  true,
+		EnableForURI:      true,
+		EnableForResponse: false,
+		EnableForHeader:   false,
+		EnableForBody:     false,
+		VerboseName:       "sec-stage-rule",
+		SecondaryStages: []*ypb.RegexOutputStage{
+			{Regexp: `(2a)`},
+		},
+	})
+	reqPacket := []byte(`GET /?a=1a2a HTTP/1.1
+Host: baidu.com
+
+`)
+	req, err := http.NewRequest("GET", "http://baidu.com/?a=1a2a", nil)
+	require.NoError(t, err)
+	flow := &schema.HTTPFlow{HiddenIndex: "trace-secondary-hookcolor"}
+	out := replacer.HookColor(reqPacket, []byte(""), req, flow)
+	require.NotNil(t, out)
+	require.Len(t, out, 1)
+	require.Equal(t, "2a", out[0].Data)
+	require.Equal(t, "trace-secondary-hookcolor", out[0].TraceId)
+	require.Contains(t, flow.Tags, "YAKIT_COLOR_RED")
+}
+
+type secondaryOnlyMatchPrimaryOutputTestConfig struct {
+	name            string
+	primaryTemplate string
+	secondaryStages []*ypb.RegexOutputStage
+	expectResults   []string
+}
+
+func TestMITMReplaceRule_SecondaryStages_OnlyMatchPrimaryOutput(t *testing.T) {
+	packet := []byte(`GET /content-search.xml HTTP/1.1
+Host: www.baidu.com
+Connection: keep-alive
+Cookie: BIDUPSID=170D1DAFEA666C9C1F1ED82C7C181F8D; PSTM=1775801484; BAIDUID=170D1DAFEA666C9C2475921E80607EA4:FG=1; BD_HOME=1;
+
+`)
+
+	// Primary regex extracts only the prefix (up to PSTM=...;) so later cookie keys are excluded.
+	const primaryRule = `Cookie: (.*?; PSTM=\d+;)`
+	const extractedCookiePrefix = `BIDUPSID=170D1DAFEA666C9C1F1ED82C7C181F8D; PSTM=1775801484;`
+
+	for _, cfg := range []secondaryOnlyMatchPrimaryOutputTestConfig{
+		{
+			name:            "secondary_enabled__primary_template_enabled",
+			primaryTemplate: `D=$1`,
+			secondaryStages: []*ypb.RegexOutputStage{
+				{
+					Regexp:         `D=.*?BIDUPSID=([^;]+);`,
+					ResultTemplate: ``,
+					Joiner:         ``,
+				},
+			},
+			expectResults: []string{"170D1DAFEA666C9C1F1ED82C7C181F8D"},
+		},
+		{
+			name:            "secondary_enabled__primary_template_disabled",
+			primaryTemplate: ``,
+			secondaryStages: []*ypb.RegexOutputStage{
+				{
+					Regexp:         `BIDUPSID=([^;]+);`,
+					ResultTemplate: ``,
+					Joiner:         ``,
+				},
+			},
+			expectResults: []string{"170D1DAFEA666C9C1F1ED82C7C181F8D"},
+		},
+		{
+			name:            "secondary_disabled__primary_template_enabled",
+			primaryTemplate: `D=$1`,
+			secondaryStages: nil,
+			expectResults:   []string{"D=" + extractedCookiePrefix},
+		},
+		{
+			name:            "secondary_disabled__primary_template_disabled",
+			primaryTemplate: ``,
+			secondaryStages: nil,
+			expectResults:   []string{extractedCookiePrefix},
+		},
+	} {
+		t.Run(cfg.name, func(t *testing.T) {
+			replacer := &ypb.MITMContentReplacer{
+				Rule:              primaryRule,
+				EnableForRequest:  true,
+				EnableForHeader:   true,
+				EnableForBody:     false,
+				EnableForResponse: false,
+				EnableForURI:      false,
+			}
+
+			replacer.RegexpResultTemplate = cfg.primaryTemplate
+			replacer.SecondaryStages = cfg.secondaryStages
+
+			rule := &yakit.MITMReplaceRule{MITMContentReplacer: replacer}
+			_, results, err := rule.MatchPacket(packet, true)
+			require.NoError(t, err)
+			require.Len(t, results, len(cfg.expectResults))
+			for i, want := range cfg.expectResults {
+				require.Equal(t, want, results[i].MatchResult)
+				require.NotContains(t, results[i].MatchResult, "BAIDUID=170D1DAFEA666C9C2475921E80607EA4")
+				require.NotContains(t, results[i].MatchResult, "BD_HOME=1")
 			}
 		})
 	}
@@ -1651,6 +1924,110 @@ Content-Length: 15
 	assert.False(t, packetInfo.IsRequest, "PacketInfo should be marked as response")
 
 	t.Logf("Match result: %s", results[0].MatchResult)
+}
+
+// TestMUSTPASS_ExactMatch_Compile verifies that MITMReplaceRule.Compile() with
+// ExactMatch=true escapes regex metacharacters so they are matched literally.
+// Without ExactMatch, a rule like "1.00" would compile as a regex where "." matches
+// any character, silently producing wrong results.
+func TestMUSTPASS_ExactMatch_Compile(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		rule        string
+		input       string
+		exactMatch  bool
+		expectMatch bool
+	}{
+		{
+			// With ExactMatch=false (default), "." is a regex wildcard – "1X00" also matches.
+			name: "regex_dot_matches_any_char",
+			rule: "1.00", exactMatch: false,
+			input: "price: 1X00", expectMatch: true,
+		},
+		{
+			// With ExactMatch=true, "." is literal – "1X00" must NOT match.
+			name: "exact_dot_no_match_on_any_char",
+			rule: "1.00", exactMatch: true,
+			input: "price: 1X00", expectMatch: false,
+		},
+		{
+			// With ExactMatch=true, "." is literal – "1.00" must match exactly.
+			name: "exact_dot_matches_literal",
+			rule: "1.00", exactMatch: true,
+			input: "price: 1.00", expectMatch: true,
+		},
+		{
+			// ExactMatch=true: "+" is literal, not "one-or-more".
+			name: "exact_plus_literal",
+			rule: "a+b", exactMatch: true,
+			input: "key: a+b", expectMatch: true,
+		},
+		{
+			// ExactMatch=true: "+" as literal should NOT match "aab".
+			name: "exact_plus_no_regex_expand",
+			rule: "a+b", exactMatch: true,
+			input: "key: aab", expectMatch: false,
+		},
+		{
+			// ExactMatch=true: "*" is literal, not "zero-or-more".
+			name: "exact_star_literal",
+			rule: "a*b", exactMatch: true,
+			input: "val: a*b", expectMatch: true,
+		},
+		{
+			// ExactMatch=false (regex): "a*b" matches "b" (zero a's).
+			name: "regex_star_matches_zero",
+			rule: "a*b", exactMatch: false,
+			input: "val: b", expectMatch: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &yakit.MITMReplaceRule{
+				MITMContentReplacer: &ypb.MITMContentReplacer{
+					Rule:       tc.rule,
+					ExactMatch: tc.exactMatch,
+				},
+			}
+			re, err := r.Compile()
+			require.NoError(t, err)
+			got, err := re.MatchString(tc.input)
+			require.NoError(t, err)
+			require.Equalf(t, tc.expectMatch, got,
+				"rule=%q exactMatch=%v input=%q", tc.rule, tc.exactMatch, tc.input)
+		})
+	}
+}
+
+// TestMUSTPASS_ExactMatch_Hook verifies that the full Hook pipeline respects
+// ExactMatch: the replacement must only fire on an exact byte-for-byte match,
+// not on strings that merely satisfy the same regex pattern.
+func TestMUSTPASS_ExactMatch_Hook(t *testing.T) {
+	const replaceResult = "REPLACED"
+
+	// "1.00" as a regex would also match "1X00" (dot = any char).
+	// With ExactMatch=true it must only match the literal "1.00".
+	reqWithLiteral := []byte("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 12\r\n\r\nprice: 1.00")
+	reqWithWildcard := []byte("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 12\r\n\r\nprice: 1X00")
+
+	replacer := yakit.NewMITMReplacer()
+	replacer.SetRules(&ypb.MITMContentReplacer{
+		Rule:             "1.00",
+		ExactMatch:       true,
+		NoReplace:        false,
+		Result:           replaceResult,
+		EnableForRequest: true,
+		EnableForBody:    true,
+	})
+
+	_, modifiedLiteral, dropped := replacer.Hook(true, false, "", reqWithLiteral)
+	require.False(t, dropped)
+	require.Contains(t, string(modifiedLiteral), replaceResult,
+		"ExactMatch should replace literal '1.00'")
+
+	_, modifiedWildcard, dropped := replacer.Hook(true, false, "", reqWithWildcard)
+	require.False(t, dropped)
+	require.NotContains(t, string(modifiedWildcard), replaceResult,
+		"ExactMatch must NOT replace '1X00' when rule is literal '1.00'")
 }
 
 func TestMITMReplaceRule_UseInlowhttp(t *testing.T) {

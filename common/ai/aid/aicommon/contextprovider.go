@@ -6,12 +6,12 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
-	"time"
+	"unicode"
 
-	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils/yakgit/yakdiff"
@@ -29,8 +29,9 @@ const (
 	CONTEXT_PROVIDER_TYPE_AIFORGE        = "aiforge"
 	CONTEXT_PROVIDER_TYPE_AISKILL        = "aiskill"
 
-	CONTEXT_PROVIDER_KEY_FILE_PATH    = "file_path"
-	CONTEXT_PROVIDER_KEY_FILE_CONTENT = "file_content"
+	CONTEXT_PROVIDER_KEY_FILE_PATH      = "file_path"
+	CONTEXT_PROVIDER_KEY_FILE_CONTENT   = "file_content"
+	CONTEXT_PROVIDER_KEY_DIRECTORY_PATH = "directory_path"
 	CONTEXT_PROVIDER_KEY_NAME         = "name"
 
 	CONTEXT_PROVIDER_KEY_SYSTEM_FLAG = "system_flag"
@@ -120,6 +121,28 @@ func isTextFileExtension(ext string) bool {
 	}
 
 	return textExtensions[ext]
+}
+
+// IsImageContextAttachmentPath reports whether filePath should be treated as an image
+// for prompt attachment (by extension or image/* MIME). Used so callers can route
+// images to vision pipelines instead of FileContextProvider (text-only).
+func IsImageContextAttachmentPath(filePath string) bool {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	imageExts := map[string]bool{
+		".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true,
+		".bmp": true, ".tif": true, ".tiff": true, ".heic": true, ".heif": true, ".avif": true,
+	}
+	if imageExts[ext] {
+		return true
+	}
+	mimeType := mime.TypeByExtension(ext)
+	if mimeType != "" {
+		if idx := strings.Index(mimeType, ";"); idx != -1 {
+			mimeType = strings.TrimSpace(mimeType[:idx])
+		}
+		return strings.HasPrefix(strings.ToLower(mimeType), "image/")
+	}
+	return false
 }
 
 // MaxFileContentSize 文件内容最大读取大小（1KB）
@@ -220,28 +243,21 @@ func FileContextProvider(filePath string, userPrompt ...string) ContextProvider 
 	}
 }
 
-// OutputFileContextProvider reads a tool-produced file (up to 40KB) and renders it
-// with line numbers using utils.PrefixLinesWithLineNumbers. Designed for use with
-// RegisterTracedContent to automatically inject output file content into subsequent prompts,
-// enabling the modify_file -> re-execute fast loop.
-func OutputFileContextProvider(filePath string) ContextProvider {
-	return func(config AICallerConfigIf, emitter *Emitter, key string) (string, error) {
-		info, err := aitool.ReadOutputFileFromPath(filePath)
-		if err != nil {
-			return fmt.Sprintf("[Error: failed to read output file %s: %v]", filePath, err), err
-		}
-		var buf strings.Builder
-		buf.WriteString(fmt.Sprintf("## Output File: %s (%s)\n", filePath, formatFileSize(info.Size)))
-		if info.Size > aitool.MaxOutputFileBytes {
-			buf.WriteString(fmt.Sprintf("Note: file truncated to first %d bytes (original: %d bytes)\n", aitool.MaxOutputFileBytes, info.Size))
-		}
-		buf.WriteString("```\n")
-		buf.WriteString(info.LineNumberedContent())
-		buf.WriteString("\n```\n")
-		return buf.String(), nil
-	}
-}
-
+// OutputFileContextProvider has been removed. It used to read each
+// verification-confirmed output file (up to 40KB) and re-inject its full body
+// into Pure Dynamic / AutoContext on every prompt build via
+// RegisterTracedContent, which flooded the dynamic segment with stale file
+// contents.
+//
+// Delivery files are now recorded as a single Open Timeline entry by
+// pushDeliveryFileToTimeline (see common/ai/aid/aireact/reactloops/
+// verification_gate.go). The timeline entry contains only path / size /
+// mime / mtime; the file body is never re-injected into the prompt and can
+// be re-read on demand via existing file-read or view-window actions.
+//
+// 关键词: OutputFileContextProvider 已废弃, 交付文件 timeline 化,
+//
+//	Pure Dynamic 反污染, AutoContext 反污染
 func KnowledgeBaseContextProvider(knowledgeBaseName string, userPrompt ...string) ContextProvider {
 	return func(config AICallerConfigIf, emitter *Emitter, key string) (string, error) {
 		// 构建基本信息（即使出错也要包含）
@@ -415,7 +431,7 @@ func KnowledgeBaseSystemFlagContextProvider(flag string, userPrompt ...string) C
 			}
 
 			content := detailBuilder.String()
-			if len(content) > maxInlineKnowledgeBaseBytes {
+			if MeasureTokens(content) > maxInlineKnowledgeBaseTokens {
 				filePath := consts.TempAIFileFast("knowledge-bases-*.txt", content)
 				if emitter != nil && filePath != "" {
 					emitter.EmitPinFilename(filePath)
@@ -423,7 +439,7 @@ func KnowledgeBaseSystemFlagContextProvider(flag string, userPrompt ...string) C
 
 				var previewBuilder strings.Builder
 				previewBuilder.WriteString(baseInfo)
-				previewBuilder.WriteString(fmt.Sprintf("All knowledge base info is large (%d bytes). Saved to file: %s\n", len(content), filePath))
+				previewBuilder.WriteString(fmt.Sprintf("All knowledge base info is large (%d tokens). Saved to file: %s\n", MeasureTokens(content), filePath))
 				previewBuilder.WriteString("Knowledge Base Names:\n")
 				for _, kb := range knowledgeBases {
 					previewBuilder.WriteString(fmt.Sprintf("- %s\n", kb.KnowledgeBaseName))
@@ -438,135 +454,25 @@ func KnowledgeBaseSystemFlagContextProvider(flag string, userPrompt ...string) C
 	}
 }
 
-// ArtifactsContextMaxBytes is the maximum size (in bytes) for the artifacts context output.
-// This limits the artifacts summary injected into every prompt to 8KB.
-const ArtifactsContextMaxBytes = 8 * 1024
+// ArtifactsContextMaxTokens is the maximum size (in tokens) for the artifacts context output.
+const ArtifactsContextMaxTokens = 8 * 1024
 
-// artifactFileEntry holds metadata for a single file in the artifacts directory.
-type artifactFileEntry struct {
-	RelPath string
-	Size    int64
-	ModTime time.Time
-}
-
-// ArtifactsContextProvider scans the session's working directory (artifacts dir) and generates
-// a structured summary of all task output files. This provider is registered once and executed
-// on every prompt build, ensuring all subsequent AI turns can see the artifacts filesystem.
+// ArtifactsContextProvider is a thin wrapper around RenderSessionArtifactsListing
+// that adds the legacy "# Session Artifacts" heading expected by older callers
+// and existing tests. New prompt code should call RenderSessionArtifactsFrozenOpen
+// and render artifacts as first-class frozen/open blocks.
 //
-// The output is limited to ArtifactsContextMaxBytes (8KB) using utils.ShrinkTextBlock.
+// Deprecated: this provider used to be registered into ContextProviderManager
+// (which routed it into Pure Dynamic / AutoContext). That registration has been
+// removed; the wrapper is kept only to preserve the existing test surface.
+//
+// 关键词: ArtifactsContextProvider 薄壳, 兼容旧 surface, 不再注册到 ContextProviderManager
 func ArtifactsContextProvider(config AICallerConfigIf, emitter *Emitter, key string) (string, error) {
-	workDir := config.GetOrCreateWorkDir()
-	if workDir == "" {
+	listing := RenderSessionArtifactsListing(config)
+	if listing == "" {
 		return "", nil
 	}
-
-	// Check if the directory exists
-	info, err := os.Stat(workDir)
-	if err != nil || !info.IsDir() {
-		return "", nil
-	}
-
-	var entries []artifactFileEntry
-	walkErr := filepath.Walk(workDir, func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
-			log.Warnf("[ArtifactsContextProvider] walk error for %s: %v", path, err)
-			return nil // skip errors
-		}
-		if fi.IsDir() {
-			return nil
-		}
-		relPath, err := filepath.Rel(workDir, path)
-		if err != nil {
-			relPath = path
-		}
-		log.Infof("[ArtifactsContextProvider] found file: %s", relPath)
-		entries = append(entries, artifactFileEntry{
-			RelPath: relPath,
-			Size:    fi.Size(),
-			ModTime: fi.ModTime(),
-		})
-		return nil
-	})
-	if walkErr != nil {
-		log.Warnf("artifacts context provider: walk error: %v", walkErr)
-	}
-
-	log.Infof("[ArtifactsContextProvider] total entries found: %d in workDir: %s", len(entries), workDir)
-
-	if len(entries) == 0 {
-		return "", nil
-	}
-
-	// Sort entries by modification time (newest first)
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].ModTime.After(entries[j].ModTime)
-	})
-
-	// Group entries by top-level task directory
-	taskGroups := omap.NewOrderedMap(make(map[string][]artifactFileEntry))
-	var rootFiles []artifactFileEntry
-
-	for _, e := range entries {
-		parts := strings.SplitN(e.RelPath, string(filepath.Separator), 2)
-		if len(parts) == 1 {
-			// File directly in workDir (not in a task subfolder)
-			rootFiles = append(rootFiles, e)
-		} else {
-			taskDir := parts[0]
-			existing, _ := taskGroups.Get(taskDir)
-			taskGroups.Set(taskDir, append(existing, e))
-		}
-	}
-
-	var sb strings.Builder
-	sb.WriteString("# Session Artifacts\n")
-	sb.WriteString(fmt.Sprintf("artifacts_dir: %s\n", workDir))
-	sb.WriteString(fmt.Sprintf("total_files: %d\n\n", len(entries)))
-
-	// Write task directory groups
-	taskGroups.ForEach(func(taskDir string, files []artifactFileEntry) bool {
-		// Find the latest modification time for the group
-		var latestMod time.Time
-		for _, f := range files {
-			if f.ModTime.After(latestMod) {
-				latestMod = f.ModTime
-			}
-		}
-		sb.WriteString(fmt.Sprintf("## %s (modified: %s)\n",
-			taskDir,
-			latestMod.Format("2006-01-02 15:04:05"),
-		))
-		for _, f := range files {
-			// Show only the part after the task directory
-			innerPath := strings.TrimPrefix(f.RelPath, taskDir+string(filepath.Separator))
-			sb.WriteString(fmt.Sprintf("- %s (%s, %s)\n",
-				innerPath,
-				formatFileSize(f.Size),
-				f.ModTime.Format("15:04:05"),
-			))
-		}
-		sb.WriteString("\n")
-		return true
-	})
-
-	// Write root-level files (if any)
-	if len(rootFiles) > 0 {
-		sb.WriteString("## [root files]\n")
-		for _, f := range rootFiles {
-			sb.WriteString(fmt.Sprintf("- %s (%s, %s)\n",
-				f.RelPath,
-				formatFileSize(f.Size),
-				f.ModTime.Format("15:04:05"),
-			))
-		}
-		sb.WriteString("\n")
-	}
-
-	result := sb.String()
-	if len(result) > ArtifactsContextMaxBytes {
-		result = utils.ShrinkTextBlock(result, ArtifactsContextMaxBytes)
-	}
-	return result, nil
+	return "# Session Artifacts\n" + listing, nil
 }
 
 // formatFileSize formats a file size in human-readable form.
@@ -582,17 +488,17 @@ func formatFileSize(size int64) string {
 }
 
 type ContextProviderManager struct {
-	maxBytes int
-	m        sync.RWMutex
-	callback *omap.OrderedMap[string, ContextProvider]
+	maxTokens int
+	m         sync.RWMutex
+	callback  *omap.OrderedMap[string, ContextProvider]
 }
 
-const maxInlineKnowledgeBaseBytes = 2 * 1024 // 8KB
+const maxInlineKnowledgeBaseTokens = 2 * 1024
 
 func NewContextProviderManager() *ContextProviderManager {
 	return &ContextProviderManager{
-		maxBytes: 10 * 1024, // 10KB
-		callback: omap.NewOrderedMap(make(map[string]ContextProvider)),
+		maxTokens: 48 * 1024, // 48k tokens
+		callback:  omap.NewOrderedMap(make(map[string]ContextProvider)),
 	}
 }
 
@@ -629,6 +535,13 @@ func (r *ContextProviderManager) RegisterTracedContent(name string, cb ContextPr
 				diffResult += fmt.Sprintf("\n[New error occurred: %v]", newErr)
 			} else if newErr != nil && lastErr != nil && newErr.Error() != lastErr.Error() {
 				diffResult += fmt.Sprintf("\n[Error changed from: %v to: %v]", lastErr, newErr)
+			}
+
+			if strings.TrimSpace(diffResult) == "" {
+				lastContent = content
+				lastErr = newErr
+				buf.Reset()
+				return
 			}
 
 			diff, err := utils.RenderTemplate(`<|CHANGES_DIFF_{{ .nonce }}|>
@@ -695,6 +608,28 @@ func (r *ContextProviderManager) Unregister(name string) {
 }
 
 func (r *ContextProviderManager) Execute(config AICallerConfigIf, emitter *Emitter) string {
+	return r.executeWithTagStrategy(config, emitter, func(name string) string {
+		return utils.RandStringBytes(4)
+	})
+}
+
+func (r *ContextProviderManager) ExecuteStable(config AICallerConfigIf, emitter *Emitter) string {
+	return r.executeWithTagStrategy(config, emitter, func(name string) string {
+		return stableContextProviderTag(name)
+	})
+}
+
+func (r *ContextProviderManager) ExecuteWithNonce(config AICallerConfigIf, emitter *Emitter, nonce string) string {
+	return r.executeWithTagStrategy(config, emitter, func(name string) string {
+		return contextProviderTagWithNonce(nonce, name)
+	})
+}
+
+func (r *ContextProviderManager) executeWithTagStrategy(
+	config AICallerConfigIf,
+	emitter *Emitter,
+	tagStrategy func(name string) string,
+) string {
 	r.m.RLock()
 	defer r.m.RUnlock()
 
@@ -708,7 +643,14 @@ func (r *ContextProviderManager) Execute(config AICallerConfigIf, emitter *Emitt
 		if err != nil {
 			result = `[Error getting context: ` + err.Error() + `]`
 		}
-		flag := utils.RandStringBytes(4)
+		flag := ""
+		if tagStrategy != nil {
+			flag = tagStrategy(name)
+		}
+		if strings.TrimSpace(flag) == "" {
+			flag = "ctx"
+		}
+		result = normalizeContextProviderDynamicTags(result, flag)
 		buf.WriteString(fmt.Sprintf("<|AUTO_PROVIDE_CTX_[%v]_START key=%v|>\n", flag, name))
 		buf.WriteString(result)
 		buf.WriteString(fmt.Sprintf("\n<|AUTO_PROVIDE_CTX_[%v]_END|>", flag))
@@ -716,11 +658,57 @@ func (r *ContextProviderManager) Execute(config AICallerConfigIf, emitter *Emitt
 	})
 
 	result := buf.String()
-	if len(result) > r.maxBytes {
-		shrinkSize := int(float64(r.maxBytes) * 0.8)
-		result = utils.ShrinkString(result, shrinkSize)
-		log.Warnf("context provider result exceeded maxBytes (%d), shrunk to %d characters", r.maxBytes, shrinkSize)
+	if MeasureTokens(result) > r.maxTokens {
+		shrinkSize := int(float64(r.maxTokens) * 0.8)
+		result = ShrinkTextBlockByTokens(result, shrinkSize)
+		log.Warnf("context provider result exceeded maxTokens (%d), shrunk to %d tokens", r.maxTokens, shrinkSize)
 	}
 
 	return result
+}
+
+func stableContextProviderTag(name string) string {
+	result := sanitizeContextProviderTag(name, true)
+	if result == "" {
+		return "ctx"
+	}
+	return result
+}
+
+func contextProviderTagWithNonce(nonce string, name string) string {
+	nameTag := stableContextProviderTag(name)
+	nonceTag := sanitizeContextProviderTag(nonce, false)
+	if nonceTag == "" {
+		return nameTag
+	}
+	return nonceTag + "_" + nameTag
+}
+
+func sanitizeContextProviderTag(name string, lower bool) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if lower {
+		name = strings.ToLower(name)
+	}
+	var buf strings.Builder
+	for _, r := range name {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r):
+			buf.WriteRune(r)
+		default:
+			buf.WriteByte('_')
+		}
+	}
+	return strings.Trim(buf.String(), "_")
+}
+
+var changesDiffTagRegexp = regexp.MustCompile(`<\|CHANGES_DIFF_[^\s\|\n>]+\|>`)
+
+func normalizeContextProviderDynamicTags(result string, flag string) string {
+	if strings.TrimSpace(result) == "" || strings.TrimSpace(flag) == "" {
+		return result
+	}
+	return changesDiffTagRegexp.ReplaceAllString(result, "<|CHANGES_DIFF_"+flag+"|>")
 }

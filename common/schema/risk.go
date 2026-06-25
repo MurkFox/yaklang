@@ -51,7 +51,7 @@ type Risk struct {
 	ReverseToken string `json:"reverse_token"`
 
 	// 设置运行时 ID 为了关联具体漏洞
-	RuntimeId      string `json:"runtime_id"`
+	RuntimeId      string `json:"runtime_id" gorm:"index"`
 	QuotedRequest  string `json:"quoted_request"`
 	QuotedResponse string `json:"quoted_response"`
 
@@ -74,10 +74,13 @@ type Risk struct {
 	ProgramName string `json:"program_name"`
 }
 
-// PacketPair 表示风险关联的一条 HTTP 流量引用：前端可展示 Url，再通过 HTTPFlowId 查询详情
+// PacketPair 表示风险关联的一条 HTTP 流量：优先可通过 HTTPFlowId 查询详情，
+// 即使 HTTPFlow 被删除，也可以用 Request/Response 展示保存时的报文快照。
 type PacketPair struct {
 	HTTPFlowId int64  `json:"httpflow_id"`
 	Url        string `json:"url"`
+	Request    string `json:"request"`
+	Response   string `json:"response"`
 }
 
 // PacketPairList 是 PacketPair 的集合，用于 JSON 持久化到数据库
@@ -176,6 +179,8 @@ func (p *Risk) ToGRPCModel() *ypb.Risk {
 		packetPairs = append(packetPairs, &ypb.PacketPair{
 			HttpflowId: pp.HTTPFlowId,
 			Url:        pp.Url,
+			Request:    utils.EscapeInvalidUTF8Byte([]byte(pp.Request)),
+			Response:   utils.EscapeInvalidUTF8Byte([]byte(pp.Response)),
 		})
 	}
 
@@ -250,15 +255,18 @@ func (p *Risk) BeforeSave() error {
 
 func (r *Risk) AfterCreate(tx *gorm.DB) (err error) {
 	broadcastData.Call("risk", "create")
+	PublishRuntimeScopedBroadcast(RuntimeScopedBroadcastTypeRisk, r.RuntimeId, "create", r.ID)
 	return nil
 }
 
 func (r *Risk) AfterUpdate(tx *gorm.DB) (err error) {
 	broadcastData.Call("risk", "update")
+	PublishRuntimeScopedBroadcast(RuntimeScopedBroadcastTypeRisk, r.RuntimeId, "update", r.ID)
 	return nil
 }
 
 func (r *Risk) AfterDelete(tx *gorm.DB) (err error) {
 	broadcastData.Call("risk", "delete")
+	PublishRuntimeScopedBroadcast(RuntimeScopedBroadcastTypeRisk, r.RuntimeId, "delete", r.ID)
 	return nil
 }

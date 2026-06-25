@@ -28,6 +28,7 @@ var loopAction_toolRequireAndCall = &reactloops.LoopAction{
 		if payload == "" {
 			return utils.Error("tool_require_payload is required for ActionRequireTool but empty")
 		}
+		reactloops.MaybeWarnBashBeforeEdit(loop, payload)
 		loop.Set("tool_require_payload", payload)
 		return nil
 	},
@@ -55,7 +56,7 @@ var loopAction_toolRequireAndCall = &reactloops.LoopAction{
 				pw.Close()
 			})
 		}
-		loop.GetEmitter().EmitDefaultStreamEvent("load_tool", pr, operator.GetTask().GetId())
+		loop.GetEmitter().EmitDefaultSystemStreamEvent("load_tool", pr, operator.GetTask().GetId())
 		defer closeStatusPipe()
 
 		toolIns, err := loop.GetConfig().GetAiToolManager().GetToolByName(toolPayload)

@@ -3,6 +3,7 @@ package compiler
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -17,7 +18,7 @@ import (
 	"github.com/yaklang/yaklang/common/yak/ssa2llvm/runtime/embed"
 )
 
-const cachedCompileVersion = "ssa2llvm-cache-v1"
+const cachedCompileVersion = "ssa2llvm-cache-v3"
 
 var toolVersionMemo sync.Map // map[string]string
 
@@ -57,6 +58,7 @@ func cachedWorkKeyFromConfig(cfg *CompileConfig) (string, error) {
 	write("go=" + runtime.Version())
 	write("lang=" + strings.TrimSpace(cfg.Language))
 	write("entry=" + strings.TrimSpace(cfg.EntryFunctionName))
+	write("pluginType=" + strings.TrimSpace(cfg.PluginType))
 	write(fmt.Sprintf("emitLLVM=%t", cfg.EmitLLVM))
 	write(fmt.Sprintf("emitAsm=%t", cfg.EmitAsm))
 	write(fmt.Sprintf("compileOnly=%t", cfg.CompileOnly))
@@ -64,6 +66,32 @@ func cachedWorkKeyFromConfig(cfg *CompileConfig) (string, error) {
 	write(fmt.Sprintf("printEntryResult=%t", cfg.PrintEntryResult))
 	write(fmt.Sprintf("skipRuntimeLink=%t", cfg.SkipRuntimeLink))
 	write(fmt.Sprintf("stdlibCompile=%t", cfg.StdlibCompile))
+	write(fmt.Sprintf("stdlibCompileSet=%t", cfg.StdlibCompileSet))
+	write("profile=" + strings.TrimSpace(cfg.ProfileName))
+	if cfg.resolvedProfile != nil {
+		if data, err := json.Marshal(cfg.resolvedProfile); err != nil {
+			write("profileConfig=error:" + err.Error())
+		} else {
+			write("profileConfig=" + string(data))
+		}
+	}
+	if len(cfg.RuntimeSymManifest) > 0 {
+		keys := make([]string, 0, len(cfg.RuntimeSymManifest))
+		for k := range cfg.RuntimeSymManifest {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			write("rtSym:" + k + "=" + cfg.RuntimeSymManifest[k])
+		}
+	} else {
+		write("rtSym=<off>")
+	}
+	write("llvmPlugin=" + strings.TrimSpace(cfg.LLVMPluginPath))
+	write("llvmPluginKind=" + strings.TrimSpace(cfg.LLVMPluginKind))
+	write("llvmPasses=" + strings.Join(cfg.LLVMPasses, ","))
+	write("llvmPack=" + strings.TrimSpace(cfg.LLVMPack))
+	write("llvmOpt=" + strings.TrimSpace(cfg.LLVMOptBinary))
 	needClang := !cfg.EmitLLVM && !cfg.EmitAsm && !cfg.CompileOnly
 	needLLC := cfg.EmitAsm || cfg.CompileOnly
 	if needClang {
@@ -71,6 +99,9 @@ func cachedWorkKeyFromConfig(cfg *CompileConfig) (string, error) {
 	}
 	if needLLC {
 		write("llc=" + llvmToolVersionKey("llc"))
+	}
+	if strings.TrimSpace(cfg.LLVMPluginPath) != "" || strings.TrimSpace(cfg.LLVMPack) != "" {
+		write("opt=" + llvmToolVersionKey("opt"))
 	}
 	if cfg.StdlibCompile {
 		write("goTool=" + goToolVersionKey())

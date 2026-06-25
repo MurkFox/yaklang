@@ -10,17 +10,43 @@ import (
 	"github.com/yaklang/yaklang/common/utils/memedit"
 	"github.com/yaklang/yaklang/common/utils/pipeline"
 	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
 
-type ASTSequenceType int
+type ASTSequenceType = ssaconfig.ASTSequenceType
 
 const (
-	OutOfOrder ASTSequenceType = iota
-	Order
-	ReverseOrder
+	OutOfOrder   = ssaconfig.OutOfOrder
+	Order        = ssaconfig.Order
+	ReverseOrder = ssaconfig.ReverseOrder
 )
 
 const maxFileSize = 5 * 1024 * 1024 // 5MB
+
+// pipeInitBufSize caps pipeline channel initial capacity. Passing len(paths) used to set
+// initCapacity to the full file count (two pipe stages), which oversized buffered channels
+// and allowed huge numbers of FileContent (raw bytes + AST) in flight before PreHandler drains.
+func pipeInitBufSize(pathCount, compileConcurrency int) int {
+	if pathCount < 1 {
+		pathCount = 1
+	}
+	workers := compileConcurrency
+	if workers < 1 {
+		workers = 10 // matches pipeline.NewPipeWithInit default when concurrency is 0
+	}
+	cand := workers * 8
+	if cand < 200 {
+		cand = 200
+	}
+	const hardMax = 8192
+	if cand > hardMax {
+		cand = hardMax
+	}
+	if pathCount < cand {
+		return pathCount
+	}
+	return cand
+}
 
 type FileHandler func(path string, content []byte)
 
@@ -53,19 +79,7 @@ func FilesHandler(
 	orderType ASTSequenceType,
 	concurrency int,
 ) <-chan *FileContent {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if concurrency <= 0 {
-		concurrency = 10
-	}
-	if len(paths) == 0 {
-		ch := make(chan *FileContent)
-		close(ch)
-		return ch
-	}
-
-	bufSize := len(paths)
+	bufSize := pipeInitBufSize(len(paths), concurrency)
 	readFilePipe := pipeline.NewPipe[string, *FileContent](
 		ctx, bufSize, func(path string) (*FileContent, error) {
 			info, err := filesystem.Stat(path)

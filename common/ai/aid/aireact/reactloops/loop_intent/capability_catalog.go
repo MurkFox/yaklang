@@ -12,6 +12,7 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 )
@@ -26,30 +27,16 @@ func BuildCapabilityCatalog(r aicommon.AIInvokeRuntime) string {
 
 	db := consts.GetGormProfileDatabase()
 	if db != nil {
-		tools, err := yakit.SearchAIYakTool(db, "")
-		if err != nil {
-			log.Warnf("capability catalog: failed to load tools: %v", err)
-		} else {
-			for _, t := range tools {
-				name := t.VerboseName
-				if name == "" {
-					name = t.Name
-				}
-				desc := utils.ShrinkString(t.Description, 120)
-				line := fmt.Sprintf("[tool:%s]: %s - %s", t.Name, name, desc)
-				if t.Keywords != "" {
-					line += fmt.Sprintf(". keywords: %s", utils.ShrinkString(t.Keywords, 80))
-				}
-				sb.WriteString(line)
-				sb.WriteString("\n")
-			}
-		}
+		reactloops.GenerateYakToolsCatalog(&sb)
 
 		forges, err := yakit.GetAllAIForge(db)
 		if err != nil {
 			log.Warnf("capability catalog: failed to load forges: %v", err)
 		} else {
 			for _, f := range forges {
+				if f == nil || !schema.IsRunnableForgeType(f.ForgeType) {
+					continue
+				}
 				name := f.ForgeVerboseName
 				if name == "" {
 					name = f.ForgeName
@@ -61,6 +48,25 @@ func BuildCapabilityCatalog(r aicommon.AIInvokeRuntime) string {
 				}
 				sb.WriteString(line)
 				sb.WriteString("\n")
+			}
+		}
+
+		// Include enabled MCP tools that have a cached description so the LLM
+		// catalog-match pass can discover them via semantic matching.
+		// Use [mcp-tool:] prefix to distinguish MCP tools from built-in tools.
+		if reactloops.IsMCPServersAllowed(r) {
+			mcpToolConfigs, mcpErr := yakit.GetAllEnabledMCPServerToolConfigs(db)
+			if mcpErr != nil {
+				log.Warnf("capability catalog: failed to load MCP tool configs: %v", mcpErr)
+			} else {
+				for _, t := range mcpToolConfigs {
+					if t.Description == "" {
+						continue
+					}
+					fullName := fmt.Sprintf("mcp_%s_%s", t.ServerName, t.ToolName)
+					desc := utils.ShrinkString(t.Description, 120)
+					sb.WriteString(fmt.Sprintf("[mcp-tool:%s]: %s - %s\n", fullName, fullName, desc))
+				}
 			}
 		}
 	}

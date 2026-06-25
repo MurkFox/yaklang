@@ -8,7 +8,6 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/mutate"
 	"github.com/yaklang/yaklang/common/utils"
 )
 
@@ -19,7 +18,7 @@ var setHTTPRequestAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoop
 		[]aitool.ToolOption{
 			aitool.WithStringParam("http_request", aitool.WithParam_Description("The raw HTTP request packet to test. Must be a valid HTTP request format."), aitool.WithParam_Required(true)),
 			aitool.WithBoolParam("is_https", aitool.WithParam_Description("Whether the request should use HTTPS. Default is false.")),
-			aitool.WithStringParam("reason", aitool.WithParam_Description("Explain why you want to test this HTTP request")),
+			aitool.WithStringParam("reason", aitool.WithParam_Description("请用中文说明为什么要执行这个Action、为什么要测试/修改这个 HTTP 数据包、怀疑的漏洞点，以及必须遵守的安全边界。")),
 		},
 		func(l *reactloops.ReActLoop, action *aicommon.Action) error {
 			httpRequest := action.GetString("http_request")
@@ -35,22 +34,28 @@ var setHTTPRequestAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoop
 
 			log.Infof("set_http_request action: setting HTTP request, is_https: %v, reason: %s", isHttps, reason)
 
-			// Create FuzzHTTPRequest object
-			fuzzReq, err := mutate.NewFuzzHTTPRequest([]byte(httpRequest), mutate.OptHTTPS(isHttps))
+			reactloops.EmitActionLog(loop, loopHTTPFuzzActionLogNodeSetRequest, fmt.Sprintf("设置 HTTP 请求: is_https=%v", isHttps))
+			reactloops.EmitStatus(loop, "设置请求中 / Setting Request...")
+
+			result, err := applyLoopHTTPFuzzRequestChange(loop, r, &loopHTTPFuzzRequestChange{
+				RawRequest:          httpRequest,
+				IsHTTPS:             isHttps,
+				SourceAction:        "set_http_request",
+				ChangeReason:        reason,
+				EventOp:             loopHTTPFuzzRequestEventOpReplace,
+				ResetBaseline:       true,
+				ClearActionTracking: true,
+				EmitEvent:           true,
+				EmitEditablePacket:  true,
+				PersistSession:      true,
+				Task:                operator.GetTask(),
+			})
 			if err != nil {
-				operator.Fail(fmt.Errorf("failed to create FuzzHTTPRequest: %v", err))
+				operator.Fail(fmt.Errorf("failed to apply HTTP request: %v", err))
 				return
 			}
 
-			// Store the fuzz request in loop context
-			loop.Set("fuzz_request", fuzzReq)
-			loop.Set("original_request", httpRequest)
-			loop.Set("is_https", utils.InterfaceToString(isHttps))
-
-			// Clear previous fuzz results
-			loop.Set("last_request", "")
-			loop.Set("last_response", "")
-			loop.Set("diff_result", "")
+			record := recordLoopHTTPFuzzMetaAction(loop, "set_http_request", fmt.Sprintf("is_https=%v; reason=%s", isHttps, reason), utils.ShrinkTextBlock(httpRequest, 240))
 
 			r.AddToTimeline("set_http_request", fmt.Sprintf("HTTP request set successfully, is_https: %v", isHttps))
 
@@ -58,11 +63,15 @@ var setHTTPRequestAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoop
 			var feedback strings.Builder
 			feedback.WriteString("HTTP request set successfully.\n\n")
 			feedback.WriteString("=== Request Summary ===\n")
-			feedback.WriteString(utils.ShrinkTextBlock(httpRequest, 500))
+			feedback.WriteString(utils.ShrinkTextBlock(result.CurrentState.RawRequest, 500))
 			feedback.WriteString("\n\n")
+			feedback.WriteString("The request will be executed with HTTP flow persistence enabled, so each fuzz result can be traced in the system by runtime and task context.\n\n")
 			feedback.WriteString("You can now use fuzz actions (fuzz_method, fuzz_path, fuzz_header, fuzz_get_params, fuzz_body, fuzz_cookie) to test this request.")
 
-			operator.Feedback(feedback.String())
+			feedbackMsg := buildLoopHTTPFuzzActionFeedback(record) + "\n\n" + feedback.String()
+			reactloops.EmitStatus(loop, "完成 / Complete")
+			reactloops.EmitActionLog(loop, loopHTTPFuzzActionLogNodeSetRequest, "HTTP 请求已设置 / HTTP Request Set")
+			operator.Feedback(feedbackMsg)
 			log.Infof("set_http_request done: request set successfully")
 		},
 	)

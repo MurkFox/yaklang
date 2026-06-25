@@ -367,6 +367,15 @@ func (r *testRuntime) GetBasicPromptInfo(tools []*aitool.Tool) (string, map[stri
 	return "", nil, nil
 }
 
+func (r *testRuntime) AssembleLoopPrompt(tools []*aitool.Tool, input *aicommon.LoopPromptAssemblyInput) (*aicommon.LoopPromptAssemblyResult, error) {
+	_ = tools
+	_ = input
+	return &aicommon.LoopPromptAssemblyResult{
+		Prompt:   "java decompiler test prompt",
+		Sections: nil,
+	}, nil
+}
+
 func (r *testRuntime) ExecuteLoopTaskIF(taskTypeName string, task aicommon.AIStatefulTask, options ...any) (bool, error) {
 	return false, nil
 }
@@ -409,6 +418,10 @@ func (r *testRuntime) EnhanceKnowledgeGetterEx(ctx context.Context, userQuery st
 	return "", nil
 }
 
+func (r *testRuntime) QuickKnowledgeSearch(ctx context.Context, query string, keywords []string, collections ...string) (string, error) {
+	return "", nil
+}
+
 func (r *testRuntime) EnhanceKnowledgeGetRandomN(ctx context.Context, n int, collections ...string) (string, error) {
 	return "", nil
 }
@@ -420,7 +433,32 @@ func (r *testRuntime) VerifyUserSatisfaction(ctx context.Context, query string, 
 func (r *testRuntime) RequireAIForgeAndAsyncExecute(ctx context.Context, forgeName string, onFinish func(error)) {
 }
 
+func (r *testRuntime) AsyncPlanOnly(ctx context.Context, planPayload string, onFinish func(error)) {
+}
+
 func (r *testRuntime) AsyncPlanAndExecute(ctx context.Context, planPayload string, onFinish func(error)) {
+}
+
+func (r *testRuntime) ReviewExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput) (*aicommon.ExecutePlanInput, error) {
+	return input, nil
+}
+
+func (r *testRuntime) ForceReviewExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput) (*aicommon.ExecutePlanInput, error) {
+	return input, nil
+}
+
+func (r *testRuntime) BeginPlanCoordinatorSession(ctx context.Context, input *aicommon.ExecutePlanInput, forceManualReview bool) (aicommon.PlanCoordinatorSession, error) {
+	return nil, nil
+}
+
+func (r *testRuntime) PublishDetachedPlan(ctx context.Context, input *aicommon.ExecutePlanInput, reactTaskID string) (string, error) {
+	return "", nil
+}
+
+func (r *testRuntime) AsyncExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput, onFinish func(error)) {
+}
+
+func (r *testRuntime) AsyncExecuteCod(ctx context.Context, coordinatorID string, onFinish func(error)) {
 }
 
 func (r *testRuntime) InvokeLiteForge(ctx context.Context, actionName string, prompt string, outputs []aitool.ToolOption, opts ...aicommon.GeneralKVConfigOption) (*aicommon.Action, error) {

@@ -1,23 +1,40 @@
 package mcp
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/samber/lo"
+	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
-	mcptool "github.com/yaklang/yaklang/common/mcp/mcp-go/mcp"
 	"github.com/yaklang/yaklang/common/urfavecli"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
+
+// legacyMCPToolSetOptions builds enable/disable options for legacy MCP tool sets.
+// When toolSets is empty, all registered tool sets are enabled (historical CLI default).
+func legacyMCPToolSetOptions(toolSets, disableToolSets []string) ([]McpServerOption, error) {
+	opts := make([]McpServerOption, 0, len(toolSets)+len(disableToolSets)+1)
+	if len(toolSets) == 0 {
+		opts = append(opts, WithEnableAllToolSets())
+	} else {
+		for _, toolSet := range toolSets {
+			opts = append(opts, WithEnableToolSet(toolSet))
+		}
+	}
+	for _, toolSet := range disableToolSets {
+		opts = append(opts, WithDisableToolSet(toolSet))
+	}
+	return opts, nil
+}
 
 var MCPCommandUsage = `Start a mcp server for providing mcp service.
 
-Available ToolSets: codec, cve, httpflow, hybrid_scan, payload, port_scan, yak_document, yak_script, reverse_shell, http_fuzzer, brute, subdomain, crawler, dynamic, ssa
+Available ToolSets: codec, cve, httpflow, hybrid_scan, payload, port_scan, yak_document, yak_script, reverse_shell, http_fuzzer, brute, subdomain, crawler, dynamic, ssa, project_database, global_hotpatch, system_proxy
 
 Available ResourceSets: codec`
 
@@ -34,7 +51,8 @@ var MCPCommand = &cli.Command{
 		cli.StringFlag{Name: "dr,disable-resource", Usage: "disable resource sets, split by ','"},
 		cli.StringSliceFlag{Name: "script", Usage: "add the dynamic Yak script as a tool to the MCP server"},
 		cli.StringFlag{Name: "base-url", Usage: "if transport is http-based, the base url of the MCP server"},
-		cli.BoolFlag{Name: "enable-yak-aitool", Usage: "enable yak ai tool"},
+		cli.BoolFlag{Name: "enable-aitool-framework", Usage: "expose built-in aitool-framework tools (fs, ssa, yakscript, etc.)"},
+		cli.BoolFlag{Name: "enable-bridge-external-mcp", Usage: "bridge external MCP servers already enabled in AI Agent"},
 	},
 	Action: func(c *cli.Context) error {
 		yakit.CallPostInitDatabase()
@@ -46,7 +64,8 @@ var MCPCommand = &cli.Command{
 		tool, disableTool := c.String("tool"), c.String("disable-tool")
 		script := c.StringSlice("script")
 		baseURL := c.String("base-url")
-		enableYakAITool := c.Bool("enable-yak-aitool")
+		enableAIToolFramework := c.Bool("enable-aitool-framework")
+		enableBridgeExternalMCP := c.Bool("enable-bridge-external-mcp")
 		toolSets := lo.FilterMap(strings.Split(tool, ","), func(item string, _ int) (string, bool) {
 			item = strings.TrimSpace(item)
 			return item, item != ""
@@ -65,13 +84,12 @@ var MCPCommand = &cli.Command{
 			return item, item != ""
 		})
 
-		opts := make([]McpServerOption, 0, len(toolSets)+len(disableToolSets)+len(resourceSets)+len(disableResourceSets))
-		for _, toolSet := range toolSets {
-			opts = append(opts, WithEnableToolSet(toolSet))
+		opts := make([]McpServerOption, 0, len(toolSets)+len(disableToolSets)+len(resourceSets)+len(disableResourceSets)+1)
+		legacyOpts, legacyErr := legacyMCPToolSetOptions(toolSets, disableToolSets)
+		if legacyErr != nil {
+			return legacyErr
 		}
-		for _, toolSet := range disableToolSets {
-			opts = append(opts, WithDisableToolSet(toolSet))
-		}
+		opts = append(opts, legacyOpts...)
 		for _, resourceSet := range resourceSets {
 			opts = append(opts, WithEnableResourceSet(resourceSet))
 		}
@@ -82,32 +100,36 @@ var MCPCommand = &cli.Command{
 			opts = append(opts, WithDynamicScript(script))
 		}
 
-		if enableYakAITool {
-			_, yakitTools, err := yakit.SearchAIYakToolWithPagination(consts.GetGormProfileDatabase(), "", false, &ypb.Paging{
-				OrderBy: "updated_at",
-				Order:   "desc",
-				Limit:   200,
-			})
-			if err != nil {
-				log.Errorf("failed to search yakit tools: %s", err)
-			}
+		if enableAIToolFramework {
+			db := consts.GetGormProfileDatabase()
 
-			tools := make([]*mcptool.Tool, 0, len(yakitTools))
-			for _, aiTool := range yakitTools {
-				tool := mcptool.NewTool(aiTool.Name)
-				tool.Description = aiTool.Description
-				dataMap := map[string]any{}
-				err := json.Unmarshal([]byte(aiTool.Params), &dataMap)
-				if err != nil {
-					log.Errorf("unmarshal aiTool.Params failed: %v", err)
-					continue
-				}
-				tool.InputSchema.FromMap(dataMap)
-				tool.YakScript = aiTool.Content
-				tools = append(tools, tool)
+			// Built-in framework tools: fs, ssa, yakscript, etc.
+			builtinTools := buildinaitools.GetAllToolsDynamically(db)
+			if len(builtinTools) > 0 {
+				opts = append(opts, WithAITools(builtinTools...))
+				log.Infof("loaded %d built-in aitool-framework tools", len(builtinTools))
 			}
+		}
 
-			opts = append(opts, WithYakScriptTools(tools...))
+		if enableBridgeExternalMCP {
+			db := consts.GetGormProfileDatabase()
+			externalTools, mcpErr := aitool.LoadAllEnabledAIToolsFromMCPServers(db, context.Background())
+			if mcpErr != nil {
+				log.Warnf("load external mcp tools via bridge failed: %v", mcpErr)
+			} else if len(externalTools) > 0 {
+				opts = append(opts, WithAITools(externalTools...))
+				log.Infof("loaded %d external mcp tools via bridge", len(externalTools))
+			}
+		}
+
+		// Apply per-tool enable/disable state from the profile DB, matching the
+		// behaviour of grpc_mcp.go launchMcpServer.
+		disabledTools, dbErr := yakit.GetDisabledMCPClientToolNames(consts.GetGormProfileDatabase())
+		if dbErr != nil {
+			log.Warnf("mcp command: failed to load disabled tool list from DB: %v", dbErr)
+		}
+		if len(disabledTools) > 0 {
+			opts = append(opts, WithDisabledToolNames(disabledTools))
 		}
 
 		s, err := NewMCPServer(opts...)

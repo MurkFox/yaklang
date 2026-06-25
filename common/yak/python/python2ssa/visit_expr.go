@@ -861,6 +861,9 @@ func (b *singleFileBuilder) VisitName(raw *pythonparser.NameContext) interface{}
 	if wildcardValue := b.resolveWildcardImportName(name); wildcardValue != nil {
 		return wildcardValue
 	}
+	if modExport := b.readVirtualModuleExport(name); modExport != nil {
+		return modExport
+	}
 	// Fall back to the original full lookup path for closure/freevalue resolution,
 	// externs, and undefined placeholders.
 	if varVal := b.ReadValue(name); varVal != nil {
@@ -1133,7 +1136,10 @@ func (b *singleFileBuilder) VisitTrailer(raw *pythonparser.TrailerContext, obj s
 						return b.VisitArguments(argCtx, methodVal)
 					}
 					if b.shouldUseDynamicMemberFallback(obj) {
-						return b.VisitArguments(argCtx, b.newDynamicPlaceholder(syntheticName))
+						// ph := b.newDynamicPlaceholder(syntheticName)
+						// ssa.SetMemberCallRelationship(obj, memberKey, ph)
+						ph := b.ReadMemberCallValue(obj, memberKey)
+						return b.VisitArguments(argCtx, ph)
 					}
 					obj = b.ensureDynamicObjectType(obj)
 					methodVal := b.ensureDynamicValueType(b.ReadMemberCallMethod(obj, memberKey))
@@ -1141,15 +1147,15 @@ func (b *singleFileBuilder) VisitTrailer(raw *pythonparser.TrailerContext, obj s
 				}
 			}
 			if obj.GetType() != nil && obj.GetType().GetTypeKind() == ssa.ClassBluePrintTypeKind {
-				if blueprint, ok := ssa.ToClassBluePrintType(obj.GetType()); ok && !b.hasBlueprintMemberOrMethod(blueprint, attrName) {
-					return b.newDynamicPlaceholder(syntheticName)
-				}
 				b.ensureBlueprintMember(obj, attrName)
 				obj = b.ensureDynamicObjectType(obj)
 				return b.ensureDynamicValueType(b.ReadMemberCallValue(obj, memberKey))
 			}
 			if b.shouldUseDynamicMemberFallback(obj) {
-				return b.newDynamicPlaceholder(syntheticName)
+				// ph := b.newDynamicPlaceholder(syntheticName)
+				// ssa.SetMemberCallRelationship(obj, memberKey, ph)
+				ph := b.ReadMemberCallValue(obj, memberKey)
+				return b.ensureDynamicValueType(ph)
 			}
 			obj = b.ensureDynamicObjectType(obj)
 			return b.ensureDynamicValueType(b.ReadMemberCallValue(obj, memberKey))

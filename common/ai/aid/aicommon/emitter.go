@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yaklang/yaklang/common/ai/aispec"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
@@ -23,6 +24,27 @@ import (
 
 type BaseEmitter func(e *schema.AiOutputEvent) (*schema.AiOutputEvent, error)
 type EventProcesser func(e *schema.AiOutputEvent) *schema.AiOutputEvent
+type AIEventMetaProvider func() AIEventMeta
+
+// AIEventMeta carries the runtime AI metadata that should be attached to
+// events emitted within a specific AI call scope.
+type AIEventMeta struct {
+	Service          string
+	ModelName        string
+	ModelVerboseName string
+}
+
+func (m AIEventMeta) normalize() AIEventMeta {
+	if m.ModelVerboseName == "" && m.ModelName != "" {
+		m.ModelVerboseName = aispec.ModelVerboseName(m.ModelName)
+	}
+	return m
+}
+
+func (m AIEventMeta) empty() bool {
+	return m.Service == "" && m.ModelName == "" && m.ModelVerboseName == ""
+}
+
 type Emitter struct {
 	streamWG              *sync.WaitGroup
 	id                    string
@@ -48,6 +70,37 @@ func (i *Emitter) SetStreamNodeIdI18nProvider(p func(nodeId string) *schema.I18n
 	i.streamNodeIdI18nProvider = p
 }
 
+// WithAIInfoProvider returns a scoped emitter that resolves runtime AI metadata
+// on each emit, which is useful when the actual model/provider are determined
+// asynchronously after the emitter is bound.
+func (i *Emitter) WithAIInfoProvider(provider AIEventMetaProvider) *Emitter {
+	if i == nil {
+		return nil
+	}
+	if provider == nil {
+		return i
+	}
+	return i.PushEventProcesser(func(event *schema.AiOutputEvent) *schema.AiOutputEvent {
+		if event == nil {
+			return nil
+		}
+		meta := provider().normalize()
+		if meta.empty() {
+			return event
+		}
+		if event.AIService == "" {
+			event.AIService = meta.Service
+		}
+		if event.AIModelName == "" {
+			event.AIModelName = meta.ModelName
+		}
+		if event.AIModelVerboseName == "" {
+			event.AIModelVerboseName = meta.ModelVerboseName
+		}
+		return event
+	})
+}
+
 func (i *Emitter) AssociativeAIProcess(newProcess *schema.AiProcess) *Emitter {
 	err := yakit.CreateAIProcess(consts.GetGormProjectDatabase(), newProcess)
 	if err != nil {
@@ -56,6 +109,7 @@ func (i *Emitter) AssociativeAIProcess(newProcess *schema.AiProcess) *Emitter {
 	callBack := func(event *schema.AiOutputEvent) *schema.AiOutputEvent {
 		if newProcess.ProcessType == schema.AI_Call_Tool {
 			event.CallToolID = newProcess.ProcessId
+			event.RecoveryIndexID = newProcess.ProcessId
 		}
 		event.ProcessesId = append(event.ProcessesId, newProcess.ProcessId)
 		return event
@@ -77,6 +131,24 @@ func (i *Emitter) PushEventProcesser(newHandler EventProcesser) *Emitter {
 	}
 	copyEmitter.eventProcesserStack.Push(newHandler)
 	return copyEmitter
+}
+
+// PushEventProcessersFrom returns an emitter that runs all processors registered on other,
+// then this emitter's own processors and handler. Used when binding a task-level emitter
+// while preserving loop-scoped event filters (e.g. deferred yaklang editor sync).
+func (i *Emitter) PushEventProcessersFrom(other *Emitter) *Emitter {
+	if i == nil {
+		return other
+	}
+	if other == nil || other.eventProcesserStack == nil || other.eventProcesserStack.Len() == 0 {
+		return i
+	}
+	result := i
+	other.eventProcesserStack.ForeachStack(func(f EventProcesser) bool {
+		result = result.PushEventProcesser(f)
+		return true
+	})
+	return result
 }
 
 func (i *Emitter) PopEventProcesser() *Emitter {
@@ -107,12 +179,25 @@ func (i *Emitter) callEventBeforeSave(event *schema.AiOutputEvent) *schema.AiOut
 }
 
 func (i *Emitter) emit(e *schema.AiOutputEvent) (finalEvent *schema.AiOutputEvent, retErr error) {
-	if err := recover(); err != nil {
-		retErr = utils.Errorf("Emitter panic: %v", err)
-		_ = retErr
-	}
+	// 关键词: Emitter panic 兜底, send on closed channel 兜底, defer recover 修复
+	// 注意: recover() 必须在 defer 函数内部调用才有效, 之前直接在函数体内调用 recover()
+	// 实际永远返回 nil, 完全形同虚设. 这是 panic: send on closed channel 长期溢出
+	// 到测试 cleanup 阶段后导致整个进程退出的根因.
+	// 现在通过 defer 包裹 recover, 把 baseEmitter / eventProcesserStack 中下游
+	// (channel send / EventHandler 回调等) 的 panic 收敛为 retErr 返回, 不再让
+	// panic 穿透到 runtime 引发进程退出.
+	defer func() {
+		if r := recover(); r != nil {
+			finalEvent = e
+			retErr = utils.Errorf("Emitter panic recovered: %v", r)
+			log.Warnf("Emitter.emit recovered panic: %v", r)
+		}
+	}()
 	if i.eventProcesserStack != nil {
 		e = i.callEventBeforeSave(e)
+	}
+	if e == nil {
+		return nil, nil
 	}
 	if i.baseEmitter != nil {
 		var err error
@@ -175,7 +260,17 @@ func (r *Emitter) EmitSystemJSON(typeName schema.EventType, id string, i any) (*
 	return r.emit(event)
 }
 
+// EmitAPIRequestFailed emits a system JSON event with type EVENT_TYPE_API_REQUEST_FAILED.
+// It is used for AI model API call failures so clients can detect and handle them uniformly.
+func (r *Emitter) EmitAPIRequestFailed(id string, payload map[string]any) (*schema.AiOutputEvent, error) {
+	return r.EmitSystemJSON(schema.EVENT_TYPE_API_REQUEST_FAILED, id, payload)
+}
+
 func (r *Emitter) EmitSyncJSON(typeName schema.EventType, id string, i any, syncID string) (*schema.AiOutputEvent, error) {
+	return r.EmitSyncJSONWithTaskIndex(typeName, id, i, syncID, "")
+}
+
+func (r *Emitter) EmitSyncJSONWithTaskIndex(typeName schema.EventType, id string, i any, syncID, taskIndex string) (*schema.AiOutputEvent, error) {
 	event := &schema.AiOutputEvent{
 		CoordinatorId: r.id,
 		Type:          typeName,
@@ -185,6 +280,7 @@ func (r *Emitter) EmitSyncJSON(typeName schema.EventType, id string, i any, sync
 		Content:       utils.Jsonify(i),
 		Timestamp:     time.Now().Unix(),
 		SyncID:        syncID,
+		TaskIndex:     taskIndex,
 	}
 	return r.emit(event)
 }
@@ -199,11 +295,25 @@ func (r *Emitter) EmitSyncEventError(id string, err error, syncID string) (*sche
 	}, syncID)
 }
 
+func (r *Emitter) EmitYakitRiskCount(runtimeID string, count int) (*schema.AiOutputEvent, error) {
+	return r.EmitJSON(schema.EVENT_TYPE_YAKIT_RISK_COUNT, "yakit", map[string]any{
+		"runtime_id": runtimeID,
+		"risk_count": count,
+	})
+}
+
 func (r *Emitter) EmitYakitRisk(id uint, title string, runtimeID string) (*schema.AiOutputEvent, error) {
 	return r.EmitJSON(schema.EVENT_TYPE_YAKIT_RISK, "yakit", map[string]any{
 		"risk_id":    id,
 		"title":      title,
 		"runtime_id": runtimeID,
+	})
+}
+
+func (r *Emitter) EmitYakitHTTPFlowCount(runtimeID string, count int) (*schema.AiOutputEvent, error) {
+	return r.EmitJSON(schema.EVENT_TYPE_YAKIT_HTTPFLOW_COUNT, "yakit", map[string]any{
+		"runtime_id":      runtimeID,
+		"http_flow_count": count,
 	})
 }
 
@@ -471,10 +581,19 @@ func (r *Emitter) EmitToolCallUserCancel(callToolId string, endTime time.Time, s
 }
 
 func (r *Emitter) EmitToolCallSummary(callToolId string, summary string) (*schema.AiOutputEvent, error) {
-	return r.EmitJSON(schema.EVENT_TOOL_CALL_SUMMARY, callToolId, map[string]any{
-		"call_tool_id": callToolId,
-		"summary":      summary,
-	})
+	event := &schema.AiOutputEvent{
+		CoordinatorId: r.id,
+		Type:          schema.EVENT_TOOL_CALL_SUMMARY,
+		NodeId:        callToolId,
+		IsJson:        true,
+		Content: utils.Jsonify(map[string]any{
+			"call_tool_id": callToolId,
+			"summary":      summary,
+		}),
+		Timestamp:  time.Now().Unix(),
+		CallToolID: callToolId,
+	}
+	return r.emit(event)
 }
 
 func (r *Emitter) EmitToolCallDecision(callToolId string, action string, summary string) (*schema.AiOutputEvent, error) {
@@ -493,6 +612,13 @@ func (r *Emitter) EmitToolCallResult(callToolId string, result any) (*schema.AiO
 	})
 }
 
+func (r *Emitter) EmitToolCallParam(callToolId string, params aitool.InvokeParams) (*schema.AiOutputEvent, error) {
+	return r.EmitJSON(schema.EVENT_TOOL_CALL_PARAM, callToolId, map[string]any{
+		"call_tool_id": callToolId,
+		"params":       params,
+	})
+}
+
 func (r *Emitter) EmitToolCallLogDir(callToolId string, dirPath string) (*schema.AiOutputEvent, error) {
 	return r.EmitJSON(schema.EVENT_TOOL_CALL_LOG_DIR, callToolId, map[string]any{
 		"call_tool_id": callToolId,
@@ -508,6 +634,7 @@ const (
 	TypeCodeYaklang        = "code/yaklang"
 	TypeCodePython         = "code/python"
 	TypeCodeHTTPRequest    = "code/http-request"
+	TypeCodeHTTPResponse   = "code/http-response"
 )
 
 // EmitToolCallStd emits throttled stream events for tool stdout and stderr.
@@ -522,24 +649,26 @@ func (r *Emitter) EmitToolCallStd(toolName string, stdOut, stdErr io.Reader, tas
 	stderrDone := make(chan struct{})
 
 	_, _ = r.emitStreamEvent(&streamEvent{
-		disableMarkdown:    true,
-		startTime:          time.Now(),
-		reader:             stdOut,
-		nodeId:             fmt.Sprintf("tool-%v-stdout", toolName),
-		contentType:        TypeLogTool,
-		taskIndex:          taskIndex,
-		throttleInterval:   DefaultToolStdThrottleInterval,
-		emitFinishCallback: []func(){func() { close(stdoutDone) }},
+		disableMarkdown:      true,
+		startTime:            time.Now(),
+		reader:               stdOut,
+		nodeId:               fmt.Sprintf("tool-%v-stdout", toolName),
+		contentType:          TypeLogTool,
+		taskIndex:            taskIndex,
+		throttleInterval:     DefaultToolStdThrottleInterval,
+		disableRecoveryBlock: true,
+		emitFinishCallback:   []func(){func() { close(stdoutDone) }},
 	})
 	_, _ = r.emitStreamEvent(&streamEvent{
-		disableMarkdown:    true,
-		startTime:          time.Now(),
-		reader:             stdErr,
-		nodeId:             fmt.Sprintf("tool-%v-stderr", toolName),
-		contentType:        TypeLogToolErrorOutput,
-		taskIndex:          taskIndex,
-		throttleInterval:   DefaultToolStdThrottleInterval,
-		emitFinishCallback: []func(){func() { close(stderrDone) }},
+		disableMarkdown:      true,
+		startTime:            time.Now(),
+		reader:               stdErr,
+		nodeId:               fmt.Sprintf("tool-%v-stderr", toolName),
+		contentType:          TypeLogToolErrorOutput,
+		taskIndex:            taskIndex,
+		throttleInterval:     DefaultToolStdThrottleInterval,
+		disableRecoveryBlock: true,
+		emitFinishCallback:   []func(){func() { close(stderrDone) }},
 	})
 
 	return func() {
@@ -578,6 +707,20 @@ func (r *Emitter) EmitHTTPRequestStreamEvent(nodeId string, reader io.Reader, ta
 	return r.EmitStreamEventWithContentType(nodeId, reader, taskIndex, TypeCodeHTTPRequest, finishCallback...)
 }
 
+func (r *Emitter) EmitDefaultSystemStreamEvent(nodeId string, reader io.Reader, taskIndex string, finishCallback ...func()) (*schema.AiOutputEvent, error) {
+	return r.emitStreamEvent(&streamEvent{
+		disableMarkdown:    true,
+		startTime:          time.Now(),
+		isSystem:           true,
+		isReason:           false,
+		reader:             utils.UTF8Reader(reader),
+		nodeId:             nodeId,
+		contentType:        "",
+		taskIndex:          taskIndex,
+		emitFinishCallback: finishCallback,
+	})
+}
+
 func (r *Emitter) EmitDefaultStreamEvent(nodeId string, reader io.Reader, taskIndex string, finishCallback ...func()) (*schema.AiOutputEvent, error) {
 	return r.emitStreamEvent(&streamEvent{
 		disableMarkdown:    true,
@@ -592,11 +735,11 @@ func (r *Emitter) EmitDefaultStreamEvent(nodeId string, reader io.Reader, taskIn
 	})
 }
 
-func (r *Emitter) EmitStreamEventWithContentType(nodeId string, reader io.Reader, taskIndex string, contentType string, finishCallback ...func()) (*schema.AiOutputEvent, error) {
+func (r *Emitter) EmitStreamEventWithContentTypeEx(nodeId string, reader io.Reader, taskIndex string, contentType string, isSystem bool, finishCallback ...func()) (*schema.AiOutputEvent, error) {
 	return r.emitStreamEvent(&streamEvent{
 		disableMarkdown:    true,
 		startTime:          time.Now(),
-		isSystem:           false,
+		isSystem:           isSystem,
 		isReason:           false,
 		reader:             reader,
 		nodeId:             nodeId,
@@ -604,6 +747,10 @@ func (r *Emitter) EmitStreamEventWithContentType(nodeId string, reader io.Reader
 		taskIndex:          taskIndex,
 		emitFinishCallback: finishCallback,
 	})
+}
+
+func (r *Emitter) EmitStreamEventWithContentType(nodeId string, reader io.Reader, taskIndex string, contentType string, finishCallback ...func()) (*schema.AiOutputEvent, error) {
+	return r.EmitStreamEventWithContentTypeEx(nodeId, reader, taskIndex, contentType, false, finishCallback...)
 }
 
 func (r *Emitter) EmitStreamEventEx(nodeId string, startTime time.Time, reader io.Reader, taskIndex string, disableMarkdown bool, finishCallback ...func()) (*schema.AiOutputEvent, error) {
@@ -658,7 +805,7 @@ func (r *Emitter) EmitReasonStreamEvent(nodeId string, startTime time.Time, read
 }
 
 func (r *Emitter) emitStartStreamEvent(ts int64, er *streamAIOutputEventWriter) (*schema.AiOutputEvent, error) {
-	return r.emit(&schema.AiOutputEvent{
+	event := &schema.AiOutputEvent{
 		CoordinatorId: er.coordinatorId,
 		Type:          schema.EVENT_TYPE_STREAM_START,
 		NodeId:        er.nodeId,
@@ -675,7 +822,12 @@ func (r *Emitter) emitStartStreamEvent(ts int64, er *streamAIOutputEventWriter) 
 		TaskIndex:       er.taskIndex,
 		DisableMarkdown: true,
 		ContentType:     er.contentType,
-	})
+	}
+	if !er.disableRecoveryBlock {
+		event.IsRecoveryBlock = true
+		event.RecoveryIndexID = er.eventWriterID
+	}
+	return r.emit(event)
 }
 
 func (r *Emitter) emitStreamEvent(e *streamEvent) (*schema.AiOutputEvent, error) {
@@ -708,6 +860,16 @@ func (r *Emitter) emitStreamEvent(e *streamEvent) (*schema.AiOutputEvent, error)
 
 	go func() {
 		defer r.streamWG.Done()
+		// 关键词: stream emit goroutine panic 兜底, send on closed channel 兜底
+		// 异步 stream 复制 / r.emit(streamFinished) 可能在 EventHandler 监听
+		// 端 (e.g. test outputChan) 已关闭后才 fire. 即便 Emitter.emit 自身已
+		// 经 defer recover, 这里再叠一层 recover, 防止 io.Copy / producer.Write
+		// 内部某条路径绕过 emit 仍触发 send on closed channel 而让进程退出.
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Warnf("emitStreamEvent goroutine panic recovered: %v", rec)
+			}
+		}()
 		defer func() {
 			for _, f := range e.emitFinishCallback {
 				if f == nil {
@@ -727,16 +889,29 @@ func (r *Emitter) emitStreamEvent(e *streamEvent) (*schema.AiOutputEvent, error)
 		}
 		if n > 0 {
 			du := time.Since(e.startTime)
-			r.EmitStructured("stream-finished", map[string]any{
-				"node_id":         e.nodeId,
-				"coordinator_id":  r.id,
-				"is_system":       e.isSystem,
-				"is_reason":       e.isReason,
-				"start_timestamp": startTS,
-				"task_index":      e.taskIndex,
-				"event_writer_id": ewid,
-				"duration_ms":     du.Milliseconds(),
-			})
+			streamFinished := &schema.AiOutputEvent{
+				CoordinatorId: r.id,
+				Type:          schema.EVENT_TYPE_STRUCTURED,
+				NodeId:        "stream-finished",
+				IsJson:        true,
+				Content: utils.Jsonify(map[string]any{
+					"node_id":         e.nodeId,
+					"coordinator_id":  r.id,
+					"is_system":       e.isSystem,
+					"is_reason":       e.isReason,
+					"start_timestamp": startTS,
+					"task_index":      e.taskIndex,
+					"event_writer_id": ewid,
+					"duration_ms":     du.Milliseconds(),
+				}),
+				IsSystem:  producer.isSystem,
+				Timestamp: time.Now().Unix(),
+				TaskIndex: e.taskIndex,
+			}
+			if !e.disableRecoveryBlock {
+				streamFinished.RecoveryIndexID = ewid
+			}
+			r.emit(streamFinished)
 		}
 	}()
 
@@ -831,6 +1006,21 @@ func (e *Emitter) EmitResult(nodeId string, result interface{}, success bool) (*
 	})
 }
 
+func (e *Emitter) EmitNotify(promptType string, content string, duration time.Duration) (*schema.AiOutputEvent, error) {
+	if duration < 0 {
+		duration = 0
+	}
+	return e.EmitJSON(schema.EVENT_TYPE_NOTIFY, promptType, map[string]any{
+		"type":             promptType,
+		"warning_type":     promptType,
+		"content":          content,
+		"duration":         duration.Seconds(),
+		"duration_ms":      duration.Milliseconds(),
+		"duration_seconds": duration.Seconds(),
+		"timestamp":        time.Now().Unix(),
+	})
+}
+
 func (e *Emitter) EmitPinDirectory(path string) (*schema.AiOutputEvent, error) {
 	return e.EmitJSON(schema.EVENT_TYPE_FILESYSTEM_PIN_DIRECTORY, "filesystem", map[string]any{
 		"path":      path,
@@ -854,6 +1044,92 @@ func (e *Emitter) EmitResultAfterStream(nodeId string, result interface{}, succe
 		"finished":     true,
 		"after_stream": true,
 		"timestamp":    time.Now().Unix(),
+	})
+}
+
+func (e *Emitter) EmitIntentRecognition(
+	nodeId string,
+	intent string,
+	recommendedTools string,
+	recommendedForges string,
+	matchedToolNames string,
+	matchedForgeNames string,
+	matchedSkillNames string,
+	contextEnrichment string,
+) (*schema.AiOutputEvent, error) {
+	return e.EmitJSON(schema.EVENT_TYPE_INTENT_RECOGNITION, nodeId, map[string]any{
+		"intent":              intent,
+		"recommended_tools":   recommendedTools,
+		"recommended_forges":  recommendedForges,
+		"matched_tool_names":  matchedToolNames,
+		"matched_forge_names": matchedForgeNames,
+		"matched_skill_names": matchedSkillNames,
+		"context_enrichment":  contextEnrichment,
+		"timestamp":           time.Now().Unix(),
+	})
+}
+
+// EmitPerception 把一次 perception 评估结果以事件形式投递给前端.
+//
+// intentShift 是后加入的可选字段, 表达本轮意图相对上一轮的方向性变更粒度
+// (none/drift/pivot). 仅作前端展示与诊断, 不影响事件路由. 可空字符串.
+//
+// 关键词: EmitPerception 签名扩展, intent_shift 透传前端
+func (e *Emitter) EmitPerception(
+	nodeId string,
+	summary string,
+	topics []string,
+	keywords []string,
+	changed bool,
+	confidence float64,
+	trigger string,
+	epoch int,
+	intentShift string,
+) (*schema.AiOutputEvent, error) {
+	return e.EmitJSON(schema.EVENT_TYPE_PERCEPTION, nodeId, map[string]any{
+		"summary":      summary,
+		"topics":       topics,
+		"keywords":     keywords,
+		"changed":      changed,
+		"confidence":   confidence,
+		"trigger":      trigger,
+		"epoch":        epoch,
+		"intent_shift": intentShift,
+		"timestamp":    time.Now().Unix(),
+	})
+}
+
+func (e *Emitter) EmitPerceptionCapabilities(
+	nodeId string,
+	query string,
+	matchedToolNames []string,
+	matchedForgeNames []string,
+	matchedSkillNames []string,
+	matchedFocusModeNames []string,
+	recommendedCapabilities []string,
+) (*schema.AiOutputEvent, error) {
+	return e.EmitJSON(schema.EVENT_TYPE_PERCEPTION_CAPABILITY, nodeId, map[string]any{
+		"query":                    query,
+		"matched_tool_names":       matchedToolNames,
+		"matched_forge_names":      matchedForgeNames,
+		"matched_skill_names":      matchedSkillNames,
+		"matched_focus_mode_names": matchedFocusModeNames,
+		"recommended_capabilities": recommendedCapabilities,
+		"timestamp":                time.Now().Unix(),
+	})
+}
+
+func (e *Emitter) EmitPerceptionKnowledge(
+	nodeId string,
+	query string,
+	knowledgeBases []string,
+	content string,
+) (*schema.AiOutputEvent, error) {
+	return e.EmitJSON(schema.EVENT_TYPE_PERCEPTION_KNOWLEDGE, nodeId, map[string]any{
+		"query":           query,
+		"knowledge_bases": knowledgeBases,
+		"content":         content,
+		"timestamp":       time.Now().Unix(),
 	})
 }
 
@@ -902,9 +1178,10 @@ func (e *Emitter) EmitKnowledgeListAboutTask(nodeId string, taskID string, resul
 func (e *Emitter) EmitReferenceMaterial(typeName string, eventId string, content any) (*schema.AiOutputEvent, error) {
 	log.Infof("emit reference material: [%v]-[to:%v] content: %v", typeName, eventId, utils.ShrinkTextBlock(utils.InterfaceToString(content), 256))
 	return e.EmitJSON(schema.EVENT_TYPE_REFERENCE_MATERIAL, "reference_material", map[string]any{
-		"event_uuid": eventId,
-		"type":       typeName, // text / file / url / other
-		"payload":    utils.InterfaceToString(content),
+		"event_uuid":      eventId,
+		"type":            typeName, // text / file / url / other
+		"payload":         utils.InterfaceToString(content),
+		"event_writer_id": eventId, // filled in stream event writer if emitted from stream
 	})
 }
 

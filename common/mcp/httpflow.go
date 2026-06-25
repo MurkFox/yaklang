@@ -111,23 +111,82 @@ var filterHTTPFlowToolOptions = []mcp.ToolOption{
 		mcp.Description("Exclude flows containing these keywords"),
 	),
 	mcp.WithString("keywordType",
-		mcp.Description("Type of keyword to search for (empty means all, or response, or request)"),
-		mcp.Enum("", "response", "request"),
+		mcp.Description(`Type of keyword to search for. Allowed values: "response", "request", or leave empty to search all`),
+		mcp.Enum("response", "request"),
+	),
+	mcp.WithBool("haveCommonParams",
+		mcp.Description("Filter flows that have common parameters (GET/POST/Cookie)"),
+	),
+	mcp.WithNumberArray("excludeId",
+		mcp.Description("Exclude flows with these IDs"),
+	),
+	mcp.WithNumberArray("includeId",
+		mcp.Description("Include only flows with these IDs"),
+	),
+	mcp.WithString("haveParamsTotal",
+		mcp.Description("Filter flows by total parameter count expression, e.g. \">0\" or \"=3\""),
+	),
+	mcp.WithStringArray("color",
+		mcp.Description("Filter flows by color labels"),
+	),
+	mcp.WithNumber("offsetId",
+		mcp.Description("Offset ID for cursor-based pagination"),
+	),
+	mcp.WithStringArray("includeHash",
+		mcp.Description("Include only flows matching these hashes"),
+	),
+	mcp.WithString("payloadKeyword",
+		mcp.Description("Keyword to search within the payload field"),
+	),
+	mcp.WithString("excludeStatusCode",
+		mcp.Description("HTTP status codes to exclude, e.g. \"200,301\""),
+	),
+	mcp.WithStringArray("hostnameFilter",
+		mcp.Description("Fuzzy-match filter on hostname"),
+	),
+	mcp.WithStructArray("mitmExtractAggregateFilterRows",
+		[]mcp.PropertyOption{
+			mcp.Description("MITM extract aggregate filter rows for advanced filtering"),
+		},
+		mcp.WithString("ruleVerbose",
+			mcp.Description("Rule verbose name"),
+		),
+		mcp.WithString("displayData",
+			mcp.Description("Display data value to match"),
+		),
 	),
 }
+
+// httpFlowDatabaseHint is appended to every HTTP-flow tool description so that
+// AI clients understand that results come from the *current* project database.
+// If no data is found, the agent should verify and potentially switch the active
+// project before retrying.
+const httpFlowDatabaseHint = `
+<IMPORTANT>
+HTTP flow records are stored in the CURRENT project database.
+If the query returns no results or unexpected results, the active project database may not be the one the user intended.
+Recommended recovery steps:
+  1. Call get_current_database_context to inspect the active project database.
+  2. Call list_project_databases to enumerate all available projects.
+  3. Present the project list to the user and ask which project to switch to. DO NOT switch automatically.
+  4. Only call switch_current_project_database after the user explicitly confirms their choice.
+</IMPORTANT>`
 
 func init() {
 	AddGlobalToolSet("httpflow",
 		WithTool(mcp.NewTool("query_http_flow",
 			append([]mcp.ToolOption{
-				mcp.WithDescription("Query HTTP flow data with flexible filters"),
-			}, filterYakScriptToolOptions...)...,
+				mcp.WithDescription("Query HTTP flow data with flexible filters." + httpFlowDatabaseHint),
+			}, filterHTTPFlowToolOptions...)...,
 		), handleQueryHTTPFlows),
 		WithTool(mcp.NewTool(string("set_tag_for_http_flow"),
-			mcp.WithDescription("Sets tags for an HTTP flow"),
+			mcp.WithDescription("Sets tags for an HTTP flow."+httpFlowDatabaseHint),
 			mcp.WithNumber("id",
 				mcp.Description("The ID of the HTTP flow, maybe use query_http_flow to get the ID of the flow to be tagged"),
 				mcp.Required(),
+			),
+			mcp.WithString("hash",
+				mcp.Description("The hash of the HTTP flow; alternative to id for locating the flow"),
 			),
 			mcp.WithStringArray("tags",
 				mcp.Description("The tags to be set for the HTTP flow"),
@@ -135,9 +194,21 @@ func init() {
 			),
 		), handleSetTagForHTTPFlow),
 		WithTool(mcp.NewTool(string("delete_http_flow"),
-			mcp.WithDescription("Delete HTTP flow with flexible filters"),
+			mcp.WithDescription("Delete HTTP flow with flexible filters."+httpFlowDatabaseHint),
 			mcp.WithBool("deleteAll",
 				mcp.Description("Delete all flows")),
+			mcp.WithNumberArray("id",
+				mcp.Description("Delete flows with these specific IDs"),
+			),
+			mcp.WithStringArray("itemHash",
+				mcp.Description("Delete flows matching these hashes"),
+			),
+			mcp.WithString("urlPrefix",
+				mcp.Description("Delete flows whose URL starts with this prefix"),
+			),
+			mcp.WithStringArray("urlPrefixBatch",
+				mcp.Description("Delete flows whose URL starts with any of these prefixes"),
+			),
 			mcp.WithStruct("filter",
 				[]mcp.PropertyOption{
 					mcp.Description("Filter that same with query_http_flow arguments"),
@@ -208,7 +279,22 @@ func handleQueryHTTPFlows(s *MCPServer) server.ToolHandlerFunc {
 			}
 			results = append(results, ypbHTTPFlowToFriendlyHTTPFlow(flow))
 		}
-		return NewCommonCallToolResult(results)
+
+		dbCtx := buildCurrentDatabaseContext(ctx, s, "")
+		projectName := "(default)"
+		if dbCtx.CurrentProject != nil && dbCtx.CurrentProject.GetProjectName() != "" {
+			projectName = dbCtx.CurrentProject.GetProjectName()
+		}
+		ret := map[string]any{
+			"current_project":  projectName,
+			"current_database": dbCtx.CurrentProjectDBPath,
+			"flows":            results,
+			"total":            rsp.GetTotal(),
+		}
+		if len(results) == 0 {
+			ret["hint"] = "No HTTP flows found. The data may reside in a different project database. Call list_project_databases to get all available projects, present the list to the user, and ask them to confirm which project to switch to. Only call switch_current_project_database after the user explicitly confirms their choice."
+		}
+		return NewCommonCallToolResult(ret)
 	}
 }
 

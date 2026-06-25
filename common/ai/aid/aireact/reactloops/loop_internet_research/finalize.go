@@ -25,6 +25,11 @@ func hasFinalResearchReportDelivered(loop *reactloops.ReActLoop) bool {
 	return utils.InterfaceToBoolean(loop.Get(finalResearchReportDeliveredKey))
 }
 
+// emitFinalResearchReport 把已生成的调研报告以「参考资料 + DirectlyAnswer 对话答复」方式投递给用户。
+// 行为：
+//  1. 将报告原文压缩后注入 timeline，作为 DirectlyAnswer 的对话上下文。
+//  2. 调用 DirectlyAnswer 让模型基于素材生成对话式回答；报告作为 reference material 挂在答复事件上。
+//  3. DirectlyAnswer 失败/为空 → 回退到「直接 emit markdown 报告」的旧路径，保证不退化。
 func emitFinalResearchReport(loop *reactloops.ReActLoop, invoker aicommon.AIInvokeRuntime, finalContent string) bool {
 	finalContent = strings.TrimSpace(finalContent)
 	if finalContent == "" {
@@ -37,6 +42,54 @@ func emitFinalResearchReport(loop *reactloops.ReActLoop, invoker aicommon.AIInvo
 		return false
 	}
 
+	userQuery := strings.TrimSpace(loop.Get("user_query"))
+	if userQuery == "" {
+		if task := loop.GetCurrentTask(); task != nil {
+			userQuery = task.GetUserInput()
+		}
+	}
+
+	ctx := loop.GetConfig().GetContext()
+
+	// 关键词: internet research, timeline injection, DirectlyAnswer
+	// 把报告内容压缩后注入 timeline，作为 DirectlyAnswer 的对话上下文
+	timelineMaterial := finalContent
+	if compressed, err := invoker.CompressLongTextWithDestination(ctx, finalContent, userQuery, 10*1024); err == nil && strings.TrimSpace(compressed) != "" {
+		timelineMaterial = compressed
+	} else if err != nil {
+		log.Warnf("internet research finalize: compress final report failed, fallback to raw content: %v", err)
+	}
+	invoker.AddToTimeline("internet_research_content", timelineMaterial)
+
+	// 关键词: internet research, DirectlyAnswer, WithReferenceMaterial
+	// 优先尝试让模型基于素材生成对话式答复，报告以参考资料形式挂在答复事件上
+	if userQuery != "" {
+		answer, err := invoker.DirectlyAnswer(
+			ctx,
+			userQuery,
+			nil,
+			aicommon.WithDirectlyAnswerReferenceMaterial(finalContent, 0),
+		)
+		if err == nil && strings.TrimSpace(answer) != "" {
+			markFinalResearchReportDelivered(loop)
+			log.Infof("internet research finalize: delivered conversational answer via DirectlyAnswer (%d bytes)", len(answer))
+			return true
+		}
+		if err != nil {
+			log.Warnf("internet research finalize: DirectlyAnswer failed, falling back to raw report: %v", err)
+		} else {
+			log.Warnf("internet research finalize: DirectlyAnswer returned empty answer, falling back to raw report")
+		}
+	} else {
+		log.Warnf("internet research finalize: empty user query, skip DirectlyAnswer and fallback to raw report")
+	}
+
+	return emitRawReportFallback(loop, invoker, finalContent)
+}
+
+// emitRawReportFallback 在 DirectlyAnswer 不可用时仍然以原始报告 markdown 形式投递。
+// 仅由 emitFinalResearchReport 在 DirectlyAnswer 失败时调用。
+func emitRawReportFallback(loop *reactloops.ReActLoop, invoker aicommon.AIInvokeRuntime, finalContent string) bool {
 	taskIndex := ""
 	if task := loop.GetCurrentTask(); task != nil {
 		taskIndex = task.GetId()
@@ -85,25 +138,10 @@ type smartEvaluation struct {
 	Overall    string
 }
 
-func evaluateSMART(ctx context.Context, invoker aicommon.AIInvokeRuntime, userQuery, searchResults, searchHistory string) *smartEvaluation {
-	dNonce := utils.RandStringBytes(4)
-
-	resultPreview := searchResults
-	if len(resultPreview) > 4096 {
-		resultPreview = resultPreview[:4096] + "\n...(truncated)"
-	}
-
-	promptTemplate := `<|SMART_EVAL_{{ .nonce }}|>
-Evaluate the following internet research results using the S.M.A.R.T framework.
-
-User Query:
-{{ .userQuery }}
-
-Search History:
-{{ .searchHistory }}
-
-Collected Results Summary:
-{{ .searchResults }}
+// smartEvaluationStaticInstruction 是 SMART 评估的系统侧静态指令
+// 通过 aicommon.WithLiteForgeStaticInstruction 进入 LiteForge 的 high-static 段，跨调用稳定哈希
+// 关键词: aicache, PROMPT_SECTION, StaticInstruction, smart-evaluation, B 档
+const smartEvaluationStaticInstruction = `Evaluate the following internet research results using the S.M.A.R.T framework.
 
 For each S.M.A.R.T dimension, provide a brief evaluation (1-2 sentences) of the search results:
 - Specific: How specific and targeted are the search results relative to the user's question?
@@ -111,12 +149,31 @@ For each S.M.A.R.T dimension, provide a brief evaluation (1-2 sentences) of the 
 - Achievable: Did the research achieve its goal of answering the user's question? What percentage of the question was answered?
 - Relevant: How relevant is the collected information to the user's actual needs?
 - Time-bound: Is the information current and timely? Are the sources up-to-date?
-- Overall: A brief overall assessment of the research quality (1 sentence).
-<|SMART_EVAL_END_{{ .nonce }}|>
+- Overall: A brief overall assessment of the research quality (1 sentence).`
+
+func evaluateSMART(ctx context.Context, invoker aicommon.AIInvokeRuntime, userQuery, searchResults, searchHistory string) *smartEvaluation {
+	resultPreview := searchResults
+	if len(resultPreview) > 4096 {
+		resultPreview = resultPreview[:4096] + "\n...(truncated)"
+	}
+
+	// 关键词: aicache, dynamic, smart-evaluation, B 档去 nonce
+	// 内层 user_query/search_history/search_results 不再带 nonce
+	// 外层 PROMPT_SECTION_dynamic_NONCE 已经屏蔽 prompt-injection
+	promptTemplate := `<user_query>
+{{ .userQuery }}
+</user_query>
+
+<search_history>
+{{ .searchHistory }}
+</search_history>
+
+<search_results>
+{{ .searchResults }}
+</search_results>
 `
 
 	materials, err := utils.RenderTemplate(promptTemplate, map[string]any{
-		"nonce":         dNonce,
 		"userQuery":     userQuery,
 		"searchHistory": searchHistory,
 		"searchResults": resultPreview,
@@ -138,6 +195,7 @@ For each S.M.A.R.T dimension, provide a brief evaluation (1-2 sentences) of the 
 			aitool.WithStringParam("time_bound", aitool.WithParam_Description("Time-bound: information timeliness"), aitool.WithParam_Required(true)),
 			aitool.WithStringParam("overall", aitool.WithParam_Description("Overall assessment in 1 sentence"), aitool.WithParam_Required(true)),
 		},
+		aicommon.WithLiteForgeStaticInstruction(smartEvaluationStaticInstruction),
 	)
 	if err != nil {
 		log.Warnf("SMART evaluation LiteForge failed: %v", err)
@@ -157,37 +215,39 @@ For each S.M.A.R.T dimension, provide a brief evaluation (1-2 sentences) of the 
 	}
 }
 
-func evaluateInsufficientReason(ctx context.Context, invoker aicommon.AIInvokeRuntime, userQuery, searchResults, searchHistory string) string {
-	dNonce := utils.RandStringBytes(4)
-
-	resultPreview := searchResults
-	if len(resultPreview) > 2048 {
-		resultPreview = resultPreview[:2048] + "\n...(truncated)"
-	}
-
-	promptTemplate := `<|INSUFFICIENT_EVAL_{{ .nonce }}|>
-The following internet research did not yield sufficient results to fully answer the user's question.
-
-User Query:
-{{ .userQuery }}
-
-Search History:
-{{ .searchHistory }}
-
-Partial Results (if any):
-{{ .searchResults }}
+// insufficientReasonStaticInstruction 是 insufficient-reason 评估的系统侧静态指令
+// 通过 aicommon.WithLiteForgeStaticInstruction 进入 LiteForge 的 high-static 段，跨调用稳定哈希
+// 关键词: aicache, PROMPT_SECTION, StaticInstruction, insufficient-reason-analysis, B 档
+const insufficientReasonStaticInstruction = `The following internet research did not yield sufficient results to fully answer the user's question.
 
 Please analyze why the search results are insufficient. Consider:
 1. What specific aspects of the user's question remain unanswered?
 2. What was found vs what was expected?
 3. Possible reasons (topic too niche, information not publicly available, wrong search strategy, etc.)
 
-Provide a concise analysis (3-5 sentences) explaining why the collected information does not meet the user's needs.
-<|INSUFFICIENT_EVAL_END_{{ .nonce }}|>
+Provide a concise analysis (3-5 sentences) explaining why the collected information does not meet the user's needs.`
+
+func evaluateInsufficientReason(ctx context.Context, invoker aicommon.AIInvokeRuntime, userQuery, searchResults, searchHistory string) string {
+	resultPreview := searchResults
+	if len(resultPreview) > 2048 {
+		resultPreview = resultPreview[:2048] + "\n...(truncated)"
+	}
+
+	// 关键词: aicache, dynamic, insufficient-reason-analysis, B 档去 nonce
+	promptTemplate := `<user_query>
+{{ .userQuery }}
+</user_query>
+
+<search_history>
+{{ .searchHistory }}
+</search_history>
+
+<partial_results>
+{{ .searchResults }}
+</partial_results>
 `
 
 	materials, err := utils.RenderTemplate(promptTemplate, map[string]any{
-		"nonce":         dNonce,
 		"userQuery":     userQuery,
 		"searchHistory": searchHistory,
 		"searchResults": resultPreview,
@@ -203,6 +263,7 @@ Provide a concise analysis (3-5 sentences) explaining why the collected informat
 		[]aitool.ToolOption{
 			aitool.WithStringParam("analysis", aitool.WithParam_Description("Analysis of why results are insufficient"), aitool.WithParam_Required(true)),
 		},
+		aicommon.WithLiteForgeStaticInstruction(insufficientReasonStaticInstruction),
 	)
 	if err != nil || forgeResult == nil {
 		return ""

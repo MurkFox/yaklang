@@ -78,6 +78,7 @@ type AIStatefulTask interface {
 	GetAttachedDatas() []*AttachedResource
 	GetStatus() AITaskState
 	SetStatus(state AITaskState)
+	ForceSetStatus(state AITaskState)
 	AppendErrorToResult(i error)
 	GetCreatedAt() time.Time
 	Finish(i error)
@@ -126,6 +127,8 @@ type AIStatefulTaskBase struct {
 	taskRetrievalInfo *AITaskRetrievalInfo
 
 	asyncDeferCallback func(err error)
+
+	skipTaskStatusChangeEmit bool
 }
 
 func (s *AIStatefulTaskBase) GetFocusMode() string {
@@ -412,6 +415,24 @@ func (s *AIStatefulTaskBase) GetStatus() AITaskState {
 }
 
 func (s *AIStatefulTaskBase) SetStatus(status AITaskState) {
+	s.setStatus(status, false)
+}
+
+// ForceSetStatus bypasses the finished-state guard while preserving
+// lifecycle side effects such as event emission and cancellation when
+// entering a terminal state. Callers must ensure the task has a usable
+// context when reviving a previously finished task.
+func (s *AIStatefulTaskBase) ForceSetStatus(status AITaskState) {
+	s.setStatus(status, true)
+}
+
+func (s *AIStatefulTaskBase) setStatus(status AITaskState, force bool) {
+	if s == nil {
+		return
+	}
+	if !force && s.IsFinished() {
+		return // 已完成的任务状态不可更改
+	}
 	old := s.status
 	s.status = status
 
@@ -424,7 +445,7 @@ func (s *AIStatefulTaskBase) SetStatus(status AITaskState) {
 	// 输出调试日志记录状态变化
 	if old != status {
 		log.Debugf("Task %s status changed: %s -> %s", s.GetId(), old, status)
-		if s.Emitter != nil {
+		if !s.skipTaskStatusChangeEmit && s.Emitter != nil {
 			s.Emitter.EmitStructured("react_task_status_changed", map[string]any{
 				"react_task_id":         s.GetId(),
 				"react_task_old_status": old,
@@ -480,7 +501,7 @@ func NewSubTaskBase(
 	parentTask AIStatefulTask,
 	subTaskId string,
 	userInput string,
-	skipEvent ...bool,
+	skipTaskStatusChangeEmit ...bool,
 ) *AIStatefulTaskBase {
 	var parentCtx context.Context
 	if parentTask != nil {
@@ -494,7 +515,7 @@ func NewSubTaskBase(
 	if parentTask != nil {
 		emitter = parentTask.GetEmitter()
 	}
-	return NewStatefulTaskBase(subTaskId, userInput, parentCtx, emitter, skipEvent...)
+	return NewStatefulTaskBase(subTaskId, userInput, parentCtx, emitter, skipTaskStatusChangeEmit...)
 }
 
 func NewStatefulTaskBase(
@@ -502,7 +523,7 @@ func NewStatefulTaskBase(
 	userInput string,
 	ctx context.Context,
 	Emitter *Emitter,
-	skipEvent ...bool,
+	skipTaskStatusChangeEmit ...bool,
 ) *AIStatefulTaskBase {
 	if ctx == nil {
 		ctx = context.Background()
@@ -521,16 +542,19 @@ func NewStatefulTaskBase(
 		toolCallResultIds: omap.NewOrderedMap[int64, *aitool.ToolResult](make(map[int64]*aitool.ToolResult)),
 		uuid:              ksuid.New().String(),
 	}
+	if len(skipTaskStatusChangeEmit) > 0 && skipTaskStatusChangeEmit[0] {
+		base.skipTaskStatusChangeEmit = true
+	}
+
 	if base.Emitter != nil {
 		base.Emitter = base.Emitter.PushEventProcesser(func(event *schema.AiOutputEvent) *schema.AiOutputEvent {
 			if event != nil {
 				event.TaskUUID = base.GetUUID()
+				event.TaskId = base.GetId()
 			}
 			return event
 		})
-		if len(skipEvent) > 0 && skipEvent[0] {
-
-		} else {
+		if !base.skipTaskStatusChangeEmit {
 			base.Emitter.EmitStructured(
 				"react_task_created",
 				map[string]any{

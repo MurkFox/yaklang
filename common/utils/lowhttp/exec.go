@@ -77,11 +77,12 @@ func HTTP(opts ...LowhttpOpt) (*LowhttpResponse, error) {
 		opt(option)
 	}
 
-	if option.Session == nil {
-		sessionId := uuid.New().String()
-		option.Session = sessionId
+	if !option.DisableSession {
+		if option.Session == "" {
+			option.Session = uuid.NewString()
+			defer RemoveCookiejar(option.Session)
+		}
 		opts = append(opts, WithSession(option.Session))
-		defer RemoveCookiejar(sessionId)
 	}
 
 	if option.WithConnPool && option.ConnPool == nil {
@@ -266,6 +267,8 @@ func HTTPWithoutRetry(option *LowhttpExecConfig) (*LowhttpResponse, error) {
 		gmTLS                   = option.GmTLS
 		onlyGMTLS               = option.GmTLSOnly
 		preferGMTLS             = option.GmTLSPrefer
+		gmTLSCipherSuites           = option.GmTLSCipherSuites
+		gmTLSDisableCompatMode      = option.GmTLSDisableCompatMode
 		host                    = option.Host
 		port                    = option.Port
 		requestPacket           = option.Packet
@@ -339,9 +342,16 @@ func HTTPWithoutRetry(option *LowhttpExecConfig) (*LowhttpResponse, error) {
 			waitStreamHandlerDone(streamHandlerDone, streamBodyReaderCh, 2*time.Second, "non-pool stream handler")
 		}
 		if option != nil && option.BodyStreamReaderHandler != nil && !bodyStreamReaderHandled.IsSet() {
-			r, w := utils.NewPipe()
-			w.Close()
-			option.BodyStreamReaderHandler([]byte{}, r)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Errorf("BodyStreamReaderHandler fallback panic: %v", r)
+					}
+				}()
+				r, w := utils.NewPipe()
+				w.Close()
+				option.BodyStreamReaderHandler([]byte{}, r)
+			}()
 		}
 	}()
 
@@ -556,9 +566,9 @@ func HTTPWithoutRetry(option *LowhttpExecConfig) (*LowhttpResponse, error) {
 	// 逐个记录 response 中的内容
 	response.Url = urlStr
 
-	// 获取 cookiejar（仅在 session != nil 时启用自动 cookie 管理）
+	// 获取 cookiejar（仅在 session 非空时启用自动 cookie 管理）
 	var cookiejar http.CookieJar
-	if session != nil {
+	if session != "" {
 		cookiejar = GetCookiejar(session)
 		cookies := cookiejar.Cookies(urlIns)
 		if cookies != nil {
@@ -653,12 +663,16 @@ func HTTPWithoutRetry(option *LowhttpExecConfig) (*LowhttpResponse, error) {
 
 	if https {
 		if gmTLS {
-			dialopts = append(dialopts, netx.DialX_WithGMTLSConfig(&gmtls.Config{
+			gmCfg := &gmtls.Config{
 				GMSupport:          &gmtls.GMSupport{WorkMode: gmtls.ModeAutoSwitch},
 				NextProtos:         nextProto,
 				ServerName:         host,
 				InsecureSkipVerify: !option.VerifyCertificate,
-			}))
+			}
+			if len(gmTLSCipherSuites) > 0 {
+				gmCfg.CipherSuites = gmTLSCipherSuites
+			}
+			dialopts = append(dialopts, netx.DialX_WithGMTLSConfig(gmCfg))
 		} else {
 			dialopts = append(dialopts, netx.DialX_WithTLSConfig(&gmtls.Config{
 				NextProtos:         nextProto,
@@ -666,17 +680,23 @@ func HTTPWithoutRetry(option *LowhttpExecConfig) (*LowhttpResponse, error) {
 				InsecureSkipVerify: !option.VerifyCertificate,
 			}))
 		}
-		dialopts = append(dialopts, netx.DialX_WithGMTLSSupport(gmTLS), netx.DialX_WithTLS(https), netx.DialX_WithGMTLSOnly(onlyGMTLS), netx.DialX_WithGMTLSPrefer(preferGMTLS))
+		dialopts = append(dialopts,
+			netx.DialX_WithGMTLSSupport(gmTLS),
+			netx.DialX_WithTLS(https),
+			netx.DialX_WithGMTLSOnly(onlyGMTLS),
+			netx.DialX_WithGMTLSPrefer(preferGMTLS),
+			netx.DialX_WithGMTLSDisableCompatMode(gmTLSDisableCompatMode),
+		)
 
 		if clientHelloSpec != nil {
 			dialopts = append(dialopts, netx.DialX_WithClientHelloSpec(clientHelloSpec))
 		} else if randomJA3FingerPrint {
-			spec, err := utls.UTLSIdToSpec(utls.HelloRandomizedALPN)
+			spec, err := utls.UTLSIdToSpec(utls.HelloChrome_120)
 			if err == nil {
 				clientHelloSpec = &spec
 				dialopts = append(dialopts, netx.DialX_WithClientHelloSpec(&spec))
 			} else {
-				log.Debugf("generate random JA3 fingerprint failed: %v", err)
+				log.Debugf("generate Chrome TLS fingerprint failed: %v", err)
 			}
 		}
 		if sni != nil {
@@ -847,7 +867,11 @@ RECONNECT:
 
 			currentRPS.Add(1)
 			if err := h2Stream.doRequest(); err != nil {
-				if h2Stream.ID == 1 { // first stream
+				if err == CreateStreamAfterGoAwayErr {
+					pc.closeConn(err)
+					goto RECONNECT
+				}
+				if h2Stream.ID <= 1 { // first stream or ID not yet assigned
 					return nil, err
 				} else {
 					pc.closeConn(err) // close old connection to avoid goroutine leak
@@ -993,9 +1017,9 @@ RECONNECT:
 			streamHandlerDone = make(chan struct{})
 			reader, writer := utils.NewBufPipe(nil)
 			defer func() {
-				utils.Debug(func() {
-					log.Infof("close reader and writer")
-				})
+				// utils.Debug(func() {
+				// 	log.Infof("close reader and writer")
+				// })
 				writer.Close()
 			}()
 			//startHandlerStream := time.Now()
@@ -1008,12 +1032,11 @@ RECONNECT:
 				default:
 				}
 				defer func() {
+					if r := recover(); r != nil {
+						log.Errorf("BodyStreamReaderHandler panic: %v", r)
+					}
 					bodyWriter.Close()
 					close(streamHandlerDone)
-					if err := recover(); err != nil {
-						log.Errorf("BodyStreamReaderHandler panic: %v", err)
-						utils.PrintCurrentGoroutineRuntimeStack()
-					}
 				}()
 
 				packetReader := bufio.NewReader(reader)
@@ -1204,12 +1227,12 @@ RECONNECT:
 	}
 
 	// 更新 cookiejar 中的 cookie
-	if session != nil && firstResponse != nil {
+	if session != "" && firstResponse != nil {
 		cookiejar.SetCookies(urlIns, firstResponse.Cookies())
 	}
 
 	// 将请求中的cookie更新到cookiejar中
-	if session != nil && reqIns != nil {
+	if session != "" && reqIns != nil {
 		reqCookies := reqIns.Cookies()
 		for _, cookie := range reqCookies {
 			// 限制domain为当前域, path为当前路径

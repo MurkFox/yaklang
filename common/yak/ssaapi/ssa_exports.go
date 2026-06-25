@@ -54,7 +54,22 @@ func ClearCache() {
 	ttlSSAParseCache.Purge()
 }
 
-// Parse parse code to ssa.Program
+// Parse 将一段源码编译为 SSA 程序对象，用于后续的 SyntaxFlow 查询与静态分析
+// 导出名为 ssa.Parse
+// 参数:
+//   - code: 待编译的源码字符串
+//   - opts: 编译可选项，如 ssa.withLanguage(ssa.Yak)、ssa.withProgramName 等
+//
+// 返回值:
+//   - 编译得到的 SSA 程序对象
+//   - 错误信息
+//
+// Example:
+// ```
+// prog = ssa.Parse("a = 1; b = a + 1; println(b)", ssa.withLanguage(ssa.Yak))~
+// result = prog.SyntaxFlowWithError("println(* as $arg)")~
+// assert result != nil, "syntaxflow result should not be nil"
+// ```
 func Parse(code string, opts ...ssaconfig.Option) (*Program, error) {
 	input := strings.NewReader(code)
 	return ParseFromReader(input, opts...)
@@ -163,6 +178,7 @@ var Exports = map[string]any{
 	"Yak":        ssaconfig.Yak,
 	"PHP":        ssaconfig.PHP,
 	"Java":       ssaconfig.JAVA,
+	"Python":     ssaconfig.PYTHON,
 
 	/// static analyze
 	"YaklangScriptChecking": YaklangScriptChecking,
@@ -176,11 +192,29 @@ var Exports = map[string]any{
 	"NewSSAProject":             ssaproject.NewSSAProject,
 
 	// Query latest program name by project name
-	"GetLatestProgramNameByProjectName": func(projectName string) (string, error) {
-		if projectName == "" {
-			return "", utils.Errorf("project name is empty")
-		}
-		db := consts.GetGormProfileDatabase()
-		return yakit.QueryLatestSSAProgramNameByProjectName(db, projectName)
-	},
+	"GetLatestProgramNameByProjectName": getLatestProgramNameByProjectName,
+}
+
+// getLatestProgramNameByProjectName 根据 SSA 项目名查询其最新编译产物（program）的名称（导出名为 ssa.GetLatestProgramNameByProjectName）
+// 一个项目可能多次编译产生多个 program，本函数返回最近一次的 program 名称
+//
+// 参数:
+//   - projectName: SSA 项目名
+//
+// 返回值:
+//   - 最新的 program 名称
+//   - 错误信息（项目名为空或查询失败时返回）
+//
+// Example:
+// ```
+// // 该示例依赖数据库中已存在的 SSA 项目，仅作用法示意
+// name = ssa.GetLatestProgramNameByProjectName("my-project")~
+// println(name)
+// ```
+func getLatestProgramNameByProjectName(projectName string) (string, error) {
+	if projectName == "" {
+		return "", utils.Errorf("project name is empty")
+	}
+	db := consts.GetGormProfileDatabase()
+	return yakit.QueryLatestSSAProgramNameByProjectName(db, projectName)
 }

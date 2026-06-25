@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"gopkg.in/yaml.v3"
 )
@@ -20,6 +19,15 @@ var healthCheckSchedulerStarted sync.Once
 
 // Used to ensure the latency watcher is started only once
 var latencyWatcherStarted sync.Once
+
+// statsSchedulerOnce 保证 daily cleanup + summary flusher 只启动一次。
+// 进程级单例：多个 ServerConfig 共享同一份 stats 后台任务。
+// 关键词: statsSchedulerOnce, daily cleanup goroutine 单例
+var (
+	statsSchedulerOnce   sync.Once
+	statsSchedulerCtx    context.Context
+	statsSchedulerCancel context.CancelFunc
+)
 
 type Balancer struct {
 	config   *ServerConfig
@@ -134,7 +142,7 @@ func fixHistoricalProviderHealthState() error {
 
 	// Find providers where: IsFirstCheckCompleted is false AND IsHealthy is true
 	// We don't need to check HealthCheckTime specifically, as IsHealthy=true implies a successful check happened.
-	result := db.Model(&schema.AiProvider{}).
+	result := db.Model(&AiProvider{}).
 		Where("is_first_check_completed = ? AND is_healthy = ?", false, true).
 		Update("is_first_check_completed", true)
 
@@ -160,10 +168,38 @@ func LoadProvidersFromDatabase(config *ServerConfig) error {
 		log.Warnf("Failed to initialize Memfit TOTP: %v", err)
 	}
 
+	// Ensure aibalance 专属基础表存在（原先登记在 schema.ProfileTables，现已搬回本包自治迁移）。
+	// 必须在 GetAllAiProviders / API key / ops user 等查询之前完成，否则首启会因表不存在报错。
+	// 关键词: aibalance B 类表自治迁移, EnsureProviderTable, EnsureApiKeysTable, EnsureOpsUserTable
+	if err := EnsureProviderTable(); err != nil {
+		log.Warnf("Failed to ensure AiProvider table exists: %v", err)
+	}
+	if err := EnsureApiKeysTable(); err != nil {
+		log.Warnf("Failed to ensure AiApiKeys table exists: %v", err)
+	}
+	if err := EnsureLoginSessionTable(); err != nil {
+		log.Warnf("Failed to ensure LoginSession table exists: %v", err)
+	}
+	if err := EnsureOpsUserTable(); err != nil {
+		log.Warnf("Failed to ensure OpsUser table exists: %v", err)
+	}
+	if err := EnsureOpsActionLogTable(); err != nil {
+		log.Warnf("Failed to ensure OpsActionLog table exists: %v", err)
+	}
+
 	// 1. Load AI providers
 	// Ensure metadata table exists
 	if err := EnsureModelMetaTable(); err != nil {
 		log.Warnf("Failed to ensure AiModelMeta table exists: %v", err)
+	}
+
+	// Ensure actual-model multiplier / global default tables exist (实际模型计费 + 批量应用)
+	// 关键词: EnsureModelMultiplierTable, EnsureModelMultiplierConfigTable, 实际模型计费自治迁移
+	if err := EnsureModelMultiplierTable(); err != nil {
+		log.Warnf("Failed to ensure AiModelMultiplier table exists: %v", err)
+	}
+	if err := EnsureModelMultiplierConfigTable(); err != nil {
+		log.Warnf("Failed to ensure AiModelMultiplierConfig table exists: %v", err)
 	}
 
 	// Ensure health record table exists (for uptime tracking)
@@ -189,6 +225,86 @@ func LoadProvidersFromDatabase(config *ServerConfig) error {
 		log.Warnf("Failed to ensure Amap API key table exists: %v", err)
 	}
 
+	// Ensure rate limit config table exists and load config
+	if err := EnsureRateLimitConfigTable(); err != nil {
+		log.Warnf("Failed to ensure RateLimitConfig table exists: %v", err)
+	}
+
+	// Ensure client version stat table exists (for memfit version gate UI display)
+	// 关键词: EnsureClientVersionStatTable 初始化, memfit 版本控流统计表
+	if err := EnsureClientVersionStatTable(); err != nil {
+		log.Warnf("Failed to ensure ClientVersionStat table exists: %v", err)
+	}
+	if err := EnsureFreeUserDailyTokenUsageTable(); err != nil {
+		log.Warnf("Failed to ensure FreeUserDailyTokenUsage table exists: %v", err)
+	}
+	// 付费用户全局日 Token 总额度表（第二道硬门，与免费日限额并列）
+	// 关键词: EnsurePaidUserDailyTokenUsageTable 初始化, 付费全局额度
+	if err := EnsurePaidUserDailyTokenUsageTable(); err != nil {
+		log.Warnf("Failed to ensure PaidUserDailyTokenUsage table exists: %v", err)
+	}
+	// 单 IP 免费模型每日用量限额表（防盗刷，保证公共免费接口公平）
+	// 关键词: EnsureFreeUserIPDailyUsageTable 初始化, 单 IP 每日限额
+	if err := EnsureFreeUserIPDailyUsageTable(); err != nil {
+		log.Warnf("Failed to ensure FreeUserIPDailyUsage table exists: %v", err)
+	}
+	// 单 IP 按模型用量表（仅面板「每个 IP 用得最多的模型」展示用，不参与限额）
+	// 关键词: EnsureFreeUserIPModelDailyUsageTable 初始化, per-IP TOP 模型
+	if err := EnsureFreeUserIPModelDailyUsageTable(); err != nil {
+		log.Warnf("Failed to ensure FreeUserIPModelDailyUsage table exists: %v", err)
+	}
+	// 一键限流 IP 表（持久化被限流 IP + 加载到进程内缓存供热路径查询）
+	// 关键词: EnsureThrottledIPTable 初始化, ReloadThrottledIPCache 一键限流
+	if err := EnsureThrottledIPTable(); err != nil {
+		log.Warnf("Failed to ensure ThrottledIP table exists: %v", err)
+	}
+	if err := ReloadThrottledIPCache(); err != nil {
+		log.Warnf("Failed to load throttled IP cache: %v", err)
+	}
+	if rlConfig, err := GetRateLimitConfig(); err != nil {
+		log.Warnf("Failed to load RateLimitConfig: %v", err)
+	} else {
+		config.applyRateLimitConfig(rlConfig)
+		log.Infof("Loaded rate limit config: default_rpm=%d, free_user_delay=%d~%ds free_token_limit_m=%d output_tps=%d soft_limit_m=%d soft_tps=%d",
+			rlConfig.DefaultRPM, rlConfig.FreeUserDelaySec, rlConfig.FreeUserDelayMaxSec,
+			rlConfig.FreeUserTokenLimitM, rlConfig.FreeUserOutputTPS,
+			rlConfig.FreeUserTokenSoftLimitM, rlConfig.FreeUserSoftLimitTPS)
+	}
+
+	// Ensure DAU & cache stats tables exist and start daily cleanup + summary flusher.
+	// 这三张表 + 后台任务支撑 portal "日活与缓存" 卡片与 tab 数据。
+	// 关键词: ai_daily_cache_stats, ai_daily_user_seen, ai_daily_summary, daily cleanup, summary flusher
+	if err := EnsureCacheStatsTable(); err != nil {
+		log.Warnf("Failed to ensure ai_daily_cache_stats table exists: %v", err)
+	}
+	if err := EnsureUserSeenTable(); err != nil {
+		log.Warnf("Failed to ensure ai_daily_user_seen table exists: %v", err)
+	}
+	if err := EnsureSummaryTable(); err != nil {
+		log.Warnf("Failed to ensure ai_daily_summary table exists: %v", err)
+	}
+	// 镜像数据落盘配置表 + 装配落盘子系统（save() 落盘 + 容量治理）。
+	// 关键词: EnsureMirrorStorageConfigTable 初始化, initDataSink 装配, 落盘子系统
+	if err := EnsureMirrorStorageConfigTable(); err != nil {
+		log.Warnf("Failed to ensure AiMirrorStorageConfig table exists: %v", err)
+	}
+	if storageCfg, err := GetMirrorStorageConfig(); err != nil {
+		log.Warnf("Failed to load mirror storage config: %v", err)
+	} else {
+		applyMirrorStorageConfig(storageCfg)
+		log.Infof("Loaded mirror storage config: enabled=%v max_bytes=%d reclaim_bytes=%d check_interval_sec=%d",
+			storageCfg.Enabled, storageCfg.MaxBytes, storageCfg.ReclaimBytes, storageCfg.CheckIntervalSec)
+	}
+	statsSchedulerOnce.Do(func() {
+		statsSchedulerCtx, statsSchedulerCancel = context.WithCancel(context.Background())
+		StartDailyCleanupScheduler(statsSchedulerCtx)
+		StartDailySummaryFlusher(statsSchedulerCtx, 30*time.Second)
+		// 镜像数据落盘容量巡检（每分钟，超限按最旧分片整文件淘汰）。
+		// 关键词: StartDataSinkGovernor 启动, 容量巡检调度
+		StartDataSinkGovernor(statsSchedulerCtx)
+		log.Infof("DAU & cache stats schedulers started: cleanup=daily@0:01 flusher=30s sink_governor=on")
+	})
+
 	// Start amap health check scheduler (checks every 1 hour)
 	StartAmapHealthCheckScheduler(config.amapHealthCheckStopCh)
 
@@ -211,6 +327,7 @@ func LoadProvidersFromDatabase(config *ServerConfig) error {
 		}
 
 		// Create Provider instance
+		// 关键词: ActiveCacheControl 字段 db -> 内存透传, 主动 cache_control 注入开关
 		provider := &Provider{
 			ModelName:           dbProvider.ModelName,
 			TypeName:            dbProvider.TypeName,
@@ -219,6 +336,7 @@ func LoadProvidersFromDatabase(config *ServerConfig) error {
 			APIKey:              dbProvider.APIKey,
 			NoHTTPS:             dbProvider.NoHTTPS,
 			OptionalAllowReason: dbProvider.OptionalAllowReason,
+			ActiveCacheControl:  dbProvider.ActiveCacheControl,
 			DbProvider:          dbProvider,
 		}
 
@@ -231,24 +349,23 @@ func LoadProvidersFromDatabase(config *ServerConfig) error {
 		modelProviders[modelName] = append(modelProviders[modelName], provider)
 	}
 
-	// Add providers to config
+	// Replace entire maps so wrappers removed from DB no longer linger in memory.
+	newModels := make(map[string][]*Provider, len(modelProviders))
+	newEntrypoints := make(map[string][]*Provider, len(modelProviders))
 	for modelName, providers := range modelProviders {
-		if len(providers) > 0 {
-			log.Infof("Adding %d providers for model %s", len(providers), modelName)
-
-			// Add to Models
-			config.Models.models[modelName] = providers
-
-			// Add to Entrypoints
-			config.Entrypoints.providers[modelName] = providers
-
-			// Print provider information
-			for i, p := range providers {
-				log.Infof("  Provider %d: TypeName=%s, ModelName=%s, Domain=%s, HealthStatus=%v",
-					i, p.TypeName, p.ModelName, p.DomainOrURL, p.DbProvider.IsHealthy)
-			}
+		if len(providers) == 0 {
+			continue
+		}
+		log.Infof("Adding %d providers for model %s", len(providers), modelName)
+		newModels[modelName] = providers
+		newEntrypoints[modelName] = providers
+		for i, p := range providers {
+			log.Infof("  Provider %d: TypeName=%s, ModelName=%s, Domain=%s, HealthStatus=%v",
+				i, p.TypeName, p.ModelName, p.DomainOrURL, p.DbProvider.IsHealthy)
 		}
 	}
+	config.Models.models = newModels
+	config.Entrypoints.providers = newEntrypoints
 
 	log.Infof("Database AI providers loaded, added %d models in total", len(modelProviders))
 

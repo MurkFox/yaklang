@@ -1,0 +1,263 @@
+package loop_http_fuzztest
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
+	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+)
+
+func TestBuildLoopHTTPFuzzOverviewReport_SummarizesLargeRuns(t *testing.T) {
+	stats := newLoopHTTPFuzzOverviewStats()
+	baselineSample := loopHTTPFuzzInterestingSample{
+		Index:          1,
+		Score:          5,
+		StatusCode:     200,
+		DurationMs:     120,
+		BodyLength:     24,
+		HiddenIndex:    "flow-1",
+		RequestSummary: "URL: https://example.test/login BODY: [(32) bytes]",
+		ResponseRaw:    "HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\nhello user",
+	}
+	sample := loopHTTPFuzzInterestingSample{
+		Index:           2,
+		Score:           70,
+		StatusCode:      401,
+		DurationMs:      1450,
+		BodyLength:      0,
+		HiddenIndex:     "flow-2",
+		Payloads:        []string{"{{payload(pass_top25)}}"},
+		RequestSummary:  "URL: https://example.test/login BODY: [(32) bytes]",
+		ResponseSummary: "URL: https://example.test/login STATUS: 401 BODY: [(0) bytes]",
+		RequestDiff:     "  + password={{payload(pass_top25)}}",
+		ResponseRaw:     "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+	}
+
+	for i := 0; i < 9; i++ {
+		stats.observeSuccess(200, 120, 24, true)
+		stats.observeResponseLengthGroup(baselineSample)
+	}
+	for i := 0; i < 4; i++ {
+		stats.observeSuccess(401, 1450, 0, true)
+		stats.observeResponseLengthGroup(sample)
+	}
+	stats.considerInterestingSample(sample)
+	stats.finalizeResponseLengthGroups()
+
+	report := buildLoopHTTPFuzzOverviewReport("fuzz_body", "body_type=json_params; param_name=username; param_values=[admin {{7*7}}]", stats)
+	require.Contains(t, report, "=== Fuzz Overview for fuzz_body ===")
+	require.Contains(t, report, "Fuzz Parameters:")
+	require.Contains(t, report, "param_name=username")
+	require.Contains(t, report, "Total Requests: 13")
+	require.Contains(t, report, "Saved HTTPFlows: 13")
+	require.Contains(t, report, "Status Distribution:")
+	require.Contains(t, report, "401: 4")
+	require.Contains(t, report, "Response Length Overview: 24B=9, 0B=4")
+}
+
+func TestBuildCompressedAnalysisSection_RendersRepresentativePacket(t *testing.T) {
+	report := buildCompressedAnalysisSection(
+		"compressed body",
+		"GET /login HTTP/1.1\r\nHost: example.test\r\n\r\n",
+		"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+		"flow-9",
+	)
+
+	require.Contains(t, report, "=== Compressed Fuzz Analysis ===")
+	require.Contains(t, report, "compressed body")
+	require.Contains(t, report, "Representative Packet For Follow-Up Testing")
+}
+
+func TestBuildLoopHTTPFuzzVerificationPayload_DoesNotDuplicateAggregateOverview(t *testing.T) {
+	payload := buildLoopHTTPFuzzVerificationPayload(
+		"=== Fuzz Overview for fuzz_body ===\nTotal Requests: 12\nSaved HTTPFlows: 12",
+		"flow-9",
+	)
+
+	require.Equal(t, 1, strings.Count(payload, "=== Fuzz Overview for fuzz_body ==="))
+	require.Contains(t, payload, "Representative HTTPFlow: flow-9")
+}
+
+func TestBuildLoopHTTPFuzzStatusProgress_UsesStructuredFields(t *testing.T) {
+	stats := newLoopHTTPFuzzOverviewStats()
+	stats.observeSuccess(200, 100, 24, true)
+	stats.observeSuccess(200, 110, 24, true)
+	stats.observeSuccess(401, 300, 0, true)
+	stats.observeError()
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{BodyLength: 24, StatusCode: 200})
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{BodyLength: 24, StatusCode: 200})
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{BodyLength: 0, StatusCode: 401})
+	stats.considerInterestingSample(loopHTTPFuzzInterestingSample{Index: 3, Score: 70, StatusCode: 401, BodyLength: 0})
+
+	progress := buildLoopHTTPFuzzStatusProgress(stats, 401, 3)
+	require.NotNil(t, progress)
+	require.Equal(t, 4, progress.TotalRequests)
+	require.Equal(t, 3, progress.SuccessfulResponses)
+	require.Equal(t, 1, progress.FailedRequests)
+	require.Equal(t, 3, progress.SavedHTTPFlowCount)
+	require.Equal(t, 401, progress.LastStatusCode)
+	require.Equal(t, int64(170), progress.AverageResponseMs)
+	require.Equal(t, 1, progress.InterestingSampleNum)
+	require.Equal(t, []loopHTTPFuzzStatusCodeCount{
+		{Code: 200, Count: 2},
+		{Code: 401, Count: 1},
+	}, progress.StatusCounts)
+	require.Equal(t, []loopHTTPFuzzResponseLengthCount{
+		{BodyLength: 24, Count: 2},
+		{BodyLength: 0, Count: 1},
+	}, progress.ResponseLengthGroups)
+}
+
+func TestFinalizeLoopHTTPFuzzResponseLengthGroups_UsesDominantLengthAsBaseline(t *testing.T) {
+	stats := newLoopHTTPFuzzOverviewStats()
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{
+		Index:       1,
+		Score:       5,
+		StatusCode:  200,
+		BodyLength:  10,
+		ResponseRaw: "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789",
+	})
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{
+		Index:       2,
+		Score:       6,
+		StatusCode:  200,
+		BodyLength:  10,
+		ResponseRaw: "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789",
+	})
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{
+		Index:       3,
+		Score:       20,
+		StatusCode:  401,
+		BodyLength:  5,
+		ResponseRaw: "HTTP/1.1 401 Unauthorized\r\nContent-Length: 5\r\n\r\nadmin",
+	})
+
+	stats.finalizeResponseLengthGroups()
+
+	require.Equal(t, 10, stats.BaselineBodyLength)
+	require.True(t, stats.ResponseLengthGroups[10].IsBaseline)
+	require.Contains(t, stats.ResponseLengthGroups[10].Sample.ResponseDiff, "representative baseline response")
+	require.False(t, stats.ResponseLengthGroups[5].IsBaseline)
+	require.NotEmpty(t, stats.ResponseLengthGroups[5].Sample.ResponseDiff)
+}
+
+func TestBuildLoopHTTPFuzzOverviewReport_SkipsLengthAnalysisForSmallRuns(t *testing.T) {
+	stats := newLoopHTTPFuzzOverviewStats()
+	stats.observeSuccess(200, 100, 12, true)
+	stats.observeSuccess(200, 110, 18, true)
+	stats.observeSuccess(200, 120, 27, true)
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{BodyLength: 12, StatusCode: 200, ResponseRaw: "HTTP/1.1 200 OK\r\n\r\na"})
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{BodyLength: 18, StatusCode: 200, ResponseRaw: "HTTP/1.1 200 OK\r\n\r\nbb"})
+	stats.observeResponseLengthGroup(loopHTTPFuzzInterestingSample{BodyLength: 27, StatusCode: 200, ResponseRaw: "HTTP/1.1 200 OK\r\n\r\nccc"})
+	stats.finalizeResponseLengthGroups()
+
+	report := buildLoopHTTPFuzzOverviewReport("fuzz_get_params", "param_name=id; param_values=[1 2 3]", stats)
+	require.Contains(t, report, "Response Length Overview: 12B=1, 18B=1, 27B=1")
+	require.Contains(t, report, "param_name=id")
+}
+
+func TestBuildLoopHTTPFuzzLargeRunAnalysisReport_RendersGroupsAndInterestingSamples(t *testing.T) {
+	stats := newLoopHTTPFuzzOverviewStats()
+	baselineSample := loopHTTPFuzzInterestingSample{
+		Index:          1,
+		Score:          5,
+		StatusCode:     200,
+		DurationMs:     120,
+		BodyLength:     24,
+		HiddenIndex:    "flow-1",
+		RequestSummary: "URL: https://example.test/login BODY: [(32) bytes]",
+		ResponseRaw:    "HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\nhello user",
+	}
+	sample := loopHTTPFuzzInterestingSample{
+		Index:           2,
+		Score:           70,
+		StatusCode:      401,
+		DurationMs:      1450,
+		BodyLength:      0,
+		HiddenIndex:     "flow-2",
+		Payloads:        []string{"{{payload(pass_top25)}}"},
+		RequestSummary:  "URL: https://example.test/login BODY: [(32) bytes]",
+		ResponseSummary: "URL: https://example.test/login STATUS: 401 BODY: [(0) bytes]",
+		RequestDiff:     "  + password={{payload(pass_top25)}}",
+		ResponseRaw:     "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+	}
+
+	for i := 0; i < 9; i++ {
+		stats.observeSuccess(200, 120, 24, true)
+		stats.observeResponseLengthGroup(baselineSample)
+	}
+	for i := 0; i < 4; i++ {
+		stats.observeSuccess(401, 1450, 0, true)
+		stats.observeResponseLengthGroup(sample)
+	}
+	stats.considerInterestingSample(sample)
+	stats.finalizeResponseLengthGroups()
+
+	report := buildLoopHTTPFuzzLargeRunAnalysisReport(stats)
+	require.Contains(t, report, "=== Large-Run Analysis ===")
+	require.Contains(t, report, "Response Length Groups:")
+	require.Contains(t, report, "- 24 bytes: 9 responses [baseline] (statuses: 200=9)")
+	require.Contains(t, report, "Baseline group selected by dominant body length: 24 bytes (9 responses).")
+	require.Contains(t, report, "- 0 bytes: 4 responses (statuses: 401=4)")
+	require.Contains(t, report, "Sample HTTPFlow: flow-2")
+	require.Contains(t, report, "Sample Diff From Baseline:")
+	require.Contains(t, report, "Interesting Samples:")
+	require.Contains(t, report, "HTTPFlow: flow-2")
+	require.Contains(t, report, "{{payload(pass_top25)}}")
+}
+
+func TestBuildLoopHTTPFuzzDetailedPacketReport_RendersStoredResults(t *testing.T) {
+	reportData := newLoopHTTPFuzzReportData()
+	reportData.observeError(1, errors.New("network timeout"))
+	reportData.observeDetailedResult(2, loopHTTPFuzzProcessedResult{
+		RequestRaw:      "GET /debug?id=1 HTTP/1.1\r\nHost: example.test\r\n\r\n",
+		ResponseRaw:     "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+		RequestSummary:  "URL: https://example.test/debug?id=1 BODY: [(0) bytes]",
+		ResponseSummary: "URL: https://example.test/debug?id=1 STATUS: 200 BODY: [(2) bytes]",
+		RequestDiff:     "  + id=1",
+		HiddenIndex:     "flow-2",
+		StatusCode:      200,
+		DurationMs:      180,
+		Payloads:        []string{"1"},
+		Sample: loopHTTPFuzzInterestingSample{
+			Index: 2,
+		},
+	})
+
+	report := buildLoopHTTPFuzzDetailedPacketReport(reportData)
+	require.Contains(t, report, "=== Detailed Packet Results ===")
+	require.Contains(t, report, "--- Result 1 ---")
+	require.Contains(t, report, "Error:")
+	require.Contains(t, report, "--- Result 2 ---")
+	require.Contains(t, report, "Saved HTTPFlow: flow-2")
+	require.Contains(t, report, "Request Packet:")
+	require.Contains(t, report, "Response Packet:")
+}
+
+func TestBuildLoopHTTPFuzzActionLogStartLine_FormatsFuzzHeader(t *testing.T) {
+	action := aicommon.NewSimpleAction("fuzz_header", aitool.InvokeParams{
+		"header_name":   "X-Forwarded-For",
+		"header_values": []string{"127.0.0.1", "8.8.8.8", "{{payload(sqli)}}", "evil", "more"},
+		"reason":        "测试请求头注入漏洞，需要覆盖多种伪造来源 IP 的 payload 组合",
+	})
+	line := buildLoopHTTPFuzzActionLogStartLine("fuzz_header", "", action)
+	require.Contains(t, line, "X-Forwarded-For")
+	require.Contains(t, line, "5 个载荷")
+	require.NotContains(t, line, "reason=")
+	require.NotContains(t, line, "测试请求头注入")
+}
+
+func TestBuildLoopHTTPFuzzActionLogStartLine_FallbackShrinksParamSummary(t *testing.T) {
+	longValues := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		longValues = append(longValues, strings.Repeat("x", 20))
+	}
+	paramSummary := "header_name=X-Test; header_values=" + strings.Join(longValues, " ") + "; reason=很长的原因说明"
+	line := buildLoopHTTPFuzzActionLogStartLine("fuzz_header", paramSummary, nil)
+	require.Contains(t, line, "header_name=X-Test")
+	require.NotContains(t, line, "reason=")
+	require.Less(t, len(line), len(paramSummary))
+}

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/rand"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aiddb"
+	"github.com/yaklang/yaklang/common/ai/ytoken"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
@@ -20,21 +23,190 @@ type tierAwareConsumptionCaller struct {
 	tier consts.ModelTier
 }
 
+type tierUsageMetrics struct {
+	InputTokens    int64
+	OutputTokens   int64
+	TotalTokens    int64
+	CacheHitTokens int64
+	TokenSource    string
+	HaveRealUsage  bool
+}
+
 func (c *tierAwareConsumptionCaller) NewAIResponse() *AIResponse {
 	return NewAIResponse(c)
 }
 
 func (c *tierAwareConsumptionCaller) CallAIResponseConsumptionCallback(current int) {
-	if c == nil {
-		return
-	}
-	c.Config.OutputConsumptionCallback(c.tier, current)
+	// Token accounting is finalized once after the full answer completes in
+	// Config.wrapper. Do not accumulate streaming estimates here.
 }
 
 func wrapCallerWithTierConsumption(owner *Config, tier consts.ModelTier) AICallerConfigIf {
 	return &tierAwareConsumptionCaller{
 		Config: owner,
 		tier:   tier,
+	}
+}
+
+func (c *Config) resolveTierUsageMetrics(estimatedInputTokens int64, rsp *AIResponse) tierUsageMetrics {
+	metrics := tierUsageMetrics{
+		InputTokens: estimatedInputTokens,
+		TokenSource: "estimated",
+	}
+	if rsp == nil {
+		return metrics
+	}
+	metrics.OutputTokens = rsp.GetTotalOutputTokens()
+	metrics.TotalTokens = metrics.InputTokens + metrics.OutputTokens
+
+	usageInfo := rsp.GetUsageInfo()
+	if usageInfo == nil {
+		return metrics
+	}
+	metrics.HaveRealUsage = true
+	metrics.TokenSource = "usage"
+	metrics.InputTokens = int64(usageInfo.PromptTokens)
+	metrics.OutputTokens = int64(usageInfo.CompletionTokens)
+	metrics.TotalTokens = int64(usageInfo.TotalTokens)
+	if metrics.TotalTokens <= 0 {
+		metrics.TotalTokens = metrics.InputTokens + metrics.OutputTokens
+	}
+	if usageInfo.PromptTokensDetails != nil {
+		metrics.CacheHitTokens = int64(usageInfo.PromptTokensDetails.CachedTokens)
+	}
+	return metrics
+}
+
+func (c *Config) finalizeTierConsumption(tier consts.ModelTier, estimatedInputTokens int64, rsp *AIResponse) tierUsageMetrics {
+	metrics := c.resolveTierUsageMetrics(estimatedInputTokens, rsp)
+	if c == nil || rsp == nil {
+		return metrics
+	}
+	c.AddTierConsumption(
+		tier,
+		metrics.InputTokens,
+		metrics.OutputTokens,
+	)
+	if metrics.CacheHitTokens > 0 {
+		c.AddTierCacheHitToken(tier, metrics.CacheHitTokens)
+	}
+	return metrics
+}
+
+func appendPresetPrompt(request *AIRequest, tagName, description, prompt string) {
+	if request == nil || strings.TrimSpace(prompt) == "" {
+		return
+	}
+	nonce := utils.RandStringBytes(8)
+	preset := fmt.Sprintf(
+		"\n<|%s_%s|>\n%s "+
+			"It MUST NOT change or override the output format, structure, or schema required by the system.\n\n"+
+			"%s\n"+
+			"<|%s_END_%s|>\n",
+		tagName, nonce, description, prompt, tagName, nonce)
+	request.SetPrompt(request.GetPrompt() + preset)
+}
+
+// handle429RateLimit checks the AI response for a 429 status code, emits the
+// appropriate user-facing message, and waits for the correct duration using a
+// context-aware select so the wait can be interrupted by context cancellation.
+//
+// Returns:
+//   - is429:   true if a 429 was detected
+//   - ctxDone: true if the context was cancelled during the wait
+//
+// Three cases:
+//  1. AIBalance daily token quota exceeded (X-AIBalance-Limit-Kind: daily_token):
+//     show daily-quota friendly notification highlighting the Yi-unit usage and
+//     the daily 06:00 Asia/Shanghai refresh time, then wait random 5-15 seconds.
+//  2. AIBalance 429 (X-AIBalance-Info header present): parse queue count,
+//     show warm notification, wait queueCount*3 seconds.
+//  3. Generic 429: show generic rate-limit message, wait random 5-15 seconds.
+func (c *Config) handle429RateLimit(rsp *AIResponse) (is429 bool, ctxDone bool) {
+	if rsp == nil {
+		return false, false
+	}
+
+	if !rsp.WaitForHTTPHeaders(c.Ctx) {
+		return false, true
+	}
+
+	if rsp.GetHTTPStatusCode() != 429 {
+		return false, false
+	}
+
+	var waitDuration time.Duration
+
+	// 关键词: handle429RateLimit, daily_token_limit_exceeded, 日 Token 限额友好提示
+	// 优先识别日 Token 限额（X-AIBalance-Limit-Kind: daily_token），按"亿词元"展示
+	// 当日全球免费池消耗状态，并提示每日北京时间 06:00 刷新；行为对齐 generic 429，
+	// 等待 5-15 秒后由上层重试，避免改变现有重试循环语义。
+	limitKind := strings.TrimSpace(rsp.GetHTTPHeader("X-AIBalance-Limit-Kind"))
+	if limitKind == "daily_token" {
+		tokensUsed, _ := strconv.ParseInt(strings.TrimSpace(rsp.GetHTTPHeader("X-AIBalance-Token-Used")), 10, 64)
+		tokensLimit, _ := strconv.ParseInt(strings.TrimSpace(rsp.GetHTTPHeader("X-AIBalance-Token-Limit")), 10, 64)
+		const yiUnit = 100_000_000 // 1 亿 = 1e8 token
+		limitYi := float64(tokensLimit) / float64(yiUnit)
+		msg := fmt.Sprintf(
+			"今日免费词元额度 %.2f 亿 已经全部消耗完毕\n"+
+				"感谢大家踊跃使用，每日北京时间 06:00 准时刷新\n"+
+				"稍后将自动重试，您也可以稍候再来",
+			limitYi)
+		sleepSec := 5 + rand.Intn(11)
+		waitDuration = time.Duration(sleepSec) * time.Second
+		c.EmitDefaultSystemStreamEvent("daily-token-exceeded", strings.NewReader(msg), "")
+		c.EmitNotify("daily-token-exceeded", msg, waitDuration)
+		log.Infof("daily token quota exceeded (used=%d, limit=%d), retrying in %ds",
+			tokensUsed, tokensLimit, sleepSec)
+
+		select {
+		case <-c.Ctx.Done():
+			return true, true
+		case <-time.After(waitDuration):
+			return true, false
+		}
+	}
+
+	queueInfo := strings.TrimSpace(rsp.GetHTTPHeader("X-AIBalance-Info"))
+	if queueInfo != "" {
+		queueCount, parseErr := strconv.Atoi(queueInfo)
+		if parseErr == nil && queueCount > 0 {
+			waitSec := queueCount * 3
+			if waitSec < 5 {
+				waitSec = 5
+			}
+			msg := fmt.Sprintf(
+				"此刻有 %d 位用户正在与我深度对话中\n"+
+					"您的任务同样重要，我不想敷衍任何一位\n"+
+					"预计等待约 %d 秒，感谢您的耐心",
+				queueCount, waitSec)
+			waitDuration = time.Duration(waitSec) * time.Second
+			c.EmitNotify("rate-limit", msg, waitDuration)
+			c.EmitError("AIBalance 429 rate limit: %s", msg)
+			log.Infof("AIBalance 429: queue=%d, waiting %ds", queueCount, waitSec)
+		} else {
+			msg := "当前有大量用户正在与我深度对话中\n" +
+				"您的任务同样重要，我不想敷衍任何一位\n" +
+				"预计等待一段时间后自动请求，感谢您的耐心"
+			waitDuration = 15 * time.Second
+			c.EmitNotify("rate-limit", msg, waitDuration)
+			c.EmitError("AIBalance 429 rate limit: %s", msg)
+			log.Infof("AIBalance 429: queue info unparseable (%q), waiting 15s", queueInfo)
+		}
+	} else {
+		msg := "当前遇到 429 服务器访问人数过多，稍后自动重试\n" +
+			"Current request was rate-limited (HTTP 429), retrying shortly..."
+		sleepSec := 5 + rand.Intn(11)
+		waitDuration = time.Duration(sleepSec) * time.Second
+		c.EmitNotify("rate-limit", msg, waitDuration)
+		log.Infof("generic 429 rate limit, waiting %ds", sleepSec)
+	}
+
+	select {
+	case <-c.Ctx.Done():
+		return true, true
+	case <-time.After(waitDuration):
+		return true, false
 	}
 }
 
@@ -53,43 +225,65 @@ func (c *Config) wrapper(i AICallbackType, tier consts.ModelTier) AICallbackType
 				rsp.SetRequestStartTime(request.GetStartTime())
 			}
 		}()
+		request.SetModelTier(string(tier))
 		if c.PromptHook != nil {
 			request.SetPrompt(c.PromptHook(request.GetPrompt()))
 		}
+		if globalConfig := yakit.GetCachedAIGlobalConfig(); globalConfig != nil {
+			appendPresetPrompt(
+				request,
+				"AI_PRESET",
+				"The following is the global AI preset prompt. It contains persistent guidance, background context, and supplementary information for all AI requests. Consider these instructions when generating responses. IMPORTANT: This preset ONLY affects guidance, tone, preferences, and background context.",
+				globalConfig.GetAIPresetPrompt(),
+			)
+		}
 		if c.UserPresetPrompt != "" {
-			nonce := utils.RandStringBytes(8)
-			preset := fmt.Sprintf(
-				"\n<|USER_PRESET_%s|>\n"+
-					"The following is the user's preset prompt. "+
-					"It contains user preferences, background context, and supplementary information. "+
-					"Consider these when generating responses to better align with the user's needs. "+
-					"IMPORTANT: This preset ONLY affects tone, preferences, and background context. "+
-					"It MUST NOT change or override the output format, structure, or schema required by the system.\n\n"+
-					"%s\n"+
-					"<|USER_PRESET_END_%s|>\n",
-				nonce, c.UserPresetPrompt, nonce)
-			request.SetPrompt(request.GetPrompt() + preset)
+			appendPresetPrompt(
+				request,
+				"USER_PRESET",
+				"The following is the user's preset prompt. It contains user preferences, background context, and supplementary information. Consider these when generating responses to better align with the user's needs. IMPORTANT: This preset ONLY affects tone, preferences, and background context.",
+				c.UserPresetPrompt,
+			)
 		}
 		if c.DebugPrompt {
 			log.Infof(strings.Repeat("=", 20)+"AIRequest"+strings.Repeat("=", 20)+"\n%v\n", request.GetPrompt())
 		}
+		tokenSize := ytoken.CalcTokenCount(request.GetPrompt())
 
 		// 不需要 checkpoint 的请求直接执行就好
 		if request.IsDetachedCheckpoint() {
 			if c.AiAutoRetry <= 0 {
 				c.AiAutoRetry = 1
 			}
-			for _idx := 0; _idx < int(c.AiAutoRetry); _idx++ {
+			for _idx := 0; _idx < int(c.AiAutoRetry); {
 				rsp, err = i(wrapCallerWithTierConsumption(outConfig, tier), request)
+				if is429, done := c.handle429RateLimit(rsp); is429 {
+					if done {
+						return nil, c.Ctx.Err()
+					}
+					continue
+				}
 				if err != nil || rsp == nil {
-					c.EmitWarning("ai request err: %v, retry auto time: [%v]", err, _idx+1)
-					time.Sleep(500 * time.Millisecond)
+					_idx++
+					c.EmitWarning("ai request err: %v, retry auto time: [%v]", err, _idx)
+					select {
+					case <-c.Ctx.Done():
+						return nil, c.Ctx.Err()
+					case <-time.After(500 * time.Millisecond):
+					}
 					continue
 				}
 				rsp.SetTaskIndex(request.GetTaskIndex())
+				origRsp := rsp
+				rsp = TeeAIResponse(config, rsp, nil, func() {
+					c.finalizeTierConsumption(tier, int64(tokenSize), origRsp)
+				})
 				return rsp, err
 			}
-			return nil, utils.Errorf("ai request err with max retry: %v", err)
+			if rsp != nil {
+				rsp.SetTaskIndex(request.GetTaskIndex())
+			}
+			return rsp, utils.Errorf("ai request err with max retry: %v", err)
 		}
 
 		var seq = request.GetSeqId()
@@ -126,20 +320,34 @@ func (c *Config) wrapper(i AICallbackType, tier consts.ModelTier) AICallbackType
 		if c.AiAutoRetry <= 0 {
 			c.AiAutoRetry = 1
 		}
-		tokenSize := estimateTokens([]byte(request.GetPrompt()))
+
+		callerLabel := request.GetCallerLabel()
+		if callerLabel == "" {
+			callerLabel = "unknown"
+			log.Warn("untracked AI communication detected (no callerLabel set), caller should use WithAIRequest_CallerLabel")
+		}
 
 		start := time.Now()
-		for _idx := 0; _idx < int(c.AiAutoRetry); _idx++ {
-			c.InputConsumptionCallback(tier, tokenSize)
+		for _idx := 0; _idx < int(c.AiAutoRetry); {
 			rsp, err = i(wrapCallerWithTierConsumption(outConfig, tier), request)
+			if is429, done := c.handle429RateLimit(rsp); is429 {
+				if done {
+					return nil, c.Ctx.Err()
+				}
+				continue
+			}
 			if err != nil || rsp == nil {
-				c.EmitWarning("ai request err: %v, retry auto time: [%v]", err, _idx+1)
-				time.Sleep(500 * time.Millisecond)
+				_idx++
+				c.EmitWarning("ai request err: %v, retry auto time: [%v]", err, _idx)
+				select {
+				case <-c.Ctx.Done():
+					return nil, c.Ctx.Err()
+				case <-time.After(500 * time.Millisecond):
+				}
 				continue
 			}
 			rsp.SetTaskIndex(request.GetTaskIndex())
 
-			var haveFirstByte = utils.NewBool(false)
 			saveHandler := func(tee *AIResponse) {
 				reasonReader, outputReader := tee.GetUnboundStreamReaderEx(nil, nil, nil)
 				reason, _ := io.ReadAll(reasonReader)
@@ -169,8 +377,8 @@ func (c *Config) wrapper(i AICallbackType, tier consts.ModelTier) AICallbackType
 				now := time.Now()
 				du := now.Sub(start)
 				origRsp.SetFirstOutputByteTime(now)
-				c.EmitInfo("ai response from %v:%v first byte cost: %v",
-					origRsp.GetProviderName(), origRsp.GetModelName(), du.String())
+				c.EmitInfo("[%s] ai response from %v:%v first byte cost: %v",
+					callerLabel, origRsp.GetProviderName(), origRsp.GetModelName(), du.String())
 
 				outConfig.Add(1)
 				go func() {
@@ -178,26 +386,24 @@ func (c *Config) wrapper(i AICallbackType, tier consts.ModelTier) AICallbackType
 					saveHandler(teeResp)
 				}()
 
-				haveFirstByte.SetTo(true)
 				c.EmitJSON(schema.EVENT_TYPE_AI_FIRST_BYTE_COST_MS, "system", map[string]any{
 					"ms":            du.Milliseconds(),
 					"second":        du.Seconds(),
 					"model_name":    origRsp.GetModelName(),
 					"provider_name": origRsp.GetProviderName(),
 					"model_tier":    string(tier),
-				})
-				c.EmitJSON(schema.EVENT_TYPE_PRESSURE, "system", map[string]any{
-					"current_cost_token_size": tokenSize,
-					"pressure_token_size":     c.AiCallTokenLimit,
-					"model_tier":              string(tier),
-					"model_name":              rsp.GetModelName(),
-					"provider_name":           rsp.GetProviderName(),
+					"caller_label":  callerLabel,
 				})
 			}, func() {
+				usageMetrics := c.finalizeTierConsumption(tier, int64(tokenSize), origRsp)
 				du := time.Since(start)
 				provider := origRsp.GetProviderName()
 				model := origRsp.GetModelName()
 				outputBytes := origRsp.GetTotalOutputBytes()
+				outputTokens := usageMetrics.OutputTokens
+				inputTokens := usageMetrics.InputTokens
+				totalTokens := usageMetrics.TotalTokens
+				cacheHitTokens := usageMetrics.CacheHitTokens
 				firstByteTime := origRsp.GetFirstOutputByteTime()
 				var outputDuration time.Duration
 				if !firstByteTime.IsZero() {
@@ -205,19 +411,35 @@ func (c *Config) wrapper(i AICallbackType, tier consts.ModelTier) AICallbackType
 				}
 				tokenRate := float64(0)
 				if outputDuration.Seconds() > 0 {
-					tokenRate = float64(outputBytes/4) / outputDuration.Seconds()
+					tokenRate = float64(outputTokens) / outputDuration.Seconds()
 				}
-				c.EmitInfo("ai response from %v:%v cost: %v, output duration: %v, estimated %.1f token/s",
-					provider, model, du, outputDuration, tokenRate)
+				c.EmitInfo("[%s] ai response from %v:%v cost: %v, output duration: %v, %.1f token/s",
+					callerLabel, provider, model, du, outputDuration, tokenRate)
+				c.EmitJSON(schema.EVENT_TYPE_PRESSURE, "system", map[string]any{
+					"current_cost_token_size": inputTokens,
+					"pressure_token_size":     c.AiCallTokenLimit,
+					"model_tier":              string(tier),
+					"model_name":              model,
+					"provider_name":           provider,
+					"cache_hit_token":         cacheHitTokens,
+					"token_source":            usageMetrics.TokenSource,
+				})
 				c.EmitJSON(schema.EVENT_TYPE_AI_TOTAL_COST_MS, "system", map[string]any{
-					"ms":                 du.Milliseconds(),
-					"second":             du.Seconds(),
-					"model_name":         model,
-					"provider_name":      provider,
-					"model_tier":         string(tier),
-					"token_rate":         tokenRate,
-					"output_bytes":       outputBytes,
-					"output_duration_ms": outputDuration.Milliseconds(),
+					"ms":                      du.Milliseconds(),
+					"second":                  du.Seconds(),
+					"model_name":              model,
+					"provider_name":           provider,
+					"model_tier":              string(tier),
+					"token_rate":              tokenRate,
+					"output_bytes":            outputBytes,
+					"estimated_output_tokens": outputTokens,
+					"output_tokens":           outputTokens,
+					"input_tokens":            inputTokens,
+					"total_tokens":            totalTokens,
+					"cache_hit_token":         cacheHitTokens,
+					"token_source":            usageMetrics.TokenSource,
+					"output_duration_ms":      outputDuration.Milliseconds(),
+					"caller_label":            callerLabel,
 				})
 				firstByteCostMs := int64(0)
 				if !firstByteTime.IsZero() {
@@ -230,10 +452,16 @@ func (c *Config) wrapper(i AICallbackType, tier consts.ModelTier) AICallbackType
 					"first_byte_cost_ms":      firstByteCostMs,
 					"total_cost_ms":           du.Milliseconds(),
 					"output_bytes":            outputBytes,
-					"estimated_output_tokens": outputBytes / 4,
+					"estimated_output_tokens": outputTokens,
+					"output_tokens":           outputTokens,
 					"token_rate":              tokenRate,
 					"output_duration_ms":      outputDuration.Milliseconds(),
-					"input_token_size":        tokenSize,
+					"input_token_size":        inputTokens,
+					"input_tokens":            inputTokens,
+					"total_tokens":            totalTokens,
+					"cache_hit_token":         cacheHitTokens,
+					"token_source":            usageMetrics.TokenSource,
+					"caller_label":            callerLabel,
 				})
 				if outputBytes == 0 {
 					rawDump := origRsp.GetRawHTTPResponseDump()
@@ -243,12 +471,12 @@ func (c *Config) wrapper(i AICallbackType, tier consts.ModelTier) AICallbackType
 							"The AI model returned HTTP 200 but generated 0 output tokens "+
 							"(finish_reason: stop without delta.content). "+
 							"This is typically a transient model-side issue and will be retried automatically.",
-							provider, model, du, tokenSize,
+							provider, model, du, inputTokens,
 						)
 					} else {
 						c.EmitWarning("[AI Empty Response] model=%v:%v, cost=%v, input_tokens~%d. "+
 							"The AI model returned an empty response. (no raw HTTP response available)",
-							provider, model, du, tokenSize,
+							provider, model, du, inputTokens,
 						)
 					}
 				}
@@ -258,7 +486,10 @@ func (c *Config) wrapper(i AICallbackType, tier consts.ModelTier) AICallbackType
 			}
 			return rsp, err
 		}
-		return nil, utils.Errorf("")
+		if rsp != nil {
+			rsp.SetTaskIndex(request.GetTaskIndex())
+		}
+		return rsp, utils.Errorf("ai request err with max retry: %v", err)
 	}
 }
 

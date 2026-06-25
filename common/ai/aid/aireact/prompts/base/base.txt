@@ -1,3 +1,13 @@
+{{/*
+TODO: migrate to AssembleLoopPrompt for prefix cache reuse
+
+本模板仅供 aimem (aimemory_build_memory.go AddRawText) 老路径使用,
+其它 aireact / aid 调用方均已切换到 aicommon.NewDefaultPromptPrefixBuilder
+5 段 prefix。{{ .Timeline }} / {{ .CurrentTime }} 等变量来自 GetBasicPromptInfo,
+不与新路径的 PromptMaterials 共享数据通道。
+
+关键词: base.txt 老路径, aimem 待迁移, AssembleLoopPrompt
+*/}}
 # Background
 Current Time: {{ .CurrentTime }} OS/Arch: {{ .OSArch }}
 {{ if .WorkingDir }}working dir: {{ .WorkingDir }}{{ end }}
@@ -20,10 +30,23 @@ AI 蓝图（也称应用体或 Forge）是一种强大的机制，旨在帮助�
 
 使用工具可以：**扩展能力范围：**，**精准解决问题：**，**自动化与效率：**
 
-You have access to {{ .ToolsCount }} built-in tools. Here are the top {{ .TopToolsCount }} most important tools:
+You have access to {{ .ToolsCount }} built-in tools. Below are {{ .TopToolsCount }} prioritized entries selected within a token budget:
+
+## Call Mode (single tool vs tool_compose)
+
+- 单工具入口: 一次提一个工具 + 参数, 返回后再决策下一步; 探索 / 上游不确定 / 需要逐步收紧时的默认形态.
+- 工具编排入口 (tool_compose): 一次提交 >=2 节点的 DAG, 节点间显式串行依赖或天然并行, 由 caller 拓扑跑完后再观察整体结果.
+- 选择原则:
+  - 默认单步. 凡是"调一步看一眼再定下一步"的链路一律走单工具, 不要把猜测拼成 DAG.
+  - 节点 <2 / 节点之间无依赖且互相独立 / 任务目标尚不明确 / 不可逆动作 -> 走单工具.
+  - 已经知道要调哪些工具 + 上游产物喂下游 (硬数据依赖) 或同质多目标 (多 URL / 多文件 / 多参数并行) -> 走 tool_compose, 单次 DAG <=5 节点, 超出拆多轮.
+
+## Prioritized Tools
 
 {{ range .TopTools }}* `{{ .Name }}`: {{ .Description }}
-{{ end }}{{ if .HasMoreTools }}...{{ end }}
+{{ end }}{{ if .HasMoreTools }}
+> 还有 {{ .MoreToolsCount }} 个工具未列入上方清单. 不在列表中的工具 / AI 蓝图 / 技能 / Focus 模式, 通过 `search_capabilities` 按关键字检索后再加载使用.
+{{ end }}
 
 Use 'search_capabilities' to discover additional tools, AI forges (blueprints), and skills for specific tasks. 如果上述工具无法满足需求，请使用 'search_capabilities' 搜索工具来发现更多没有在列表中的工具、蓝图和技能。
 使用 `{"@action": "search_capabilities", ... }` 可以快速搜索你想要的能力。

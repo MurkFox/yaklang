@@ -1,10 +1,32 @@
 package aid
 
 import (
+	"strings"
+
 	"github.com/google/uuid"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
 )
+
+func planTaskID(task *AiTask) string {
+	if task == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(task.TaskId); id != "" {
+		return id
+	}
+	return task.GetId()
+}
+
+func planTaskPayload(task *AiTask) map[string]any {
+	return map[string]any{
+		"index":     task.Index,
+		"name":      task.Name,
+		"goal":      task.Goal,
+		"task_id":   planTaskID(task),
+		"task_uuid": task.GetUUID(),
+	}
+}
 
 func (c *Coordinator) EmitRequireReviewForTask(task *AiTask, id string) {
 	reqs := map[string]any{
@@ -33,6 +55,9 @@ func (c *Coordinator) EmitRequireReviewForPlan(rsp *PlanResponse, id string) {
 		"plans":     rsp,
 		"plans_id":  uuid.New().String(),
 	}
+	if c != nil && c.ForceManualPlanReview {
+		reqs["force_manual_review"] = true
+	}
 	if ep, ok := c.Epm.LoadEndpoint(id); ok {
 		ep.SetReviewMaterials(reqs)
 		err := c.SubmitCheckpointRequest(ep.GetCheckpoint(), reqs)
@@ -46,25 +71,16 @@ func (c *Coordinator) EmitRequireReviewForPlan(rsp *PlanResponse, id string) {
 func (c *Coordinator) EmitPushTask(task *AiTask) {
 	c.EmitStructured("system", map[string]any{
 		"type": "push_task",
-		"task": map[string]any{
-			"index":     task.Index,
-			"name":      task.Name,
-			"goal":      task.Goal,
-			"task_uuid": task.GetUUID(),
-		},
+		"task": planTaskPayload(task),
 	})
 }
 
 func (c *Coordinator) EmitPopTask(task *AiTask) {
+	payload := planTaskPayload(task)
+	payload["task_status"] = task.GetProgressStatue()
 	c.EmitStructured("system", map[string]any{
 		"type": "pop_task",
-		"task": map[string]any{
-			"index":       task.Index,
-			"name":        task.Name,
-			"goal":        task.Goal,
-			"task_uuid":   task.GetUUID(),
-			"task_status": task.GetProgressStatue(),
-		},
+		"task": payload,
 	})
 }
 

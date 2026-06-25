@@ -23,6 +23,15 @@ func (r *ReAct) handleFreeValue(event *ypb.AIInputEvent) error {
 	for _, path := range event.AttachedFilePath {
 		r.config.ContextProviderManager.RegisterTracedContent(path, aicommon.FileContextProvider(path, userInput))
 	}
+	for _, resource := range event.AttachedResourceInfo {
+		if resource.GetType() == aicommon.CONTEXT_PROVIDER_TYPE_FILE &&
+			resource.GetKey() == aicommon.CONTEXT_PROVIDER_KEY_FILE_PATH {
+			path := strings.TrimSpace(resource.GetValue())
+			if path != "" {
+				r.config.ContextProviderManager.RegisterTracedContent(path, aicommon.FileContextProvider(path, userInput))
+			}
+		}
+	}
 	// 现已经被 knowledge enhance loop 替代
 	// for _, resource := range event.AttachedResourceInfo {
 	// 	registrationKey := resource.GetType() + "_" + resource.GetKey() + resource.GetValue()
@@ -106,8 +115,12 @@ func (r *ReAct) GetCurrentLoop() *reactloops.ReActLoop {
 	if currentTask == nil {
 		return nil
 	}
-	currentLoop := currentTask.GetReActLoop().(*reactloops.ReActLoop)
-	if currentLoop == nil {
+	loop := currentTask.GetReActLoop()
+	if loop == nil {
+		return nil
+	}
+	currentLoop, ok := loop.(*reactloops.ReActLoop)
+	if !ok || currentLoop == nil {
 		return nil
 	}
 	return currentLoop
@@ -117,7 +130,7 @@ func (r *ReAct) DumpCurrentEnhanceData() string {
 	if r.config.EnhanceKnowledgeManager == nil {
 		return ""
 	}
-	data := r.config.EnhanceKnowledgeManager.DumpTaskAboutKnowledge(r.GetCurrentTask().GetId())
+	data := r.config.EnhanceKnowledgeManager.DumpTaskAboutKnowledge(r.GetCurrentTaskId())
 	if r.config.DebugEvent {
 		log.Infof("Dumped enhance data: %s", data)
 	}
@@ -157,6 +170,29 @@ func sanitizeForTaskId(input string) string {
 
 // enqueueReTask 将输入事件转换为任务并添加到队列
 func (r *ReAct) enqueueReTask(event *ypb.AIInputEvent) error {
+	task := r.buildReTaskFromEvent(event)
+	if task == nil {
+		return fmt.Errorf("failed to build task from event")
+	}
+	log.Infof("Task enqueue started processing: %s", task.GetId())
+	// 任务不相关，进入排队状态
+	task.SetFocusMode(event.GetFocusModeLoop())
+	task.SetStatus(aicommon.AITaskState_Queueing)
+	err := r.taskQueue.Append(task)
+	if err != nil {
+		log.Errorf("Failed to add task to queue: %v", err)
+		return fmt.Errorf("failed to enqueue task: %v", err)
+	}
+	if r.config.DebugEvent {
+		log.Infof("Task enqueued: %s with input: %s", task.GetId(), event.FreeInput)
+	}
+	return nil
+}
+
+func (r *ReAct) buildReTaskFromEvent(event *ypb.AIInputEvent) aicommon.AIStatefulTask {
+	if event == nil {
+		return nil
+	}
 	// 创建基于aireact.Task的任务（初始状态为created）
 	sanitizedInput := sanitizeForTaskId(event.FreeInput)
 	shortId := ksuid.New().String()
@@ -180,18 +216,5 @@ func (r *ReAct) enqueueReTask(event *ypb.AIInputEvent) error {
 		}
 	}
 	task.SetAttachedDatas(attachedDatas)
-
-	log.Infof("Task enqueue started processing: %s", task.GetId())
-	// 任务不相关，进入排队状态
-	task.SetFocusMode(event.GetFocusModeLoop())
-	task.SetStatus(aicommon.AITaskState_Queueing)
-	err := r.taskQueue.Append(task)
-	if err != nil {
-		log.Errorf("Failed to add task to queue: %v", err)
-		return fmt.Errorf("failed to enqueue task: %v", err)
-	}
-	if r.config.DebugEvent {
-		log.Infof("Task enqueued: %s with input: %s", task.GetId(), event.FreeInput)
-	}
-	return nil
+	return task
 }

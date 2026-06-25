@@ -6,12 +6,20 @@ import (
 )
 
 func (c *Compiler) resolveSSAValueAsInt64(contextInst ssa.Instruction, valueID int64, ptrName string) (llvm.Value, error) {
+	if c.hasValueSlot(valueID) {
+		return c.coerceToInt64(c.loadSSAValue(valueID)), nil
+	}
 	argVal, err := c.getValue(contextInst, valueID)
 	if err == nil {
 		return c.coerceToInt64(argVal), nil
 	}
 
 	fn := contextInst.GetFunc()
+	if fn != nil {
+		if _, ok := fn.GetValueById(valueID); !ok {
+			return llvm.ConstInt(c.LLVMCtx.Int64Type(), 0, false), nil
+		}
+	}
 	if fn == nil {
 		return llvm.Value{}, err
 	}

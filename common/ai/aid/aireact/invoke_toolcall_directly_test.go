@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -35,7 +34,7 @@ func mockedDirectlyCallTool(i aicommon.AICallerConfigIf, req *aicommon.AIRequest
 
 	if isVerifySatisfactionPrompt(prompt) {
 		rsp := i.NewAIResponse()
-		rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "directly-call-satisfied", "human_readable_result": "done via directly_call_tool"}`))
+		rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "directly-call-satisfied"}`))
 		rsp.Close()
 		return rsp, nil
 	}
@@ -61,7 +60,7 @@ func mockedDirectlyCallToolLegacyWrapped(i aicommon.AICallerConfigIf, req *aicom
 
 	if isVerifySatisfactionPrompt(prompt) {
 		rsp := i.NewAIResponse()
-		rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "directly-call-satisfied", "human_readable_result": "done via directly_call_tool"}`))
+		rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "directly-call-satisfied"}`))
 		rsp.Close()
 		return rsp, nil
 	}
@@ -72,23 +71,11 @@ func mockedDirectlyCallToolLegacyWrapped(i aicommon.AICallerConfigIf, req *aicom
 	return rsp, nil
 }
 
-func extractCacheToolNonce(prompt string) string {
-	re := regexp.MustCompile(`<\|CACHE_TOOL_CALL_([A-Za-z0-9]+)\s*>|<\|CACHE_TOOL_CALL_([A-Za-z0-9]+)\>`)
-	matches := re.FindStringSubmatch(prompt)
-	if len(matches) >= 3 {
-		if matches[1] != "" {
-			return matches[1]
-		}
-		return matches[2]
-	}
-	return ""
-}
-
 func mockedDirectlyCallToolWithAITag(i aicommon.AICallerConfigIf, req *aicommon.AIRequest, toolName string) (*aicommon.AIResponse, error) {
 	prompt := req.GetPrompt()
 
 	if isPrimaryDecisionPrompt(prompt) {
-		nonce := extractCacheToolNonce(prompt)
+		nonce := aicommon.ExtractPromptNonce(prompt, "CACHE_TOOL_CALL")
 		rsp := i.NewAIResponse()
 		rsp.EmitOutputStream(bytes.NewBufferString(`
 {"@action": "object", "next_action": { "type": "directly_call_tool", "directly_call_tool_name": "` + toolName + `", "directly_call_identifier": "run_script", "directly_call_expectations": "~0.1s, instant", "directly_call_tool_params": {"timeout": 20} },
@@ -104,7 +91,7 @@ echo hello direct call
 
 	if isVerifySatisfactionPrompt(prompt) {
 		rsp := i.NewAIResponse()
-		rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "directly-call-satisfied", "human_readable_result": "done via directly_call_tool"}`))
+		rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "directly-call-satisfied"}`))
 		rsp.Close()
 		return rsp, nil
 	}
@@ -414,9 +401,9 @@ func TestReAct_DirectlyCallTool_RequireThenDirect(t *testing.T) {
 				count := atomic.AddInt32(&verifyCount, 1)
 				rsp := i.NewAIResponse()
 				if count <= 1 {
-					rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": false, "reasoning": "need one more call", "human_readable_result": "not done"}`))
+					rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": false, "reasoning": "need one more call"}`))
 				} else {
-					rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "all done", "human_readable_result": "complete"}`))
+					rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "all done"}`))
 				}
 				rsp.Close()
 				return rsp, nil

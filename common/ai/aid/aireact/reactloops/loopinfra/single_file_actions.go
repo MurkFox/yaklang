@@ -53,38 +53,35 @@ func (f *SingleFileModificationSuiteFactory) buildWriteAction() reactloops.ReAct
 			log.Infof("write_code: extracted code length=%d", len(code))
 			loop.Set(fullCodeVar, code)
 			if code == "" {
-				runtime.AddToTimeline("error", "No code generated in write_code action. The AI must use AI tags to wrap the code.")
-				operator.Fail("No code generated in 'write_code' action. Please use AI tags to wrap your code. Do NOT use markdown code blocks.")
+				failMsg := f.DiagnoseMissingWriteCode(loop)
+				runtime.AddToTimeline("error", failMsg)
+				operator.Fail(failMsg)
 				return
 			}
-			err := os.WriteFile(filename, []byte(code), 0644)
+			err := f.persistLoopFileContent(
+				runtime, filename, code,
+				"write_success", "write_failed",
+				fmt.Sprintf("SUCCESS: wrote %d bytes to file: %s", len(code), filename),
+			)
 			if err != nil {
-				runtime.AddToTimeline("write_failed", fmt.Sprintf("FAILED to write file: %s, error: %s", filename, err.Error()))
 				operator.Fail(err)
 				return
 			}
 
-			// Verify file was written correctly
-			writtenBytes, verifyErr := os.ReadFile(filename)
-			if verifyErr != nil {
-				runtime.AddToTimeline("write_verify_failed", fmt.Sprintf("FAILED to verify written file: %s, error: %s", filename, verifyErr.Error()))
-				operator.Fail(fmt.Sprintf("file write verification failed: %v", verifyErr))
-				return
+			if !f.ShouldDeferDiskWrite() {
+				// Verify file was written correctly
+				writtenBytes, verifyErr := os.ReadFile(filename)
+				if verifyErr != nil {
+					runtime.AddToTimeline("write_verify_failed", fmt.Sprintf("FAILED to verify written file: %s, error: %s", filename, verifyErr.Error()))
+					operator.Fail(fmt.Sprintf("file write verification failed: %v", verifyErr))
+					return
+				}
+				runtime.AddToTimeline("write_verified", fmt.Sprintf("verified: %d bytes on disk", len(writtenBytes)))
 			}
-			runtime.AddToTimeline("write_success", fmt.Sprintf("SUCCESS: wrote %d bytes to file: %s (verified: %d bytes on disk)", len(code), filename, len(writtenBytes)))
 
 			// Call file changed callback
 			errMsg, blocking := f.OnFileChanged(code, operator)
-			lintStatusVar := f.GetLintStatusVariableName()
-			if blocking {
-				loop.Set(lintStatusVar, "false")
-				operator.DisallowNextLoopExit()
-			} else {
-				loop.Set(lintStatusVar, "true")
-				if f.ShouldExitAfterWrite() {
-					operator.Exit()
-				}
-			}
+			f.applySyntaxLintResult(loop, operator, blocking, f.ShouldExitAfterWrite() || f.ShouldExitWhenSyntaxClean())
 
 			msg := utils.ShrinkTextBlock(code, 256)
 			if errMsg != "" {
@@ -97,6 +94,13 @@ func (f *SingleFileModificationSuiteFactory) buildWriteAction() reactloops.ReAct
 
 			log.Infof("write_code done: hasBlockingErrors=%v", blocking)
 			loop.GetEmitter().EmitPinFilename(filename)
+			_, _ = f.applyLoopYaklangCodeChange(loop, &loopYaklangCodeChange{
+				Content:      code,
+				Path:         filename,
+				SourceAction: actionName,
+				EventOp:      loopYaklangCodeEventOpCreate,
+				EmitEvent:    true,
+			})
 			loop.GetEmitter().EmitJSON(schema.EVENT_TYPE_YAKLANG_CODE_EDITOR, "write_code", code)
 		},
 	)
@@ -154,8 +158,8 @@ func (f *SingleFileModificationSuiteFactory) buildModifyAction() reactloops.ReAc
 		partialCode := loop.Get(codeVar)
 
 		editor := memedit.NewMemEditor(fullCode)
-			modifyStartLine := action.GetInt("modify_start_line")
-			modifyEndLine := action.GetInt("modify_end_line")
+			modifyStartLine := NormalizeActionLineNumber(loop, fullCodeVar, action.GetInt("modify_start_line"))
+			modifyEndLine := NormalizeActionLineNumber(loop, fullCodeVar, action.GetInt("modify_end_line"))
 
 			msg := fmt.Sprintf("decided to modify code file, from start_line[%v] to end_line:[%v]", modifyStartLine, modifyEndLine)
 			invoker.AddToTimeline("modify_code", msg)
@@ -168,6 +172,8 @@ func (f *SingleFileModificationSuiteFactory) buildModifyAction() reactloops.ReAc
 			// Prettify the code (extract line numbers if present)
 			start, end, codeSegment, fixedCode := f.PrettifyCode(partialCode)
 			if fixedCode {
+				start = NormalizeActionLineNumber(loop, fullCodeVar, start)
+				end = NormalizeActionLineNumber(loop, fullCodeVar, end)
 				if start == modifyStartLine && end == modifyEndLine {
 					log.Infof("use prettified code segment for 'modify_code' action, fix range %d to %d", start, end)
 					partialCode = codeSegment
@@ -188,24 +194,19 @@ func (f *SingleFileModificationSuiteFactory) buildModifyAction() reactloops.ReAc
 
 			fullCode = editor.GetSourceCode()
 			loop.Set(fullCodeVar, fullCode)
-			os.RemoveAll(filename)
-			writeErr := os.WriteFile(filename, []byte(fullCode), 0644)
+			writeErr := f.replaceLoopFileContent(
+				runtime, filename, fullCode,
+				"modify_success", "modify_write_failed",
+				fmt.Sprintf("SUCCESS: modified lines[%d-%d], wrote %d bytes to file: %s", modifyStartLine, modifyEndLine, len(fullCode), filename),
+			)
 			if writeErr != nil {
-				runtime.AddToTimeline("modify_write_failed", fmt.Sprintf("FAILED to write modified file: %s, error: %s", filename, writeErr.Error()))
 				op.Fail(fmt.Sprintf("failed to write modified content to file: %v", writeErr))
 				return
 			}
-			runtime.AddToTimeline("modify_success", fmt.Sprintf("SUCCESS: modified lines[%d-%d], wrote %d bytes to file: %s", modifyStartLine, modifyEndLine, len(fullCode), filename))
 
 			// Call file changed callback
 			errMsg, hasBlockingErrors := f.OnFileChanged(fullCode, op)
-			lintStatusVar := f.GetLintStatusVariableName()
-			if hasBlockingErrors {
-				loop.Set(lintStatusVar, "false")
-				op.DisallowNextLoopExit()
-			} else {
-				loop.Set(lintStatusVar, "true")
-			}
+			f.applySyntaxLintResult(loop, op, hasBlockingErrors, f.ShouldExitWhenSyntaxClean())
 
 			// Check for spinning behavior
 			isSpinning, spinReason := f.DetectSpinning(loop, modifyStartLine, modifyEndLine)
@@ -233,6 +234,14 @@ func (f *SingleFileModificationSuiteFactory) buildModifyAction() reactloops.ReAc
 			runtime.AddToTimeline("code_modified", msg)
 			log.Infof("modify_code done: hasBlockingErrors=%v", hasBlockingErrors)
 			loop.GetEmitter().EmitPinFilename(filename)
+			_, _ = f.applyLoopYaklangCodeChange(loop, &loopYaklangCodeChange{
+				Content:      fullCode,
+				Path:         filename,
+				SourceAction: actionName,
+				ChangeReason: reason,
+				EventOp:      loopYaklangCodeEventOpReplace,
+				EmitEvent:    true,
+			})
 			loop.GetEmitter().EmitJSON(schema.EVENT_TYPE_YAKLANG_CODE_EDITOR, "modify_code", partialCode)
 
 			if errMsg != "" && !isSpinning {
@@ -286,7 +295,7 @@ func (f *SingleFileModificationSuiteFactory) buildInsertAction() reactloops.ReAc
 			fullCode := loop.Get(fullCodeVar)
 			partialCode := loop.Get(codeVar)
 			editor := memedit.NewMemEditor(fullCode)
-			insertLine := action.GetInt("insert_line")
+			insertLine := NormalizeActionLineNumber(loop, fullCodeVar, action.GetInt("insert_line"))
 
 			msg := fmt.Sprintf("decided to insert lines at line[%v]", insertLine)
 			invoker.AddToTimeline("insert_lines", msg)
@@ -313,24 +322,19 @@ func (f *SingleFileModificationSuiteFactory) buildInsertAction() reactloops.ReAc
 
 			fullCode = editor.GetSourceCode()
 			loop.Set(fullCodeVar, fullCode)
-			os.RemoveAll(filename)
-			writeErr := os.WriteFile(filename, []byte(fullCode), 0644)
+			writeErr := f.replaceLoopFileContent(
+				runtime, filename, fullCode,
+				"insert_success", "insert_write_failed",
+				fmt.Sprintf("SUCCESS: inserted at line[%d], wrote %d bytes to file: %s", insertLine, len(fullCode), filename),
+			)
 			if writeErr != nil {
-				runtime.AddToTimeline("insert_write_failed", fmt.Sprintf("FAILED to write file after insert: %s, error: %s", filename, writeErr.Error()))
 				op.Fail(fmt.Sprintf("failed to write content after insert: %v", writeErr))
 				return
 			}
-			runtime.AddToTimeline("insert_success", fmt.Sprintf("SUCCESS: inserted at line[%d], wrote %d bytes to file: %s", insertLine, len(fullCode), filename))
 
 			// Call file changed callback
 			errMsg, hasBlockingErrors := f.OnFileChanged(fullCode, op)
-			lintStatusVar := f.GetLintStatusVariableName()
-			if hasBlockingErrors {
-				loop.Set(lintStatusVar, "false")
-				op.DisallowNextLoopExit()
-			} else {
-				loop.Set(lintStatusVar, "true")
-			}
+			f.applySyntaxLintResult(loop, op, hasBlockingErrors, f.ShouldExitWhenSyntaxClean())
 			msg = utils.ShrinkTextBlock(fmt.Sprintf("inserted at line[%v]:\n", insertLine)+partialCode, 256)
 			if errMsg != "" {
 				msg += "\n\n--[linter]--\nWriting Code Linter Check:\n" + utils.PrefixLines(utils.ShrinkTextBlock(errMsg, 2048), "  ")
@@ -341,6 +345,14 @@ func (f *SingleFileModificationSuiteFactory) buildInsertAction() reactloops.ReAc
 			runtime.AddToTimeline("lines_inserted", msg)
 			log.Infof("insert_lines done: hasBlockingErrors=%v", hasBlockingErrors)
 			loop.GetEmitter().EmitPinFilename(filename)
+			_, _ = f.applyLoopYaklangCodeChange(loop, &loopYaklangCodeChange{
+				Content:      fullCode,
+				Path:         filename,
+				SourceAction: actionName,
+				ChangeReason: reason,
+				EventOp:      loopYaklangCodeEventOpReplace,
+				EmitEvent:    true,
+			})
 			loop.GetEmitter().EmitJSON(schema.EVENT_TYPE_YAKLANG_CODE_EDITOR, "insert_lines", partialCode)
 
 			if errMsg != "" {
@@ -403,8 +415,8 @@ func (f *SingleFileModificationSuiteFactory) buildDeleteAction() reactloops.ReAc
 
 			fullCode := loop.Get(fullCodeVar)
 			editor := memedit.NewMemEditor(fullCode)
-			deleteStartLine := action.GetInt("delete_start_line")
-			deleteEndLine := action.GetInt("delete_end_line")
+			deleteStartLine := NormalizeActionLineNumber(loop, fullCodeVar, action.GetInt("delete_start_line"))
+			deleteEndLine := NormalizeActionLineNumber(loop, fullCodeVar, action.GetInt("delete_end_line"))
 
 			var msg string
 			var err error
@@ -436,34 +448,25 @@ func (f *SingleFileModificationSuiteFactory) buildDeleteAction() reactloops.ReAc
 
 			fullCode = editor.GetSourceCode()
 			loop.Set(fullCodeVar, fullCode)
-			os.RemoveAll(filename)
-			writeErr := os.WriteFile(filename, []byte(fullCode), 0644)
+			var successMsg string
+			if deleteEndLine > 0 {
+				successMsg = fmt.Sprintf("SUCCESS: deleted lines[%d-%d], wrote %d bytes to file: %s", deleteStartLine, deleteEndLine, len(fullCode), filename)
+			} else {
+				successMsg = fmt.Sprintf("SUCCESS: deleted line[%d], wrote %d bytes to file: %s", deleteStartLine, len(fullCode), filename)
+			}
+			writeErr := f.replaceLoopFileContent(
+				runtime, filename, fullCode,
+				"delete_success", "delete_write_failed",
+				successMsg,
+			)
 			if writeErr != nil {
-				var deleteDesc string
-				if deleteEndLine > 0 {
-					deleteDesc = fmt.Sprintf("lines[%d-%d]", deleteStartLine, deleteEndLine)
-				} else {
-					deleteDesc = fmt.Sprintf("line[%d]", deleteStartLine)
-				}
-				runtime.AddToTimeline("delete_write_failed", fmt.Sprintf("FAILED to write file after deleting %s: %s, error: %s", deleteDesc, filename, writeErr.Error()))
 				op.Fail(fmt.Sprintf("failed to write content after delete: %v", writeErr))
 				return
-			}
-			if deleteEndLine > 0 {
-				runtime.AddToTimeline("delete_success", fmt.Sprintf("SUCCESS: deleted lines[%d-%d], wrote %d bytes to file: %s", deleteStartLine, deleteEndLine, len(fullCode), filename))
-			} else {
-				runtime.AddToTimeline("delete_success", fmt.Sprintf("SUCCESS: deleted line[%d], wrote %d bytes to file: %s", deleteStartLine, len(fullCode), filename))
 			}
 
 			// Call file changed callback
 			errMsg, hasBlockingErrors := f.OnFileChanged(fullCode, op)
-			lintStatusVar := f.GetLintStatusVariableName()
-			if hasBlockingErrors {
-				loop.Set(lintStatusVar, "false")
-				op.DisallowNextLoopExit()
-			} else {
-				loop.Set(lintStatusVar, "true")
-			}
+			f.applySyntaxLintResult(loop, op, hasBlockingErrors, f.ShouldExitWhenSyntaxClean())
 
 			if deleteEndLine > 0 {
 				msg = fmt.Sprintf("deleted lines[%v-%v]", deleteStartLine, deleteEndLine)
@@ -480,6 +483,14 @@ func (f *SingleFileModificationSuiteFactory) buildDeleteAction() reactloops.ReAc
 			runtime.AddToTimeline("lines_deleted", msg)
 			log.Infof("delete_lines done: hasBlockingErrors=%v", hasBlockingErrors)
 			loop.GetEmitter().EmitPinFilename(filename)
+			_, _ = f.applyLoopYaklangCodeChange(loop, &loopYaklangCodeChange{
+				Content:      fullCode,
+				Path:         filename,
+				SourceAction: actionName,
+				ChangeReason: reason,
+				EventOp:      loopYaklangCodeEventOpReplace,
+				EmitEvent:    true,
+			})
 
 			// Emit event with deletion info
 			deletionInfo := map[string]interface{}{

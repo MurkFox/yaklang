@@ -14,6 +14,7 @@ import (
 	"github.com/yaklang/yaklang/common/utils/filesys"
 	"github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssareducer"
 )
 
@@ -24,6 +25,7 @@ var (
 
 const (
 	antlrWorkerStateKey = "antlr_worker_state"
+	largeProjectByteCap = 16 * 1024 * 1024
 )
 
 var (
@@ -46,14 +48,27 @@ func antlrCacheResetEveryFiles() int {
 	return antlrCacheResetEveryFilesCached
 }
 
+func largeProjectCompileConcurrency() int {
+	concurrency := 2
+	if raw := strings.TrimSpace(os.Getenv("YAK_SSA_LARGE_PROJECT_CONCURRENCY")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil {
+			concurrency = v
+		}
+	}
+	if concurrency <= 0 {
+		return 1
+	}
+	return concurrency
+}
+
 type antlrWorkerState struct {
 	cache       *ssa.AntlrCache
 	filesParsed int
 }
 
 type antlrASTParseWorker struct {
-	language     ssa.PreHandlerAnalyzer
-	languageName string
+	language        ssa.PreHandlerAnalyzer
+	languageName    string
 	resetEveryFiles int
 }
 
@@ -155,11 +170,22 @@ func (c *Config) GetFileHandler(
 	initWorker := func() *utils.SafeMap[any] {
 		return parser.initWorker()
 	}
+	concurrency := int(c.GetCompileConcurrency())
+	if c.GetCompileProjectBytes() >= largeProjectByteCap && concurrency > largeProjectCompileConcurrency() {
+		capped := largeProjectCompileConcurrency()
+		log.Infof(
+			"[ssa-compile] large project detected (%s), cap AST parse concurrency: %d -> %d",
+			formatFileSize(int(c.GetCompileProjectBytes())),
+			concurrency,
+			capped,
+		)
+		concurrency = capped
+	}
 	return ssareducer.FilesHandler(
 		c.ctx, filesystem, preHandlerFiles,
 		parse, initWorker,
-		c.astSequence,
-		int(c.GetCompileConcurrency()),
+		c.GetCompileASTSequence(),
+		concurrency,
 	)
 }
 
@@ -192,6 +218,10 @@ type ScanResult struct {
 	Folders         [][]string
 	HandlerTotal    int
 	PreHandlerTotal int
+	// HandlerBytes is the total source byte size of files that enter the compile
+	// stage. It is used to choose adaptive IR cache defaults for small vs large
+	// projects; it is not persisted as part of user-facing project metadata.
+	HandlerBytes int64
 }
 
 type ScanConfig struct {
@@ -212,17 +242,13 @@ func ScanProjectFiles(cfg ScanConfig) (*ScanResult, error) {
 		HandlerFilesMap: make(map[string]struct{}),
 		Folders:         make([][]string, 0),
 	}
+	exclude := ssaconfig.ResolveCompileExcludeFunc(cfg.ExcludeFunc)
 
 	err := filesys.Recursive(cfg.ProgramPath,
 		filesys.WithFileSystem(cfg.FileSystem),
 		filesys.WithContext(cfg.Context),
 		filesys.WithDirStat(func(fullPath string, fi fs.FileInfo) error {
-			// check folder folderName
-			_, folderName := cfg.FileSystem.PathSplit(fullPath)
-			if folderName == "test" || folderName == ".git" {
-				return filesys.SkipDir
-			}
-			if cfg.ExcludeFunc != nil && cfg.ExcludeFunc(fullPath) {
+			if exclude(fullPath) {
 				return filesys.SkipDir
 			}
 
@@ -242,11 +268,12 @@ func ScanProjectFiles(cfg ScanConfig) (*ScanResult, error) {
 			if fi.Size() == 0 {
 				return nil
 			}
-			if cfg.ExcludeFunc != nil && cfg.ExcludeFunc(path) {
+			if exclude(path) {
 				return nil
 			}
 			if cfg.CheckLanguage != nil && cfg.CheckLanguage(path) == nil {
 				result.HandlerTotal++
+				result.HandlerBytes += fi.Size()
 				result.HandlerFiles = append(result.HandlerFiles, path)
 			}
 			if cfg.CheckPreHandler != nil && cfg.CheckPreHandler(path) == nil {

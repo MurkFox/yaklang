@@ -726,21 +726,24 @@ func TestIntentSearchDualChannel(t *testing.T) {
 		}
 	})
 
-	t.Run("search covers tools forges and loops", func(t *testing.T) {
-		// Verify that FastIntentMatch searches all three capability types:
+	t.Run("search covers tools forges loops and mcp", func(t *testing.T) {
+		// Verify that FastIntentMatch searches all four capability types:
 		// 1. AIYakTool via yakit.SearchAIYakToolBM25 (BM25 + LIKE fallback)
 		// 2. AIForge via yakit.SearchAIForgeBM25 (BM25 + LIKE fallback)
 		// 3. LoopMetadata via matchLoopMetadata (in-memory token matching)
+		// 4. MCPTool via yakit.SearchMCPServerToolsBM25
 
 		// This is a structural test - the actual search requires a DB
-		// We verify the result struct can hold all three types
+		// We verify the result struct can hold all four types
+
 		result := &FastMatchResult{
-			MatchedTools:  []*schema.AIYakTool{{Name: "tool1"}},
-			MatchedForges: []*schema.AIForge{{ForgeName: "forge1"}},
-			MatchedLoops:  []*reactloops.LoopMetadata{{Name: "loop1"}},
+			MatchedTools:    []*schema.AIYakTool{{Name: "tool1"}},
+			MatchedForges:   []*schema.AIForge{{ForgeName: "forge1"}},
+			MatchedLoops:    []*reactloops.LoopMetadata{{Name: "loop1"}},
+			MatchedMCPTools: []*schema.MCPServerToolConfig{{ServerName: "srv", ToolName: "echo", Description: "echo tool"}},
 		}
 		if !result.HasMatches() {
-			t.Error("result with all three match types should have matches")
+			t.Error("result with all match types should have matches")
 		}
 		summary := buildFastMatchSummary(result)
 		if !strings.Contains(summary, "Matched Tools") {
@@ -751,6 +754,12 @@ func TestIntentSearchDualChannel(t *testing.T) {
 		}
 		if !strings.Contains(summary, "Matched Focus Modes") {
 			t.Error("summary should include loops section")
+		}
+		if !strings.Contains(summary, "Matched MCP Tools") {
+			t.Error("summary should include MCP tools section")
+		}
+		if !strings.Contains(summary, "mcp_srv_echo") {
+			t.Error("summary should include MCP full tool name")
 		}
 	})
 }

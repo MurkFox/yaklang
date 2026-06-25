@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
@@ -46,16 +47,102 @@ var finishJson = `{
   "summary_tool_call_result": ""
 }`
 
+var planFromDocumentJSON = `{
+	"@action": "plan_from_document",
+	"main_task": "计算1+1的值",
+	"main_task_goal": "计算1+1的值",
+	"tasks": [
+		{
+			"subtask_name": "计算1+1的值",
+			"subtask_goal": "计算1+1的值"
+		}
+	]
+}`
+
 var summaryJson = `result is 2`
 
+func isPlanExplorationPrompt(prompt string) bool {
+	return strings.Contains(prompt, "任务规划使命") &&
+		strings.Contains(prompt, "finish_exploration")
+}
+
+func isPlanFactsHookLiteForge(prompt string) bool {
+	return strings.Contains(prompt, "数据处理和总结提示小助手") &&
+		strings.Contains(prompt, `"const": "plan_facts_hook"`)
+}
+
+func isPlanGuidanceDocLiteForge(prompt string) bool {
+	return strings.Contains(prompt, "数据处理和总结提示小助手") &&
+		strings.Contains(prompt, `"const": "plan_guidance_document"`)
+}
+
+func isPlanFromDocLiteForge(prompt string) bool {
+	return strings.Contains(prompt, "数据处理和总结提示小助手") &&
+		strings.Contains(prompt, `"const": "plan_from_document"`)
+}
+
+func tryHandleNewPlanFlowPrompt(t *testing.T, config aicommon.AICallerConfigIf, prompt string, initFlag, planFlag string) (*aicommon.AIResponse, bool) {
+	if isPlanExplorationPrompt(prompt) {
+		if initFlag != "" && !strings.Contains(prompt, initFlag) {
+			t.Fatalf("init flag not found in prompt: %s", prompt)
+		}
+		if planFlag != "" && !strings.Contains(prompt, planFlag) {
+			t.Fatalf("plan flag not found in prompt: %s", prompt)
+		}
+
+		rsp := config.NewAIResponse()
+		rsp.EmitOutputStream(strings.NewReader(`{"@action": "finish_exploration", "human_readable_thought": "Ready to generate plan"}`))
+		rsp.Close()
+		return rsp, true
+	}
+
+	if isPlanFactsHookLiteForge(prompt) {
+		rsp := config.NewAIResponse()
+		rsp.EmitOutputStream(strings.NewReader(`{"@action": "plan_facts_hook", "facts": ""}`))
+		rsp.Close()
+		return rsp, true
+	}
+
+	if isPlanGuidanceDocLiteForge(prompt) {
+		rsp := config.NewAIResponse()
+		rsp.EmitOutputStream(strings.NewReader(`{"@action": "plan_guidance_document", "document": "Mock guidance document for testing."}`))
+		rsp.Close()
+		return rsp, true
+	}
+
+	if isPlanFromDocLiteForge(prompt) {
+		rsp := config.NewAIResponse()
+		rsp.EmitOutputStream(strings.NewReader(planFromDocumentJSON))
+		rsp.Close()
+		return rsp, true
+	}
+
+	return nil, false
+}
+
 func MockAICallback(t *testing.T, initFlag, persistentFlag, planFlag string) aicommon.AICallbackType {
+	// 去 Exit 化后 directly_answer 只发答复并继续循环, 真正终结整个 ReAct 循环
+	// 只能由唯一终结器 finish 完成. 主决策第一次发 directly_answer 交付答案,
+	// 第二次发 finish 收口, 避免 directly_answer 无限循环导致测试超时.
+	// 关键词: directly_answer 永不 Exit, finish 唯一终结器, 答复后追加 finish 收尾
+	var primaryDecisionCount int32
 	return func(i aicommon.AICallerConfigIf, req *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 		prompt := req.GetPrompt()
 		rsp := i.NewAIResponse()
 		defer rsp.Close()
 
+		if handledRsp, handled := tryHandleNewPlanFlowPrompt(t, i, prompt, initFlag, planFlag); handled {
+			return handledRsp, nil
+		}
+
 		if strings.Contains(prompt, "意图识别与上下文增强系统") {
 			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "finalize_enrichment", "intent_summary": "mocked intent analysis", "recommended_capabilities": "", "context_notes": ""}`))
+			return rsp, nil
+		}
+
+		if utils.MatchAllOfSubString(prompt, "capability matcher", "matched_identifiers") ||
+			utils.MatchAllOfSubString(prompt, `"const": "capability-catalog-match"`, "matched_identifiers") {
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "capability-catalog-match", "matched_identifiers": []}`))
 			return rsp, nil
 		}
 
@@ -94,9 +181,16 @@ func MockAICallback(t *testing.T, initFlag, persistentFlag, planFlag string) aic
 		}
 
 		if utils.MatchAllOfSubString(prompt, "directly_answer", "require_tool") {
-			rsp.EmitOutputStream(bytes.NewBufferString(`
+			if atomic.AddInt32(&primaryDecisionCount, 1) == 1 {
+				rsp.EmitOutputStream(bytes.NewBufferString(`
 {"@action": "object", "next_action": { "type": "directly_answer", "answer_payload": "result is 2" },
 "human_readable_thought": "mocked thought for tool calling", "cumulative_summary": "..cumulative-mocked for tool calling.."}
+`))
+				return rsp, nil
+			}
+			rsp.EmitOutputStream(bytes.NewBufferString(`
+{"@action": "object", "next_action": { "type": "finish" },
+"human_readable_thought": "finish after answer delivered", "cumulative_summary": "..cumulative-mocked for finish.."}
 `))
 			return rsp, nil
 		}

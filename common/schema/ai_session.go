@@ -1,14 +1,26 @@
 package schema
 
-import "github.com/jinzhu/gorm"
+import (
+	"time"
+
+	"github.com/jinzhu/gorm"
+)
 
 // AISession stores basic metadata for an AI chat session.
 type AISession struct {
 	gorm.Model
 
-	SessionID        string `json:"session_id" gorm:"unique_index;not null"`
-	Title            string `json:"title" gorm:"type:text"`
-	TitleInitialized bool   `json:"title_initialized" gorm:"index;default:false"`
+	SessionID        string    `json:"session_id" gorm:"unique_index;not null"`
+	Title            string    `json:"title" gorm:"type:text"`
+	TitleInitialized bool      `json:"title_initialized" gorm:"index;default:false"`
+	StartParams      string    `json:"start_params" gorm:"column:start_params;type:text"`
+	LastUsedAt       time.Time `json:"last_used_at" gorm:"column:last_used_at;index"`
+
+	// Source identifies who started the session (e.g. ide, cli); indexed for filtering.
+	Source string `json:"source" gorm:"index;type:varchar(128)"`
+
+	// RelatedRuntimeIDS stores a JSON-encoded string array of related runtime UUIDs.
+	RelatedRuntimeIDS string `json:"related_runtime_ids" gorm:"column:related_runtime_ids;type:text"`
 }
 
 func (a *AISession) TableName() string {

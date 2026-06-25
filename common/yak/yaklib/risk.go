@@ -17,10 +17,21 @@ import (
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
-// NewRisk 创建一条漏洞记录结构体并保存到数据库中，第一个参数是目标URL，后面可以传入零个或多个选项参数，用于指定 risk 的结构
+// NewRisk 创建一条漏洞记录并保存到数据库（导出名为 risk.NewRisk）
+// 第一个参数为目标，后面可传入零个或多个选项用于描述该 risk（标题、类型、严重程度、描述、解决方案等）
+//
+// 参数:
+//   - target: 漏洞目标，通常为 URL 或 IP
+//   - opts: 可选项，如 risk.title / risk.type / risk.severity / risk.description / risk.solution 等
+//
 // Example:
 // ```
-// risk.NewRisk("http://example.com", risk.title("SQL注入漏洞"), risk.type("sqli"), risk.severity("high"), risk.description(""), risk.solution(""))
+// risk.NewRisk("http://example.com",
+//     risk.title("SQL Injection"),
+//     risk.type("sqli"),
+//     risk.severity("high"),
+// )
+// // 写入后可用 risk.YieldRiskByTarget 等查询（示意性示例）
 // ```
 func YakitNewRiskBuilder(client *YakitClient) func(target string, opts ...yakit.RiskParamsOpt) {
 	return func(target string, opts ...yakit.RiskParamsOpt) {
@@ -52,11 +63,19 @@ func YakitNewRiskBuilder(client *YakitClient) func(target string, opts ...yakit.
 	}
 }
 
-// Save 将漏洞记录结构体保存到数据库中其通常与 CreateRisk 一起使用
+// Save 将一条漏洞记录结构体保存到数据库（导出名为 risk.Save）
+// 通常与 risk.CreateRisk 搭配使用：先构造再保存
+//
+// 参数:
+//   - r: 漏洞记录对象（通常来自 risk.CreateRisk）
+//
+// 返回值:
+//   - 错误信息（保存失败时返回）
+//
 // Example:
 // ```
-// r = risk.CreateRisk("http://example.com", risk.title("SQL注入漏洞"), risk.type("sqli"), risk.severity("high"))
-// risk.Save(r)
+// r = risk.CreateRisk("http://example.com", risk.title("SQL Injection"), risk.type("sqli"), risk.severity("high"))
+// risk.Save(r)~
 // ```
 func YakitSaveRiskBuilder(client *YakitClient) func(r *schema.Risk) error {
 	return func(risk *schema.Risk) error {
@@ -104,6 +123,13 @@ func QueryRisks(opts ...yakit.RiskParamsOpt) chan *schema.Risk {
 }
 
 // QueryRisksByKeyword 根据关键字查询风险记录，返回风险记录的管道
+// 参数:
+//   - keyword: 查询关键字
+//   - opts: 零个或多个风险选项参数，用于附加过滤条件，如 risk.severity、risk.type 等
+//
+// 返回值:
+//   - 风险记录的管道
+//
 // Example:
 // ```
 // for risk := range risk.QueryRisksByKeyword("SQL注入", risk.severity("high")) {
@@ -132,6 +158,12 @@ func queryRiskEx(keyword string, opts ...yakit.RiskParamsOpt) chan *schema.Risk 
 }
 
 // YieldRiskByTarget 根据目标(ip或ip:port)获取风险记录，返回风险记录的管道
+// 参数:
+//   - target: 目标地址(ip 或 ip:port)
+//
+// 返回值:
+//   - 风险记录的管道
+//
 // Example:
 // ```
 // for risk := range risk.YieldRiskByTarget("example.com") {
@@ -143,6 +175,12 @@ func YieldRiskByTarget(target string) chan *schema.Risk {
 }
 
 // YieldRiskByIds 根据 Risk ID 获取风险记录，返回风险记录的管道
+// 参数:
+//   - ids: 风险记录 ID 列表
+//
+// 返回值:
+//   - 风险记录的管道
+//
 // Example:
 // ```
 // for risk := range risk.YieldRiskByIds([1,2,3]) {
@@ -154,6 +192,12 @@ func YieldRiskByIds(ids []int) chan *schema.Risk {
 }
 
 // YieldRiskByRuntimeId 根据 RuntimeID 获取风险记录，返回风险记录的管道
+// 参数:
+//   - runtimeId: 运行时 ID
+//
+// 返回值:
+//   - 风险记录的管道
+//
 // Example:
 // ```
 // for risk := range risk.YieldRiskByRuntimeId("161c5372-3e75-46f6-a6bf-1a3182da625e") {
@@ -165,6 +209,12 @@ func YieldRiskByRuntimeId(runtimeId string) chan *schema.Risk {
 }
 
 // YieldRiskByCreateAt 根据创建时间戳获取风险记录，返回风险记录的管道
+// 参数:
+//   - timestamp: 创建时间的 Unix 时间戳
+//
+// 返回值:
+//   - 风险记录的管道
+//
 // Example:
 // ```
 // ts = time.Parse("2006-01-02 15:04:05", "2020-01-01 00:00:00")~.Unix()
@@ -177,6 +227,12 @@ func YieldRiskByCreateAt(timestamp int64) chan *schema.Risk {
 }
 
 // YieldRiskByScriptName 根据插件名戳获取风险记录，返回风险记录的管道
+// 参数:
+//   - scriptName: 插件名
+//
+// 返回值:
+//   - 风险记录的管道
+//
 // Example:
 // ```
 // for risk := range risk.YieldRiskByScriptName("基础 XSS 检测") {
@@ -188,6 +244,12 @@ func YieldRiskByScriptName(scriptName string) chan *schema.Risk {
 }
 
 // DeleteRiskByTarget 根据目标(ip或ip:port)删除风险记录
+// 参数:
+//   - addr: 目标地址(ip 或 ip:port)
+//
+// 返回值:
+//   - 错误信息，失败时非 nil
+//
 // Example:
 // ```
 // risk.DeleteRiskByTarget("example.com")
@@ -197,11 +259,27 @@ func DeleteRiskByTarget(addr string) error {
 }
 
 // DeleteRiskByID 根据风险记录ID删除风险记录
+// 参数:
+//   - id: 风险记录 ID
+//
+// 返回值:
+//   - 错误信息，失败时非 nil
+//
+// Example:
+// ```
+// risk.DeleteRiskByID(123)
+// ```
 func DeleteRiskByID(id int64) error {
 	return yakit.DeleteRiskByID(consts.GetGormProjectDatabase(), id)
 }
 
 // GetSSARiskByID 根据 SSA Risk ID 获取 SSA 风险记录
+// 参数:
+//   - id: SSA Risk ID
+//
+// 返回值:
+//   - SSA 风险记录，获取失败时返回 nil
+//
 // Example:
 // ```
 // ssaRisk = risk.GetSSARiskByID(123)
@@ -222,6 +300,12 @@ func GetSSARiskByID(id int64) *schema.SSARisk {
 }
 
 // GetSSARiskSourceCode 根据 SSA Risk ID 获取完整的源代码,无法获取会返回相关代码片段CodeFragment
+// 参数:
+//   - id: SSA Risk ID
+//
+// 返回值:
+//   - 完整源代码，无法获取时返回代码片段 CodeFragment
+//
 // Example:
 // ```
 // sourceCode = risk.GetSSARiskSourceCode(123)
@@ -246,7 +330,14 @@ func GetSSARiskSourceCode(id int64) string {
 }
 
 // GetSSARiskSourceCodeWithFragment 根据 SSA Risk ID 获取源代码，如果获取完整源码失败则返回代码片段CodeFragment
-// 返回: (完整源码, 代码片段, 是否成功获取完整源码)
+// 参数:
+//   - id: SSA Risk ID
+//
+// 返回值:
+//   - 完整源码
+//   - 代码片段 CodeFragment
+//   - 是否成功获取完整源码
+//
 // Example:
 // ```
 // fullCode, fragment, isFullCode = risk.GetSSARiskSourceCodeWithFragment(123)
@@ -334,6 +425,12 @@ func readFileFromSSADB(filePath string) (string, error) {
 }
 
 // GetSSARiskWithDataFlow 根据 SSA Risk ID 获取包含数据流信息的风险记录
+// 参数:
+//   - id: SSA Risk ID
+//
+// 返回值:
+//   - 包含数据流信息的风险记录，获取失败时返回 nil
+//
 // Example:
 // ```
 // wrappedRisk = risk.GetSSARiskWithDataFlow(123)
@@ -388,6 +485,10 @@ func GetSSARiskWithDataFlow(id int64) *sfreport.Risk {
 }
 
 // NewPublicReverseRMIUrl 返回一个公网 Bridge 的反向 RMI URL
+//
+// 返回值:
+//   - 反向 RMI URL 字符串
+//
 // Example:
 // ```
 // url := risk.NewPublicReverseRMIUrl()
@@ -397,6 +498,10 @@ func NewPublicReverseRMIUrl() string {
 }
 
 // NewPublicReverseHTTPSUrl 返回一个公网 Bridge 的反向 HTTPS URL
+//
+// 返回值:
+//   - 反向 HTTPS URL 字符串
+//
 // Example:
 // ```
 // url := risk.NewPublicReverseHTTPSUrl()
@@ -406,6 +511,10 @@ func NewPublicReverseHTTPSUrl() string {
 }
 
 // NewPublicReverseHTTPUrl 返回一个公网 Bridge 的反向 HTTP URL
+//
+// 返回值:
+//   - 反向 HTTP URL 字符串
+//
 // Example:
 // ```
 // url := risk.NewPublicReverseHTTPUrl()
@@ -415,6 +524,10 @@ func NewPublicReverseHTTPUrl() string {
 }
 
 // NewLocalReverseRMIUrl 返回一个本地 Bridge 的反向 RMI URL
+//
+// 返回值:
+//   - 反向 RMI URL 字符串
+//
 // Example:
 // ```
 // url := risk.NewLocalReverseRMIUrl()
@@ -424,6 +537,10 @@ func NewLocalReverseRMIUrl() string {
 }
 
 // NewLocalReverseHTTPSUrl 返回一个本地 Bridge 的反向 HTTPS URL
+//
+// 返回值:
+//   - 反向 HTTPS URL 字符串
+//
 // Example:
 // ```
 // url := risk.NewLocalReverseHTTPSUrl()
@@ -433,6 +550,10 @@ func NewLocalReverseHTTPSUrl() string {
 }
 
 // NewLocalReverseHTTPUrl 返回一个本地 Bridge 的反向 HTTP URL
+//
+// 返回值:
+//   - 反向 HTTP URL 字符串
+//
 // Example:
 // ```
 // url := risk.NewLocalReverseHTTPUrl()

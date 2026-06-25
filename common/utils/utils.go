@@ -36,6 +36,13 @@ import (
 )
 
 // LowerAndTrimSpace 将字符串raw转换为小写并去除前后空白字符
+//
+// 参数:
+//   - raw: 原始字符串
+//
+// 返回值:
+//   - 转为小写并去除前后空白后的字符串
+//
 // Example:
 // ```
 // str.LowerAndTrimSpace("  Hello  ") // "hello"
@@ -407,7 +414,7 @@ func FixHTTPRequestForHTTPDoWithHttps(r *http.Request, isHttps bool) (*http.Requ
 }
 
 func CallWithCtx(ctx context.Context, cb func()) error {
-	sig := make(chan struct{})
+	sig := make(chan struct{}, 1)
 	go func() {
 		cb()
 		sig <- struct{}{}
@@ -423,7 +430,7 @@ func CallWithCtx(ctx context.Context, cb func()) error {
 func CallWithTimeout(timeout float64, cb func()) error {
 	ctx, cancel := context.WithCancel(TimeoutContextSeconds(timeout))
 	defer cancel()
-	sig := make(chan struct{})
+	sig := make(chan struct{}, 1)
 	go func() {
 		cb()
 		sig <- struct{}{}

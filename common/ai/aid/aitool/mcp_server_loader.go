@@ -2,8 +2,10 @@ package aitool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +20,26 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 )
 
+// defaultMCPClientInfo is the implementation identity yaklang advertises during
+// the MCP initialize handshake (akin to a User-Agent). The version tracks the
+// running yaklang build so MCP servers can tell client versions apart.
+func defaultMCPClientInfo() mcp.Implementation {
+	return mcp.Implementation{
+		Name:    "yaklang-aitool-loader",
+		Version: consts.GetYakVersion(),
+	}
+}
+
+// mcpToolParamInfo is a lightweight representation of a tool parameter used for
+// JSON serialization into MCPServerToolConfig.ParamsJSON.
+type mcpToolParamInfo struct {
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+	Default     string `json:"default,omitempty"`
+	Required    bool   `json:"required"`
+}
+
 func mapStringAnyToStringMap(input schema.MapStringAny) map[string]string {
 	result := make(map[string]string, len(input))
 	for key, value := range input {
@@ -27,7 +49,7 @@ func mapStringAnyToStringMap(input schema.MapStringAny) map[string]string {
 }
 
 func LoadAllEnabledAIToolsFromMCPServers(db *gorm.DB, ctx context.Context) ([]*Tool, error) {
-	return LoadAllEnabledAIToolsFromMCPServersWithCallback(db, ctx, nil, nil, nil)
+	return LoadAllEnabledAIToolsFromMCPServersWithCallback(db, ctx, nil, nil, nil, nil)
 }
 
 func LoadAllEnabledAIToolsFromMCPServersWithCallback(
@@ -35,6 +57,7 @@ func LoadAllEnabledAIToolsFromMCPServersWithCallback(
 	onStart func(mcpServer *schema.MCPServer),
 	onDone func(mcpServer *schema.MCPServer, tools []*Tool, err error),
 	onAllDone func(tools []*Tool, err error),
+	onToolsListChanged MCPToolsListChangedHandler,
 ) ([]*Tool, error) {
 	swg := utils.NewSizedWaitGroup(10)
 	var results []*Tool
@@ -65,7 +88,7 @@ func LoadAllEnabledAIToolsFromMCPServersWithCallback(
 					}
 				})
 			}()
-			tools, err := LoadAIToolFromMCPServers(db, ctx, mcpServer.Name)
+			tools, err := LoadAIToolFromMCPServers(db, ctx, mcpServer.Name, onToolsListChanged)
 			done.Do(func() {
 				if onDone != nil {
 					onDone(mcpServer, tools, err)
@@ -87,8 +110,13 @@ func LoadAllEnabledAIToolsFromMCPServersWithCallback(
 // LoadAIToolFromMCPServers 从数据库中加载指定名称的 MCP 服务器，并将其工具转换为 AITool
 // name: MCP 服务器名称
 // db: 数据库连接，如果为 nil 则使用默认的 profile 数据库
+// onToolsListChanged: optional handler for notifications/tools/list_changed from the remote server
 // 返回: 从该 MCP 服务器加载的所有 AITool 列表
-func LoadAIToolFromMCPServers(db *gorm.DB, ctx context.Context, name string) ([]*Tool, error) {
+func LoadAIToolFromMCPServers(db *gorm.DB, ctx context.Context, name string, onToolsListChanged ...MCPToolsListChangedHandler) ([]*Tool, error) {
+	var listChangedHandler MCPToolsListChangedHandler
+	if len(onToolsListChanged) > 0 {
+		listChangedHandler = onToolsListChanged[0]
+	}
 	if db == nil {
 		// 使用默认的 profile 数据库
 		db = consts.GetGormProfileDatabase()
@@ -119,9 +147,11 @@ func LoadAIToolFromMCPServers(db *gorm.DB, ctx context.Context, name string) ([]
 
 	initRequest := mcp.InitializeRequest{}
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
-	initRequest.Params.ClientInfo = mcp.Implementation{
-		Name:    "yaklang-aitool-loader",
-		Version: "1.0.0",
+	initRequest.Params.ClientInfo = defaultMCPClientInfo()
+
+	var listChangedState *mcpToolsListChangedState
+	if listChangedHandler != nil {
+		listChangedState = registerMCPToolsListChangedHandler(mcpClient, db, mcpServer, nil, listChangedHandler)
 	}
 
 	_, err = mcpClient.Initialize(ctx, initRequest)
@@ -136,9 +166,36 @@ func LoadAIToolFromMCPServers(db *gorm.DB, ctx context.Context, name string) ([]
 		return nil, utils.Errorf("list tools failed: %v", err)
 	}
 
+	// Reconcile the local DB cache with the freshly-fetched tool list first, so
+	// that the enable flags read below reflect the current tool set.
+	liveEntries := make([]yakit.MCPToolEntry, 0, len(toolsResult.Tools))
+	for _, t := range toolsResult.Tools {
+		liveEntries = append(liveEntries, yakit.MCPToolEntry{
+			ToolName:    t.Name,
+			FullName:    fmt.Sprintf("mcp_%s_%s", mcpServer.Name, t.Name),
+			Description: t.Description,
+			ParamsJSON:  serializeMCPToolParams(&t.InputSchema),
+		})
+	}
+	if syncErr := yakit.SyncAndCacheMCPServerTools(db, mcpServer.Name, liveEntries); syncErr != nil {
+		log.Warnf("sync mcp tool cache for server %s failed: %v", mcpServer.Name, syncErr)
+	}
+
+	// Batch-load per-tool enable flags after sync so deleted tools are excluded.
+	toolConfigs, err := yakit.BatchGetMCPServerToolConfigs(db, mcpServer.Name)
+	if err != nil {
+		log.Warnf("batch load tool configs for server %s failed: %v, falling back to defaults", mcpServer.Name, err)
+		toolConfigs = map[string]*schema.MCPServerToolConfig{}
+	}
+
 	// 转换为 AITool
 	var aiTools []*Tool
 	for _, mcpTool := range toolsResult.Tools {
+		cfg, ok := toolConfigs[mcpTool.Name]
+		if ok && !cfg.Enable {
+			log.Debugf("mcp tool %s/%s is disabled, skipping", mcpServer.Name, mcpTool.Name)
+			continue
+		}
 		aiTool, err := convertMCPToolToAITool(mcpTool, mcpServer, mcpClient)
 		if err != nil {
 			log.Errorf("convert mcp tool to aitool failed: %v", err)
@@ -151,6 +208,78 @@ func LoadAIToolFromMCPServers(db *gorm.DB, ctx context.Context, name string) ([]
 		return nil, utils.Errorf("no tools found in mcp server: %s", name)
 	}
 
+	if listChangedState != nil {
+		SyncMCPToolsListChangedState(listChangedState, aiTools)
+	}
+
+	return aiTools, nil
+}
+
+// LoadAIToolsFromMCPServer 从单个显式 MCP server（不查 DB）加载工具，用于会话级挂载。
+// allowedTools 非空时在 client 侧按裸工具名做白名单过滤，server 多暴露的工具一律丢弃，
+// 不依赖 server 自觉只暴露。客户端生命周期随返回的 Tool（Callback 持有 client）。
+func LoadAIToolsFromMCPServer(ctx context.Context, server *schema.MCPServer, allowedTools []string) ([]*Tool, error) {
+	if server == nil {
+		return nil, utils.Errorf("mcp server is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	mcpClient, err := createMCPClient(server)
+	if err != nil {
+		return nil, utils.Errorf("create mcp client failed: %v", err)
+	}
+	// createMCPClient already opened a live connection (sse) or spawned a
+	// subprocess (stdio). On any failure path below we must close it; only when
+	// tools are returned does ownership transfer to the caller (the returned
+	// tools' callbacks keep using the client), so we must NOT close it then.
+	success := false
+	defer func() {
+		if !success {
+			_ = mcpClient.Close()
+		}
+	}()
+
+	initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	initRequest := mcp.InitializeRequest{}
+	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initRequest.Params.ClientInfo = defaultMCPClientInfo()
+	if _, err = mcpClient.Initialize(initCtx, initRequest); err != nil {
+		return nil, utils.Errorf("initialize mcp client failed: %v", err)
+	}
+
+	toolsResult, err := mcpClient.ListTools(initCtx, mcp.ListToolsRequest{})
+	if err != nil {
+		return nil, utils.Errorf("list tools failed: %v", err)
+	}
+
+	allow := make(map[string]bool, len(allowedTools))
+	for _, name := range allowedTools {
+		if name != "" {
+			allow[name] = true
+		}
+	}
+
+	var aiTools []*Tool
+	for _, mcpTool := range toolsResult.Tools {
+		if len(allow) > 0 && !allow[mcpTool.Name] {
+			continue
+		}
+		aiTool, err := convertMCPToolToAITool(mcpTool, server, mcpClient)
+		if err != nil {
+			log.Errorf("convert mcp tool to aitool failed: %v", err)
+			continue
+		}
+		aiTools = append(aiTools, aiTool)
+	}
+
+	if len(aiTools) == 0 {
+		return nil, utils.Errorf("no tools loaded from mcp server %s (allowlist=%v)", server.Name, allowedTools)
+	}
+	success = true
 	return aiTools, nil
 }
 
@@ -197,33 +326,73 @@ func createMCPClient(server *schema.MCPServer) (client.MCPClient, error) {
 	}
 }
 
-// convertMCPToolToAITool 将 MCP 工具转换为 AITool
+// convertMCPToolToAITool converts an MCP tool descriptor into an AITool.
+// MCP tools use the same global AgreePolicy as all other tools; no per-tool
+// approval override is applied here.
 func convertMCPToolToAITool(mcpTool *mcp.Tool, server *schema.MCPServer, mcpClient client.MCPClient) (*Tool, error) {
-	// 生成工具名称: mcp_{server_name}_{tool_name}
+	// Tool name convention: mcp_{server_name}_{tool_name}
 	toolName := fmt.Sprintf("mcp_%s_%s", server.Name, mcpTool.Name)
 
-	// 创建工具描述
 	description := mcpTool.Description
 	if description == "" {
-		description = fmt.Sprintf("Tool from MCP server: %s", server.Name)
+		description = fmt.Sprintf("[MCP:%s] Tool from MCP server: %s", server.Name, server.Name)
 	} else {
 		description = fmt.Sprintf("[MCP:%s] %s", server.Name, description)
 	}
 
-	// 创建 AITool，使用 NewFromMCPTool
 	aiTool, err := NewFromMCPTool(
 		mcpTool,
 		WithDescription(description),
+		WithKeywords([]string{"mcp", server.Name, mcpTool.Name, "external", "remote"}),
+		WithVerboseName(fmt.Sprintf("%s (MCP:%s)", mcpTool.Name, server.Name)),
 		WithCallback(createToolCallback(mcpClient, mcpTool.Name, server.Name)),
 	)
 	if err != nil {
 		return nil, utils.Errorf("create aitool from mcp tool failed: %v", err)
 	}
 
-	// 更新工具名称
 	aiTool.Name = toolName
-
+	aiTool.BridgeMCPClient = mcpClient
 	return aiTool, nil
+}
+
+// isMCPInternalInvokeParam reports keys injected by Yakit/AI runtime that must not
+// be forwarded to external MCP servers (they validate against their own JSON schema).
+func isMCPInternalInvokeParam(key string) bool {
+	switch key {
+	case "runtime_id", "@action", "__DEFAULT__", "__FALLBACK__", "__[yaklang-raw]__":
+		return true
+	default:
+		return false
+	}
+}
+
+// filterParamsForMCPCall strips Yakit-internal invoke params before forwarding to MCP.
+func filterParamsForMCPCall(params InvokeParams) map[string]interface{} {
+	mcpParams := make(map[string]interface{})
+	for k, v := range params {
+		if isMCPInternalInvokeParam(k) {
+			continue
+		}
+		mcpParams[k] = v
+	}
+	return mcpParams
+}
+
+// firstMCPTextFromContent extracts the first text block from MCP tool result content.
+// JSON unmarshaling yields map[string]interface{} rather than mcp.TextContent structs.
+func firstMCPTextFromContent(content []any) string {
+	for _, item := range content {
+		if textContent, ok := item.(mcp.TextContent); ok && textContent.Text != "" {
+			return textContent.Text
+		}
+		if m, ok := item.(map[string]interface{}); ok {
+			if text, _ := m["text"].(string); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 // createToolCallback 创建工具调用回调函数
@@ -232,11 +401,7 @@ func createToolCallback(mcpClient client.MCPClient, toolName string, serverName 
 		// 记录工具调用
 		log.Infof("calling mcp tool: %s from server: %s", toolName, serverName)
 
-		// 转换参数为 map[string]interface{}
-		mcpParams := make(map[string]interface{})
-		for k, v := range params {
-			mcpParams[k] = v
-		}
+		mcpParams := filterParamsForMCPCall(params)
 
 		// 设置超时
 		callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -256,11 +421,9 @@ func createToolCallback(mcpClient client.MCPClient, toolName string, serverName 
 
 		// 处理结果
 		if result.IsError {
-			errMsg := "tool execution failed"
-			if len(result.Content) > 0 {
-				if textContent, ok := result.Content[0].(mcp.TextContent); ok {
-					errMsg = textContent.Text
-				}
+			errMsg := firstMCPTextFromContent(result.Content)
+			if errMsg == "" {
+				errMsg = "tool execution failed"
 			}
 			log.Errorf("mcp tool %s execution error: %s, content: %#v", toolName, errMsg, result.Content)
 			stderr.Write([]byte(errMsg))
@@ -276,8 +439,11 @@ func createToolCallback(mcpClient client.MCPClient, toolName string, serverName 
 			case mcp.ImageContent:
 				resultContent += fmt.Sprintf("[Image: %s]", c.MIMEType)
 			default:
-				// 其他类型的内容，尝试转换为字符串
-				resultContent += fmt.Sprintf("%v", c)
+				if text := firstMCPTextFromContent([]any{c}); text != "" {
+					resultContent += text
+				} else {
+					resultContent += fmt.Sprintf("%v", c)
+				}
 			}
 		}
 
@@ -288,4 +454,84 @@ func createToolCallback(mcpClient client.MCPClient, toolName string, serverName 
 
 		return resultContent, nil
 	}
+}
+
+// LoadAIToolsFromMCPCapability loads MCP tools for an enabled capability entry.
+// If name looks like a full AI tool name (mcp_{server}_{tool}), it resolves that tool;
+// otherwise name is treated as an MCP server name and all tools from that server are loaded.
+func LoadAIToolsFromMCPCapability(db *gorm.DB, ctx context.Context, name string) ([]*Tool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, utils.Error("mcp capability name is empty")
+	}
+	if strings.HasPrefix(name, "mcp_") {
+		tool, err := loadAIToolFromMCPServersByAIToolName(db, ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		return []*Tool{tool}, nil
+	}
+	return LoadAIToolFromMCPServers(db, ctx, name, nil)
+}
+
+func loadAIToolFromMCPServersByAIToolName(db *gorm.DB, ctx context.Context, aiToolName string) (*Tool, error) {
+	if db == nil {
+		db = consts.GetGormProfileDatabase()
+	}
+	if db == nil {
+		return nil, utils.Error("profile database is nil")
+	}
+	for server := range yakit.YieldEnabledMCPServers(ctx, db) {
+		tools, err := LoadAIToolFromMCPServers(db, ctx, server.Name, nil)
+		if err != nil {
+			log.Warnf("load mcp server %q while resolving tool %q failed: %v", server.Name, aiToolName, err)
+			continue
+		}
+		for _, tool := range tools {
+			if tool != nil && tool.Name == aiToolName {
+				return tool, nil
+			}
+		}
+	}
+	return nil, utils.Errorf("mcp tool %q not found in enabled mcp servers", aiToolName)
+}
+
+// serializeMCPToolParams converts a ToolInputSchema into a compact JSON string
+// suitable for storing in MCPServerToolConfig.ParamsJSON.
+func serializeMCPToolParams(schema *mcp.ToolInputSchema) string {
+	if schema == nil || schema.Properties == nil || schema.Properties.Len() == 0 {
+		return "[]"
+	}
+
+	requiredSet := make(map[string]bool, len(schema.Required))
+	for _, r := range schema.Required {
+		requiredSet[r] = true
+	}
+
+	var params []mcpToolParamInfo
+	schema.Properties.ForEach(func(name string, val any) bool {
+		p := mcpToolParamInfo{Name: name, Required: requiredSet[name]}
+		if m, ok := val.(map[string]interface{}); ok {
+			if t, ok := m["type"].(string); ok {
+				p.Type = t
+			}
+			if d, ok := m["description"].(string); ok {
+				p.Description = d
+			}
+			if def, ok := m["default"]; ok {
+				p.Default = fmt.Sprintf("%v", def)
+			}
+		}
+		if p.Type == "" {
+			p.Type = "string"
+		}
+		params = append(params, p)
+		return true
+	})
+
+	b, err := json.Marshal(params)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
 }

@@ -69,6 +69,15 @@ func (m *AdvancedMockInvoker) GetBasicPromptInfo(tools []*aitool.Tool) (string, 
 	}, nil
 }
 
+func (m *AdvancedMockInvoker) AssembleLoopPrompt(tools []*aitool.Tool, input *aicommon.LoopPromptAssemblyInput) (*aicommon.LoopPromptAssemblyResult, error) {
+	_ = tools
+	_ = input
+	return &aicommon.LoopPromptAssemblyResult{
+		Prompt:   "advanced mock loop prompt",
+		Sections: nil,
+	}, nil
+}
+
 func (m *AdvancedMockInvoker) InvokeSpeedPriorityLiteForge(ctx context.Context, actionName string, prompt string, outputs []aitool.ToolOption, opts ...aicommon.GeneralKVConfigOption) (*aicommon.Action, error) {
 	return m.InvokeLiteForge(ctx, actionName, prompt, outputs, opts...)
 }
@@ -183,6 +192,9 @@ func (m *AdvancedMockInvoker) EnhanceKnowledgeGetter(ctx context.Context, userQu
 func (m *AdvancedMockInvoker) EnhanceKnowledgeGetterEx(ctx context.Context, userQuery string, enhancePlans []string, collections ...string) (string, error) {
 	return "", nil
 }
+func (m *AdvancedMockInvoker) QuickKnowledgeSearch(ctx context.Context, query string, keywords []string, collections ...string) (string, error) {
+	return "", nil
+}
 func (m *AdvancedMockInvoker) EnhanceKnowledgeGetRandomN(ctx context.Context, n int, collections ...string) (string, error) {
 	return "", nil
 }
@@ -198,7 +210,32 @@ func (m *AdvancedMockInvoker) VerifyUserSatisfaction(ctx context.Context, query 
 func (m *AdvancedMockInvoker) RequireAIForgeAndAsyncExecute(ctx context.Context, forgeName string, onFinish func(error)) {
 }
 
+func (m *AdvancedMockInvoker) AsyncPlanOnly(ctx context.Context, planPayload string, onFinish func(error)) {
+}
+
 func (m *AdvancedMockInvoker) AsyncPlanAndExecute(ctx context.Context, planPayload string, onFinish func(error)) {
+}
+
+func (m *AdvancedMockInvoker) ReviewExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput) (*aicommon.ExecutePlanInput, error) {
+	return input, nil
+}
+
+func (m *AdvancedMockInvoker) ForceReviewExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput) (*aicommon.ExecutePlanInput, error) {
+	return input, nil
+}
+
+func (m *AdvancedMockInvoker) BeginPlanCoordinatorSession(ctx context.Context, input *aicommon.ExecutePlanInput, forceManualReview bool) (aicommon.PlanCoordinatorSession, error) {
+	return nil, nil
+}
+
+func (m *AdvancedMockInvoker) PublishDetachedPlan(ctx context.Context, input *aicommon.ExecutePlanInput, reactTaskID string) (string, error) {
+	return "", nil
+}
+
+func (m *AdvancedMockInvoker) AsyncExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput, onFinish func(error)) {
+}
+
+func (m *AdvancedMockInvoker) AsyncExecuteCod(ctx context.Context, coordinatorID string, onFinish func(error)) {
 }
 
 func (m *AdvancedMockInvoker) AddToTimeline(entry, content string) {
@@ -651,8 +688,8 @@ func TestAIMemoryTriage_SearchMemory(t *testing.T) {
 			t.Fatalf("search result should not be nil")
 		}
 
-		if result.ContentBytes > 500 {
-			t.Errorf("content bytes %d exceeds limit 500", result.ContentBytes)
+		if result.ContentTokens > 500 {
+			t.Errorf("content tokens %d exceeds limit 500", result.ContentTokens)
 		}
 
 		if result.SearchSummary == "" {

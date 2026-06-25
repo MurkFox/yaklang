@@ -3,9 +3,14 @@ package compiler
 import (
 	"context"
 	"fmt"
+	"maps"
+	"sort"
+	"strings"
 
 	"github.com/yaklang/go-llvm"
 	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssa2llvm/obfuscation"
+	"github.com/yaklang/yaklang/common/yak/ssa2llvm/runtime/abi"
 	"github.com/yaklang/yaklang/common/yak/ssa2llvm/types"
 )
 
@@ -39,6 +44,27 @@ type Compiler struct {
 	// extending the SSA package schema.
 	InstrTags map[int64]string
 
+	// functionWrappers maps function name → obfuscation.FunctionWrapper info.
+	// When set, CompileFunction emits a runtime wrapper instead of
+	// compiling the SSA function body.
+	functionWrappers map[string]*obfuscation.FunctionWrapper
+
+	// runtimeSym maps canonical runtime symbol → link symbol (linkprep).
+	runtimeSym map[string]string
+
+	// yaklibDeps tracks module.method pairs that were actually lowered to
+	// runtime yaklib dispatch. It drives pruned runtime source generation.
+	yaklibDeps map[string]map[string]struct{}
+
+	// runtimeDispatchDeps tracks dispatch-table entries that must be present in
+	// optional pruned runtime files.
+	runtimeDispatchDeps map[abi.FuncID]struct{}
+
+	initialMemberValueIDs      map[int64]struct{}
+	initializingMemberValueIDs map[int64]int
+	emittedMemberVariableSets  map[string]struct{}
+	materializingCallableIDs   map[int64]int
+
 	function *functionCompileContext
 }
 
@@ -65,20 +91,56 @@ func WithInstructionTags(tags map[int64]string) CompilerOption {
 	}
 }
 
+// WithFunctionWrappers sets the generic runtime-wrapper map. Functions listed
+// here will have their bodies replaced with runtime invoke stubs.
+func WithFunctionWrappers(wrappers map[string]*obfuscation.FunctionWrapper) CompilerOption {
+	return func(c *Compiler) {
+		if len(wrappers) == 0 {
+			return
+		}
+		c.functionWrappers = wrappers
+	}
+}
+
+// WithRuntimeSymManifest sets per-build names for runtime symbols (linkprep).
+func WithRuntimeSymManifest(m map[string]string) CompilerOption {
+	return func(c *Compiler) {
+		if len(m) == 0 {
+			return
+		}
+		c.runtimeSym = maps.Clone(m)
+	}
+}
+
+func (c *Compiler) runtimeSymName(canonical string) string {
+	if c == nil || len(c.runtimeSym) == 0 {
+		return canonical
+	}
+	if v, ok := c.runtimeSym[canonical]; ok && v != "" {
+		return v
+	}
+	return canonical
+}
+
 // NewCompiler initializes a new Compiler instance.
 func NewCompiler(ctx context.Context, prog *ssa.Program, opts ...CompilerOption) *Compiler {
 	c := llvm.NewContext()
 	comp := &Compiler{
-		Ctx:            ctx,
-		LLVMCtx:        c,
-		Mod:            c.NewModule(prog.Name),
-		Builder:        c.NewBuilder(),
-		Values:         make(map[int64]llvm.Value),
-		Blocks:         make(map[int64]llvm.BasicBlock),
-		Funcs:          make(map[int64]llvm.Value),
-		Program:        prog,
-		TypeConverter:  types.NewTypeConverter(c),
-		ExternBindings: cloneExternBindings(defaultExternBindings),
+		Ctx:                       ctx,
+		LLVMCtx:                   c,
+		Mod:                       c.NewModule(prog.Name),
+		Builder:                   c.NewBuilder(),
+		Values:                    make(map[int64]llvm.Value),
+		Blocks:                    make(map[int64]llvm.BasicBlock),
+		Funcs:                     make(map[int64]llvm.Value),
+		Program:                   prog,
+		TypeConverter:             types.NewTypeConverter(c),
+		ExternBindings:            cloneExternBindings(defaultExternBindings),
+		yaklibDeps:                make(map[string]map[string]struct{}),
+		runtimeDispatchDeps:       make(map[abi.FuncID]struct{}),
+		initialMemberValueIDs:     make(map[int64]struct{}),
+		emittedMemberVariableSets: make(map[string]struct{}),
+		materializingCallableIDs:  make(map[int64]int),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -86,6 +148,61 @@ func NewCompiler(ctx context.Context, prog *ssa.Program, opts ...CompilerOption)
 		}
 	}
 	return comp
+}
+
+func (c *Compiler) recordYaklibDependency(module, method string) {
+	module = strings.TrimSpace(module)
+	method = strings.TrimSpace(method)
+	if c == nil || method == "" {
+		return
+	}
+	if c.yaklibDeps == nil {
+		c.yaklibDeps = make(map[string]map[string]struct{})
+	}
+	methods := c.yaklibDeps[module]
+	if methods == nil {
+		methods = make(map[string]struct{})
+		c.yaklibDeps[module] = methods
+	}
+	methods[method] = struct{}{}
+}
+
+func (c *Compiler) recordRuntimeDispatchDependency(id abi.FuncID) {
+	if c == nil || id == 0 {
+		return
+	}
+	if c.runtimeDispatchDeps == nil {
+		c.runtimeDispatchDeps = make(map[abi.FuncID]struct{})
+	}
+	c.runtimeDispatchDeps[id] = struct{}{}
+}
+
+func (c *Compiler) YaklibDependencies() map[string][]string {
+	out := make(map[string][]string)
+	if c == nil || len(c.yaklibDeps) == 0 {
+		return out
+	}
+	for module, methods := range c.yaklibDeps {
+		list := make([]string, 0, len(methods))
+		for method := range methods {
+			list = append(list, method)
+		}
+		sort.Strings(list)
+		out[module] = list
+	}
+	return out
+}
+
+func (c *Compiler) RuntimeDispatchDependencies() []abi.FuncID {
+	if c == nil || len(c.runtimeDispatchDeps) == 0 {
+		return nil
+	}
+	out := make([]abi.FuncID, 0, len(c.runtimeDispatchDeps))
+	for id := range c.runtimeDispatchDeps {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // Dispose releases LLVM resources.
@@ -119,15 +236,24 @@ func (c *Compiler) Compile() error {
 
 // CompileFunction compiles a single YakSSA function to LLVM IR.
 func (c *Compiler) CompileFunction(fn *ssa.Function) error {
+	// Check if this function is owned by an obfuscation runtime wrapper.
+	if w, ok := c.functionWrappers[fn.GetName()]; ok && w != nil {
+		return c.compileWrappedFunction(fn, w)
+	}
+
 	c.function = newFunctionCompileContext(fn)
+	c.Values = make(map[int64]llvm.Value)
+	c.Blocks = make(map[int64]llvm.BasicBlock)
 	defer func() {
 		c.function = nil
 	}()
 	// 1. Get or declare LLVM function with a stable unique symbol name.
 	llvmFn, _ := c.getOrDeclareLLVMFunction(fn)
+	c.function.llvmFn = llvmFn
 	if err := c.prepareErrorHandling(fn); err != nil {
 		return err
 	}
+	c.function.switchHandlers = collectSwitchHandlers(fn)
 
 	// 2. Register the InvokeContext parameter.
 	if llvmFn.ParamsCount() < 1 {
@@ -139,7 +265,10 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 
 	// 3. Pre-create all BasicBlocks
 	// LLVM IR requires jump targets to exist, so we create them first.
-	for _, blockID := range fn.Blocks {
+	for _, blockID := range collectFunctionBlockIDs(fn) {
+		if _, ok := c.Blocks[blockID]; ok {
+			continue
+		}
 		bb := c.LLVMCtx.AddBasicBlock(llvmFn, fmt.Sprintf("bb_%d", blockID))
 		c.Blocks[blockID] = bb
 	}
@@ -148,13 +277,52 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 		c.function.returnBlock = c.LLVMCtx.AddBasicBlock(llvmFn, fmt.Sprintf("yak_ret_%d", fn.GetId()))
 	}
 
+	// 3b. Pre-create all Phi nodes before compiling any block instructions.
+	// Other blocks may reference phis before their defining block is visited.
+	for _, blockID := range collectFunctionBlockIDs(fn) {
+		val, ok := fn.GetValueById(blockID)
+		if !ok {
+			continue
+		}
+		blockObj, ok := val.(*ssa.BasicBlock)
+		if !ok || blockObj == nil {
+			continue
+		}
+		bb, ok := c.Blocks[blockID]
+		if !ok {
+			continue
+		}
+		c.Builder.SetInsertPointAtEnd(bb)
+		for _, phiID := range blockObj.Phis {
+			phiVal, ok := fn.GetValueById(phiID)
+			if !ok {
+				continue
+			}
+			if inst, ok := phiVal.(ssa.Instruction); ok && inst.IsLazy() {
+				if self := inst.Self(); self != nil {
+					if materialized, ok := self.(ssa.Value); ok && materialized != nil {
+						phiVal = materialized
+					}
+				}
+			}
+			if phi, ok := phiVal.(*ssa.Phi); ok {
+				if err := c.compilePhi(phi); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	// 4. Compile Instructions in each Block
-	for _, blockID := range fn.Blocks {
+	for _, blockID := range orderBlocksForCompile(fn) {
 		bb, ok := c.Blocks[blockID]
 		if !ok {
 			return fmt.Errorf("block %d not found", blockID)
 		}
 		c.Builder.SetInsertPointAtEnd(bb)
+		if c.function != nil {
+			c.function.activeBlockID = blockID
+		}
 
 		// Get Block object from function
 		val, ok := fn.GetValueById(blockID)
@@ -167,21 +335,7 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 			return fmt.Errorf("value %d is not a BasicBlock", blockID)
 		}
 
-		// First, create Phi nodes at the beginning of the block
-		for _, phiID := range blockObj.Phis {
-			phiVal, ok := fn.GetValueById(phiID)
-			if !ok {
-				continue
-			}
-			if phi, ok := phiVal.(*ssa.Phi); ok {
-				if err := c.compilePhi(phi); err != nil {
-					return err
-				}
-			}
-		}
-
-		// Bind parameters from InvokeContext after phi nodes, to keep entry-block
-		// phi ordering valid for LLVM IR.
+		// First, phi nodes were pre-created in a function-wide pass.
 		if blockID == fn.EnterBlock {
 			if err := c.bindParamsFromContext(fn); err != nil {
 				return err
@@ -195,7 +349,7 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 			if !ok || instVal == nil {
 				continue
 			}
-			if instVal.IsLazy() {
+			if _, isSideEffect := instVal.(*ssa.SideEffect); !isSideEffect && instVal.IsLazy() {
 				instVal = instVal.Self()
 			}
 			if instVal == nil {
@@ -204,7 +358,7 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 			inst := instVal
 			isTerminator := false
 			switch inst.(type) {
-			case *ssa.Return, *ssa.Jump, *ssa.If, *ssa.Loop, *ssa.Panic:
+			case *ssa.Return, *ssa.Jump, *ssa.If, *ssa.Loop, *ssa.Switch, *ssa.Panic:
 				isTerminator = true
 			}
 
@@ -237,8 +391,6 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 		}
 		if !hasTerminator {
 			if len(blockObj.Succs) == 2 {
-				// This is an If - find the condition from last BinOp (comparison)
-				// Look backwards in Insts for the last comparison
 				var condID int64 = -1
 				for i := len(blockObj.Insts) - 1; i >= 0; i-- {
 					instVal, ok := fn.GetValueById(blockObj.Insts[i])
@@ -246,7 +398,6 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 						continue
 					}
 					if binOp, ok := instVal.(*ssa.BinOp); ok {
-						// Check if it's a comparison
 						if binOp.Op == ssa.OpGt || binOp.Op == ssa.OpLt ||
 							binOp.Op == ssa.OpGtEq || binOp.Op == ssa.OpLtEq ||
 							binOp.Op == ssa.OpEq || binOp.Op == ssa.OpNotEq {
@@ -257,44 +408,43 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 				}
 
 				if condID != -1 {
-					condVal, _ := c.Values[condID]
+					var contextInst ssa.Instruction
+					if condInst, ok := fn.GetInstructionById(condID); ok {
+						contextInst = condInst
+					}
+					condVal, err := c.getValue(contextInst, condID)
+					if err != nil {
+						return err
+					}
+					condVal = c.coerceToI1(condVal, "if_cond")
 					trueBlock := c.Blocks[blockObj.Succs[0]]
 					falseBlock := c.Blocks[blockObj.Succs[1]]
 					c.Builder.CreateCondBr(condVal, trueBlock, falseBlock)
 					hasTerminator = true
 				}
 			} else if len(blockObj.Succs) == 1 {
-				// This is a Jump
 				targetBlock := c.Blocks[blockObj.Succs[0]]
 				c.Builder.CreateBr(targetBlock)
 				hasTerminator = true
 			}
 
-			// If still no terminator, add default return
 			if !hasTerminator {
-				if fn.DeferBlock > 0 && !c.function.returnBlock.IsNil() {
-					// Implicit return 0 through defer.
-					if err := c.storeContextReturn(llvm.ConstInt(c.LLVMCtx.Int64Type(), 0, false)); err != nil {
-						return err
-					}
-					deferBB, ok := c.Blocks[fn.DeferBlock]
-					if !ok {
-						return fmt.Errorf("defer block %d not found for function %s", fn.DeferBlock, fn.GetName())
-					}
-					c.Builder.CreateBr(deferBB)
-				} else {
-					// Implicit return 0.
-					if err := c.storeContextReturn(llvm.ConstInt(c.LLVMCtx.Int64Type(), 0, false)); err != nil {
-						return err
-					}
-					c.Builder.CreateRetVoid()
+				if err := c.emitImplicitFunctionExit(fn); err != nil {
+					return err
 				}
 			}
+		}
+		if err := c.ensureBasicBlockTerminator(bb, fn); err != nil {
+			return err
+		}
+		if c.function != nil {
+			c.function.compiledBlocks[blockID] = struct{}{}
+			c.function.activeBlockID = 0
 		}
 	}
 
 	// 6. Resolve Phis (Pass 2)
-	for _, blockID := range fn.Blocks {
+	for _, blockID := range collectFunctionBlockIDs(fn) {
 		val, ok := fn.GetValueById(blockID)
 		if !ok {
 			return fmt.Errorf("pass 2: block value %d not found", blockID)
@@ -317,10 +467,51 @@ func (c *Compiler) CompileFunction(fn *ssa.Function) error {
 		}
 	}
 
+	if err := c.ensureAllBlockTerminators(fn); err != nil {
+		return err
+	}
+
 	if fn.DeferBlock > 0 && !c.function.returnBlock.IsNil() {
 		c.Builder.SetInsertPointAtEnd(c.function.returnBlock)
 		c.Builder.CreateRetVoid()
 	}
 
+	return nil
+}
+
+// compileWrappedFunction emits a minimal LLVM stub that delegates to an
+// obfuscator-owned runtime entrypoint. The original function body is not
+// compiled.
+func (c *Compiler) compileWrappedFunction(fn *ssa.Function, w *obfuscation.FunctionWrapper) error {
+	llvmFn, _ := c.getOrDeclareLLVMFunction(fn)
+	entry := c.LLVMCtx.AddBasicBlock(llvmFn, "entry")
+	c.Builder.SetInsertPointAtEnd(entry)
+
+	if llvmFn.ParamsCount() < 1 {
+		return fmt.Errorf("compileWrappedFunction: missing invoke context parameter for function %s", fn.GetName())
+	}
+	ctxParam := llvmFn.Param(0)
+	ctxParam.SetName(fmt.Sprintf("ctx_%d", fn.GetId()))
+
+	i8Ptr := llvm.PointerType(c.LLVMCtx.Int8Type(), 0)
+	argTypes := make([]llvm.Type, 0, 1+len(w.Payload))
+	argTypes = append(argTypes, i8Ptr)
+	for range w.Payload {
+		argTypes = append(argTypes, i8Ptr)
+	}
+	fnType := llvm.FunctionType(c.LLVMCtx.VoidType(), argTypes, false)
+	runtimeFn := c.Mod.NamedFunction(w.RuntimeSymbol)
+	if runtimeFn.IsNil() {
+		runtimeFn = llvm.AddFunction(c.Mod, w.RuntimeSymbol, fnType)
+	}
+
+	callArgs := make([]llvm.Value, 0, 1+len(w.Payload))
+	callArgs = append(callArgs, ctxParam)
+	for idx, payload := range w.Payload {
+		symbolName := fmt.Sprintf("yak_%s_payload_%s_%d", w.Owner, w.FuncName, idx)
+		callArgs = append(callArgs, c.Builder.CreateGlobalStringPtr(payload, symbolName))
+	}
+	c.Builder.CreateCall(fnType, runtimeFn, callArgs, "")
+	c.Builder.CreateRetVoid()
 	return nil
 }

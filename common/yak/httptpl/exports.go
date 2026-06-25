@@ -37,6 +37,16 @@ func init() {
 	yaklib.FuzzExports["FuzzCalcExprInt64Safe"] = FuzzCalcExpr3
 }
 
+// FuzzCalcExprInt64Safe 生成一组用于表达式注入(SSTI/计算型)探测的随机变量，保证减法结果在 int64 安全范围内
+// 返回值:
+//   - 包含 num1、num2、expr、result 等键的变量表，用于构造与校验计算型注入 payload
+//
+// Example:
+// ```
+// // 生成 int64 安全的计算型注入变量，此处仅作示意
+// vars = fuzz.FuzzCalcExprInt64Safe()
+// println(vars["expr"])
+// ```
 func FuzzCalcExpr3() map[string]any {
 	vars := NewVars()
 	// int32 max: 2147483647               (10位)
@@ -51,6 +61,16 @@ func FuzzCalcExpr3() map[string]any {
 	return vars.ToMap()
 }
 
+// FuzzCalcExprInt32Safe 生成一组用于表达式注入(SSTI/计算型)探测的随机变量，保证减法结果在 int32 安全范围内
+// 返回值:
+//   - 包含 num1、num2、expr、result 等键的变量表，用于构造与校验计算型注入 payload
+//
+// Example:
+// ```
+// // 生成 int32 安全的计算型注入变量，此处仅作示意
+// vars = fuzz.FuzzCalcExprInt32Safe()
+// println(vars["expr"])
+// ```
 func FuzzCalcExpr2() map[string]any {
 	vars := NewVars()
 	// int32 max: 2147483647               (10位)
@@ -65,6 +85,16 @@ func FuzzCalcExpr2() map[string]any {
 	return vars.ToMap()
 }
 
+// FuzzCalcExpr 生成一组用于表达式注入(SSTI/计算型)探测的随机日期相关变量与计算表达式
+// 返回值:
+//   - 包含 year、month、day、expr、result 等键的变量表，用于构造与校验计算型注入 payload
+//
+// Example:
+// ```
+// // 生成计算型注入变量，此处仅作示意
+// vars = fuzz.FuzzCalcExpr()
+// println(vars["expr"])
+// ```
 func FuzzCalcExpr() map[string]any {
 	vars := NewVars()
 	var day string
@@ -223,6 +253,16 @@ func toConfig(opts ...interface{}) (*Config, *lowhttp.LowhttpExecConfig, []lowht
 	return config, lowhttpConfig, totalConfig
 }
 
+// ScanAuto 自动识别输入目标类型(原始请求、URL、主机等)并批量执行 nuclei 模板扫描
+// 参数:
+//   - items: 扫描目标，支持字符串、字节数组或可遍历的目标集合
+//   - opt: 零个或多个 nuclei 扫描配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：自动批量扫描多个目标
+// nuclei.ScanAuto(["http://example.com", "http://test.com"], nuclei.all(true))
+// ```
 func ScanAuto(items any, opt ...interface{}) {
 	switch items.(type) {
 	case string, []byte:
@@ -319,6 +359,379 @@ func nucleiOptionDummy(n string) func(i ...any) any {
 		})
 	}
 }
+
+// 以下为兼容 nuclei 官方命令行而保留的选项，当前在 yaklang 引擎中均为无操作(no-op)。
+// 这些选项不会影响扫描行为，仅为保证使用官方参数习惯的脚本可以无错运行而存在。
+// 如需对应能力，请使用 yaklang 中真实生效的选项（例如 nuclei.tags / nuclei.templates /
+// nuclei.proxy / nuclei.timeout / nuclei.rateLimit 等）。
+
+// excludeTags 兼容保留选项：按标签排除模板。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.excludeTags("dos"))
+// die(err)
+// ```
+func nucleiExcludeTags(i ...any) any { return nucleiOptionDummy("excludeTags")(i...) }
+
+// workflows 兼容保留选项：指定 nuclei 工作流。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.workflows("workflow.yaml"))
+// die(err)
+// ```
+func nucleiWorkflows(i ...any) any { return nucleiOptionDummy("workflows")(i...) }
+
+// templatesDir 兼容保留选项：指定模板目录。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.templatesDir("/tmp/templates"))
+// die(err)
+// ```
+func nucleiTemplatesDir(i ...any) any { return nucleiOptionDummy("templatesDir")(i...) }
+
+// headers 兼容保留选项：设置自定义请求头。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.headers("X-Test: 1"))
+// die(err)
+// ```
+func nucleiHeaders(i ...any) any { return nucleiOptionDummy("headers")(i...) }
+
+// severity 兼容保留选项：按严重级别过滤模板。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.severity("high"))
+// die(err)
+// ```
+func nucleiSeverity(i ...any) any { return nucleiOptionDummy("severity")(i...) }
+
+// output 兼容保留选项：指定结果输出文件。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.output("/tmp/result.txt"))
+// die(err)
+// ```
+func nucleiOutput(i ...any) any { return nucleiOptionDummy("output")(i...) }
+
+// logFile 兼容保留选项：指定日志文件。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.logFile("/tmp/scan.log"))
+// die(err)
+// ```
+func nucleiLogFile(i ...any) any { return nucleiOptionDummy("logFile")(i...) }
+
+// reportingDB 兼容保留选项：指定报告数据库。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.reportingDB("report.db"))
+// die(err)
+// ```
+func nucleiReportingDB(i ...any) any { return nucleiOptionDummy("reportingDB")(i...) }
+
+// reportingConfig 兼容保留选项：指定报告配置文件。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.reportingConfig("report.yaml"))
+// die(err)
+// ```
+func nucleiReportingConfig(i ...any) any { return nucleiOptionDummy("reportingConfig")(i...) }
+
+// headless 兼容保留选项：启用 headless 浏览器模板。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.headless(true))
+// die(err)
+// ```
+func nucleiHeadless(i ...any) any { return nucleiOptionDummy("headless")(i...) }
+
+// showBrowser 兼容保留选项：headless 扫描时显示浏览器。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.showBrowser(true))
+// die(err)
+// ```
+func nucleiShowBrowser(i ...any) any { return nucleiOptionDummy("showBrowser")(i...) }
+
+// systemDnsResolver 兼容保留选项：使用系统 DNS 解析。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.systemDnsResolver(true))
+// die(err)
+// ```
+func nucleiSystemDnsResolver(i ...any) any { return nucleiOptionDummy("systemDnsResolver")(i...) }
+
+// metrics 兼容保留选项：开启运行指标。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.metrics(true))
+// die(err)
+// ```
+func nucleiMetrics(i ...any) any { return nucleiOptionDummy("metrics")(i...) }
+
+// silent 兼容保留选项：静默模式。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.silent(true))
+// die(err)
+// ```
+func nucleiSilent(i ...any) any { return nucleiOptionDummy("silent")(i...) }
+
+// version 兼容保留选项：打印版本信息。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.version(true))
+// die(err)
+// ```
+func nucleiVersion(i ...any) any { return nucleiOptionDummy("version")(i...) }
+
+// noColor 兼容保留选项：禁用彩色输出。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.noColor(true))
+// die(err)
+// ```
+func nucleiNoColor(i ...any) any { return nucleiOptionDummy("noColor")(i...) }
+
+// updateTemplates 兼容保留选项：更新模板。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.updateTemplates(true))
+// die(err)
+// ```
+func nucleiUpdateTemplates(i ...any) any { return nucleiOptionDummy("updateTemplates")(i...) }
+
+// templatesVersion 兼容保留选项：指定模板版本。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.templatesVersion("v9"))
+// die(err)
+// ```
+func nucleiTemplatesVersion(i ...any) any { return nucleiOptionDummy("templatesVersion")(i...) }
+
+// templateList 兼容保留选项：列出模板。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.templateList(true))
+// die(err)
+// ```
+func nucleiTemplateList(i ...any) any { return nucleiOptionDummy("templateList")(i...) }
+
+// stopAtFirstMatch 兼容保留选项：命中首个匹配后停止。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.stopAtFirstMatch(true))
+// die(err)
+// ```
+func nucleiStopAtFirstMatch(i ...any) any { return nucleiOptionDummy("stopAtFirstMatch")(i...) }
+
+// noMeta 兼容保留选项：不显示元数据。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.noMeta(true))
+// die(err)
+// ```
+func nucleiNoMeta(i ...any) any { return nucleiOptionDummy("noMeta")(i...) }
+
+// newTemplates 兼容保留选项：仅运行新增模板。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.newTemplates(true))
+// die(err)
+// ```
+func nucleiNewTemplates(i ...any) any { return nucleiOptionDummy("newTemplates")(i...) }
+
+// reverseUrl 兼容保留选项：指定反连地址。当前为无操作(no-op)，不影响扫描行为
+//
+// 参数:
+//   - i: 兼容保留参数，会被忽略
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项（空操作）
+//
+// Example:
+// ```
+// // 该选项当前为兼容保留的空操作，调用不会影响扫描行为，此处仅作示意
+// res, err = nuclei.Scan("http://example.com", nuclei.reverseUrl("http://oob.example.com"))
+// die(err)
+// ```
+func nucleiReverseUrl(i ...any) any { return nucleiOptionDummy("reverseUrl")(i...) }
 
 func httpPayloadsToString(payloads *YakPayloads) (string, error) {
 	result := make(map[string]string)
@@ -438,6 +851,26 @@ func processVulnerability(target any, filterVul filter.Filterable, vCh chan *too
 	}
 }
 
+// Scan 对目标执行 nuclei 模板扫描，以 channel 形式流式返回扫描发现的漏洞结果
+// 参数:
+//   - target: 扫描目标，支持字符串、字节数组或目标集合
+//   - opt: 零个或多个 nuclei 扫描配置选项
+//
+// 返回值:
+//   - chan *PocVul: 漏洞结果管道，可迭代获取每个命中漏洞
+//   - error: 启动失败时返回错误
+//
+// Example:
+// ```
+// // 该示例为示意性用法：使用全部模板扫描目标
+// res, err = nuclei.Scan("http://example.com", nuclei.all(true))
+// die(err)
+//
+//	for vul = range res {
+//	    println(vul.Target, vul.PocName)
+//	}
+//
+// ```
 func ScanLegacy(target any, opt ...interface{}) (chan *tools.PocVul, error) {
 	opts := make([]ConfigOption, 0, len(opt))
 	lo.Filter(opt, func(item interface{}, index int) bool {
@@ -486,45 +919,45 @@ var Exports = map[string]interface{}{
 	// params
 	"customVulnFilter":        WithCustomVulnFilter,
 	"tags":                    WithTags,
-	"excludeTags":             nucleiOptionDummy("excludeTags"),
-	"workflows":               nucleiOptionDummy("workflows"),
+	"excludeTags":             nucleiExcludeTags,
+	"workflows":               nucleiWorkflows,
 	"templates":               WithTemplateName,
 	"excludeTemplates":        WithExcludeTemplates,
-	"templatesDir":            nucleiOptionDummy("templatesDir"),
-	"headers":                 nucleiOptionDummy("headers"),
-	"severity":                nucleiOptionDummy("severity"),
-	"output":                  nucleiOptionDummy("output"),
+	"templatesDir":            nucleiTemplatesDir,
+	"headers":                 nucleiHeaders,
+	"severity":                nucleiSeverity,
+	"output":                  nucleiOutput,
 	"proxy":                   lowhttp.WithProxy,
-	"logFile":                 nucleiOptionDummy("logFile"),
-	"reportingDB":             nucleiOptionDummy("reportingDB"),
-	"reportingConfig":         nucleiOptionDummy("reportingConfig"),
+	"logFile":                 nucleiLogFile,
+	"reportingDB":             nucleiReportingDB,
+	"reportingConfig":         nucleiReportingConfig,
 	"bulkSize":                WithConcurrentTemplates,
 	"templatesThreads":        WithConcurrentInTemplates,
 	"timeout":                 _timeout,
 	"pageTimeout":             _timeout,
 	"retry":                   lowhttp.WithRetryTimes,
 	"rateLimit":               rateLimit,
-	"headless":                nucleiOptionDummy("headless"),
-	"showBrowser":             nucleiOptionDummy("showBrowser"),
+	"headless":                nucleiHeadless,
+	"showBrowser":             nucleiShowBrowser,
 	"dnsResolver":             lowhttp.WithDNSServers,
-	"systemDnsResolver":       nucleiOptionDummy("systemDnsResolver"),
-	"metrics":                 nucleiOptionDummy("metrics"),
+	"systemDnsResolver":       nucleiSystemDnsResolver,
+	"metrics":                 nucleiMetrics,
 	"debug":                   WithDebug,
 	"interactshTimeout":       WithOOBTimeout,
 	"debugRequest":            WithDebugRequest,
 	"debugResponse":           WithDebugResponse,
-	"silent":                  nucleiOptionDummy("silent"),
-	"version":                 nucleiOptionDummy("version"),
+	"silent":                  nucleiSilent,
+	"version":                 nucleiVersion,
 	"verbose":                 WithVerbose,
-	"noColor":                 nucleiOptionDummy("noColor"),
-	"updateTemplates":         nucleiOptionDummy("updateTemplates"),
-	"templatesVersion":        nucleiOptionDummy("templatesVersion"),
-	"templateList":            nucleiOptionDummy("templateList"),
-	"stopAtFirstMatch":        nucleiOptionDummy("stopAtFirstMatch"),
-	"noMeta":                  nucleiOptionDummy("noMeta"),
-	"newTemplates":            nucleiOptionDummy("newTemplates"),
+	"noColor":                 nucleiNoColor,
+	"updateTemplates":         nucleiUpdateTemplates,
+	"templatesVersion":        nucleiTemplatesVersion,
+	"templateList":            nucleiTemplateList,
+	"stopAtFirstMatch":        nucleiStopAtFirstMatch,
+	"noMeta":                  nucleiNoMeta,
+	"newTemplates":            nucleiNewTemplates,
 	"noInteractsh":            noInteractsh,
-	"reverseUrl":              nucleiOptionDummy("reverseUrl"),
+	"reverseUrl":              nucleiReverseUrl,
 	"enableReverseConnection": WithEnableReverseConnectionFeature,
 	"targetConcurrent":        WithConcurrentTarget,
 	"rawTemplate":             WithTemplateRaw,
@@ -545,56 +978,36 @@ var Exports = map[string]interface{}{
 	"context":           WithContext,
 }
 
-func WithHttpTplRuntimeId(id string) ConfigOption {
-	return func(config *Config) {
-		config.RuntimeId = id
-	}
-}
-
-func _callback(handler func(i map[string]interface{})) ConfigOption {
-	return WithResultCallback(func(y *YakTemplate, reqBulk *YakRequestBulkConfig, rsp []*lowhttp.LowhttpResponse, result bool, extractor map[string]interface{}) {
-		var runtimeId string
-		if len(rsp) > 0 {
-			runtimeId = rsp[0].RuntimeId
-		}
-		handler(map[string]interface{}{
-			"template":  y,
-			"requests":  reqBulk,
-			"responses": rsp,
-			"response":  rsp,
-			"match":     result,
-			"extractor": extractor,
-			"runtimeId": runtimeId,
-		})
-	})
-}
-
-func _tcpCallback(handler func(i map[string]interface{})) ConfigOption {
-	return WithTCPResultCallback(func(y *YakTemplate, reqBulk *YakNetworkBulkConfig, rsp []*NucleiTcpResponse, result bool, extractor map[string]interface{}) {
-		var runtimeId string
-		if len(rsp) > 0 {
-			runtimeId = rsp[0].RuntimeId
-		}
-		handler(map[string]interface{}{
-			"template":  y,
-			"requests":  reqBulk,
-			"responses": rsp,
-			"response":  rsp,
-			"match":     result,
-			"extractor": extractor,
-			"runtimeId": runtimeId,
-		})
-	})
-}
-
-func noInteractsh(b bool) ConfigOption {
-	return WithEnableReverseConnectionFeature(!b)
-}
-
+// rateLimit 设置 nuclei 扫描的发包速率限制，控制每次请求之间的等待时间
+// 参数:
+//   - i: 请求间等待时间，单位为秒
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：限制发包速率
+// res, err = nuclei.Scan("http://example.com", nuclei.rateLimit(0.5))
+// die(err)
+// ```
 func rateLimit(i float64) lowhttp.LowhttpOpt {
 	return lowhttp.WithRetryWaitTime(utils.FloatSecondDuration(i))
 }
 
+// timeout 设置 nuclei 扫描中单个请求的超时时间
+// 参数:
+//   - i: 超时时间，单位为秒
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：设置请求超时
+// res, err = nuclei.Scan("http://example.com", nuclei.timeout(10))
+// die(err)
+// ```
 func _timeout(i float64) lowhttp.LowhttpOpt {
 	return func(o *lowhttp.LowhttpExecConfig) {
 		o.Timeout = utils.FloatSecondDuration(i)

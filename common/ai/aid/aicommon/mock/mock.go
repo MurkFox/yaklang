@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
@@ -90,6 +91,51 @@ func (m *MockedAIConfig) GetContextProviderManager() *aicommon.ContextProviderMa
 	return aicommon.NewContextProviderManager()
 }
 
+func (m *MockedAIConfig) AppendRelatedRuntimeID(string) {}
+
+func (m *MockedAIConfig) GetSessionEvidenceRendered() string {
+	return ""
+}
+
+func (m *MockedAIConfig) ApplySessionEvidenceOps(ops []aicommon.EvidenceOperation) {
+}
+
+func (m *MockedAIConfig) GetVerificationTodoRendered(_ aicommon.VerificationTodoScope) string {
+	return ""
+}
+
+func (m *MockedAIConfig) ApplyVerificationTodoOps(scope aicommon.VerificationTodoScope, satisfied bool, movements []aicommon.VerifyNextMovement) []aicommon.VerificationTodoApplyError {
+	return nil
+}
+
+func (m *MockedAIConfig) GetVerificationTodoMarkdownDelta(scope aicommon.VerificationTodoScope, satisfied bool, movements []aicommon.VerifyNextMovement) string {
+	return ""
+}
+
+func (m *MockedAIConfig) SnapshotVerificationTodoItems() []aicommon.VerificationTodoItem {
+	return nil
+}
+
+func (m *MockedAIConfig) SnapshotVerificationTodoItemsByScope(scope aicommon.VerificationTodoScope) []aicommon.VerificationTodoItem {
+	return nil
+}
+
+func (m *MockedAIConfig) GetVerificationTodoStats() aicommon.VerificationTodoStats {
+	return aicommon.VerificationTodoStats{}
+}
+
+func (m *MockedAIConfig) GetVerificationTodoStatsByScope(scope aicommon.VerificationTodoScope) aicommon.VerificationTodoStats {
+	return aicommon.VerificationTodoStats{}
+}
+
+func (m *MockedAIConfig) HasActiveVerificationTodosByScope(scope aicommon.VerificationTodoScope) bool {
+	return false
+}
+
+func (m *MockedAIConfig) ActiveVerificationTodoItemsByScope(scope aicommon.VerificationTodoScope) []aicommon.VerificationTodoItem {
+	return nil
+}
+
 func (m *MockedAIConfig) IsCtxDone() bool {
 	select {
 	case <-m.Ctx.Done():
@@ -103,6 +149,10 @@ func (m *MockedAIConfig) GetContext() context.Context {
 	return m.Ctx
 }
 
+func (m *MockedAIConfig) GetBrowserSessionTracker() aicommon.BrowserSessionTracker {
+	return nil
+}
+
 func (m *MockedAIConfig) CallAIResponseConsumptionCallback(current int) {
 	// Mock implementation - do nothing
 }
@@ -113,6 +163,10 @@ func (m *MockedAIConfig) GetAITransactionAutoRetryCount() int64 {
 
 func (m *MockedAIConfig) GetToolComposeConcurrency() int {
 	return 2
+}
+
+func (m *MockedAIConfig) GetPlanExecTaskConcurrency() int {
+	return 1
 }
 
 func (m *MockedAIConfig) RetryPromptBuilder(originalPrompt string, err error) string {
@@ -161,6 +215,108 @@ func NewMockInvoker(ctx context.Context) *MockInvoker {
 		ctx:    ctx,
 		config: NewMockedAIConfig(ctx),
 	}
+}
+
+func (m *MockInvoker) AssembleLoopPrompt(tools []*aitool.Tool, input *aicommon.LoopPromptAssemblyInput) (*aicommon.LoopPromptAssemblyResult, error) {
+	_ = tools
+	if input == nil {
+		return nil, utils.Error("loop prompt assembly input is nil")
+	}
+
+	highStatic := wrapMockPromptSection("high-static", joinMockPromptParts(
+		renderMockTitledBlock("Task Instruction", input.TaskInstruction),
+		renderMockTitledBlock("Output Example", input.OutputExample),
+	))
+	semiDynamic := wrapMockPromptSection("semi-dynamic", joinMockPromptParts(
+		renderMockTitledBlock("Skills Context", input.SkillsContext),
+		renderMockSchemaBlock(input.Schema),
+	))
+	dynamic := wrapMockPromptSectionWithNonce("dynamic", joinMockPromptParts(
+		renderMockUserQueryBlock(input.Nonce, input.UserQuery),
+		renderMockTaggedBlock("EXTRA_CAPABILITIES", input.Nonce, input.ExtraCapabilities),
+		input.SessionEvidence,
+		renderMockTaggedBlock("REFLECTION", input.Nonce, input.ReactiveData),
+		renderMockInjectedMemoryBlock(input.Nonce, input.InjectedMemory),
+	), input.Nonce)
+
+	return &aicommon.LoopPromptAssemblyResult{
+		Prompt:   joinMockPromptParts(highStatic, semiDynamic, dynamic),
+		Sections: nil,
+	}, nil
+}
+
+func wrapMockPromptSectionWithNonce(sectionName string, content string, nonce string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	sectionName = fmt.Sprintf("%s_%s", sectionName, nonce)
+	return fmt.Sprintf("<|PROMPT_SECTION_%s|>\n%s\n<|PROMPT_SECTION_END_%s|>", sectionName, content, sectionName)
+}
+
+func wrapMockPromptSection(sectionName string, content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	return fmt.Sprintf("<|PROMPT_SECTION_%s|>\n%s\n<|PROMPT_SECTION_END_%s|>", sectionName, content, sectionName)
+}
+
+func renderMockTitledBlock(title string, body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	return "# " + title + "\n" + body
+}
+
+func renderMockTaggedBlock(tag string, nonce string, body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	if strings.TrimSpace(nonce) == "" {
+		return fmt.Sprintf("<|%s|>\n%s\n<|%s_END|>", tag, body, tag)
+	}
+	return fmt.Sprintf("<|%s_%s|>\n%s\n<|%s_END_%s|>", tag, nonce, body, tag, nonce)
+}
+
+func renderMockSchemaBlock(schema string) string {
+	schema = strings.TrimSpace(schema)
+	if schema == "" {
+		return ""
+	}
+	return "# Response Schema\n```jsonschema\n" + schema + "\n```"
+}
+
+func renderMockUserQueryBlock(nonce string, userQuery string) string {
+	userQuery = strings.TrimSpace(userQuery)
+	if userQuery == "" {
+		return ""
+	}
+	if strings.TrimSpace(nonce) == "" {
+		return "# User Query\n" + userQuery
+	}
+	return fmt.Sprintf("<|USER_QUERY_%s|>\n%s\n<|USER_QUERY_END_%s|>", nonce, userQuery, nonce)
+}
+
+func renderMockInjectedMemoryBlock(nonce string, memory string) string {
+	memory = strings.TrimSpace(memory)
+	if memory == "" {
+		return ""
+	}
+	return renderMockTaggedBlock("INJECTED_MEMORY", nonce, "# Memory Context\n"+memory)
+}
+
+func joinMockPromptParts(parts ...string) string {
+	var filtered []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			filtered = append(filtered, part)
+		}
+	}
+	return strings.Join(filtered, "\n\n")
 }
 
 func (m *MockInvoker) GetBasicPromptInfo(tools []*aitool.Tool) (string, map[string]any, error) {
@@ -263,6 +419,14 @@ func (m *MockInvoker) CompressLongTextWithDestination(ctx context.Context, i any
 	return "", nil
 }
 
+func (m *MockInvoker) QuickKnowledgeSearch(ctx context.Context, query string, keywords []string, collections ...string) (string, error) {
+	_ = ctx
+	_ = query
+	_ = keywords
+	_ = collections
+	return "", nil
+}
+
 func (m *MockInvoker) EnhanceKnowledgeAnswer(ctx context.Context, s string) (string, error) {
 	return "", nil
 }
@@ -282,8 +446,42 @@ func (m *MockInvoker) VerifyUserSatisfaction(ctx context.Context, query string, 
 func (m *MockInvoker) RequireAIForgeAndAsyncExecute(ctx context.Context, forgeName string, onFinish func(error)) {
 }
 
+func (m *MockInvoker) AsyncPlanOnly(ctx context.Context, planPayload string, onFinish func(error)) {
+}
+
 func (m *MockInvoker) AsyncPlanAndExecute(ctx context.Context, planPayload string, onFinish func(error)) {
 }
+
+func (m *MockInvoker) ReviewExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput) (*aicommon.ExecutePlanInput, error) {
+	return input, nil
+}
+
+func (m *MockInvoker) ForceReviewExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput) (*aicommon.ExecutePlanInput, error) {
+	return input, nil
+}
+
+func (m *MockInvoker) BeginPlanCoordinatorSession(ctx context.Context, input *aicommon.ExecutePlanInput, forceManualReview bool) (aicommon.PlanCoordinatorSession, error) {
+	return &mockPlanCoordinatorSession{input: input}, nil
+}
+
+func (m *MockInvoker) PublishDetachedPlan(ctx context.Context, input *aicommon.ExecutePlanInput, reactTaskID string) (string, error) {
+	return "mock-detached-coordinator-id", nil
+}
+
+func (m *MockInvoker) AsyncExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput, onFinish func(error)) {
+}
+
+func (m *MockInvoker) AsyncExecuteCod(ctx context.Context, coordinatorID string, onFinish func(error)) {
+}
+
+type mockPlanCoordinatorSession struct {
+	input *aicommon.ExecutePlanInput
+}
+
+func (m *mockPlanCoordinatorSession) CoordinatorID() string { return "mock-coordinator-id" }
+func (m *mockPlanCoordinatorSession) ReviewPlan(ctx context.Context) error { return nil }
+func (m *mockPlanCoordinatorSession) ApprovedPlanInput() *aicommon.ExecutePlanInput { return m.input }
+func (m *mockPlanCoordinatorSession) Close() {}
 
 func (m *MockInvoker) AddToTimeline(entry, content string) {
 }

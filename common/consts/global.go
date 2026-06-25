@@ -28,6 +28,8 @@ var (
 	YAK_PROJECT_DATA_DB_NAME   = "default-yakit.db"
 	YAK_PROFILE_PLUGIN_DB_NAME = "yakit-profile-plugin.db"
 	YAK_VERSION                = "dev"
+	YAK_BUILD_TIME             = ""
+	YAK_GIT_HASH               = ""
 	YAK_ONLINE_BASEURL         = "https://www.yaklang.com"
 	YAK_ONLINE_BASEURL_PROXY   = ""
 
@@ -152,10 +154,31 @@ func GetExtraDNSServers() []string {
 	return utils.RemoveRepeatStringSlice(utils.PrettifyListFromStringSplited(os.Getenv(CONST_YAK_EXTRA_DNS_SERVERS), ","))
 }
 
+// GetOnlineBaseUrl 获取当前配置的在线服务（Yakit 商店等）基础 URL（导出名为 yakit.GetOnlineBaseUrl）
+//
+// 返回值:
+//   - 当前在线服务的基础 URL
+//
+// Example:
+// ```
+// url = yakit.GetOnlineBaseUrl()
+// println(url)
+// assert url != "", "GetOnlineBaseUrl should return a non-empty base url"
+// ```
 func GetOnlineBaseUrl() string {
 	return YAK_ONLINE_BASEURL
 }
 
+// SetOnlineBaseUrl 设置在线服务（Yakit 商店等）的基础 URL（导出名为 yakit.SetOnlineBaseUrl）
+//
+// 参数:
+//   - u: 新的在线服务基础 URL
+//
+// Example:
+// ```
+// yakit.SetOnlineBaseUrl("https://www.yaklang.com")
+// assert yakit.GetOnlineBaseUrl() == "https://www.yaklang.com", "SetOnlineBaseUrl should update the base url"
+// ```
 func SetOnlineBaseUrl(u string) {
 	YAK_ONLINE_BASEURL = u
 }
@@ -186,6 +209,28 @@ func IsDevMode() bool {
 
 func SetYakVersion(v string) {
 	YAK_VERSION = v
+}
+
+// GetYakBuildTime 返回 Yak 引擎构建时间字符串
+// 由 cmd/yak.go 在启动时通过 SetYakBuildTime 注入（ldflags 提供）
+// 关键词: YakBuildTime 全局存取, 客户端版本控流, X-Yak-Build-Time
+func GetYakBuildTime() string {
+	return YAK_BUILD_TIME
+}
+
+func SetYakBuildTime(v string) {
+	YAK_BUILD_TIME = v
+}
+
+// GetYakGitHash 返回 Yak 引擎构建对应的 Git Hash
+// 由 cmd/yak.go 在启动时通过 SetYakGitHash 注入（ldflags 提供）
+// 关键词: YakGitHash 全局存取
+func GetYakGitHash() string {
+	return YAK_GIT_HASH
+}
+
+func SetYakGitHash(v string) {
+	YAK_GIT_HASH = v
 }
 
 func GetDefaultPublicReverseServerPassword() string {
@@ -241,6 +286,18 @@ func SetDefaultYakitProfileDatabaseName(i string) {
 	YAK_PROFILE_PLUGIN_DB_NAME = i
 }
 
+// GetDefaultYakitBaseDir 获取 Yakit 的主工作目录（导出名为 yakit.GetHomeDir）
+// 优先使用环境变量 YAKIT_HOME，否则默认为用户主目录下的 yakit-projects
+//
+// 返回值:
+//   - Yakit 主工作目录的绝对路径
+//
+// Example:
+// ```
+// dir = yakit.GetHomeDir()
+// println(dir)
+// assert dir != "", "GetHomeDir should return a non-empty path"
+// ```
 func GetDefaultYakitBaseDir() string {
 	OnceYakitHome.Do(GetRegistryYakitHome)
 	// 这个检测默认数据库
@@ -251,6 +308,18 @@ func GetDefaultYakitBaseDir() string {
 	return filepath.Join(utils.GetHomeDirDefault("."), "yakit-projects")
 }
 
+// GetDefaultYakitBaseTempDir 获取 Yakit 的临时目录（导出名为 yakit.GetHomeTempDir）
+// 该目录位于 Yakit 主工作目录下的 temp 子目录，不存在时会自动创建
+//
+// 返回值:
+//   - Yakit 临时目录的绝对路径
+//
+// Example:
+// ```
+// tmp = yakit.GetHomeTempDir()
+// println(tmp)
+// assert tmp != "", "GetHomeTempDir should return a non-empty path"
+// ```
 func GetDefaultYakitBaseTempDir() string {
 	OnceYakitHome.Do(GetRegistryYakitHome)
 
@@ -319,6 +388,22 @@ func GetDefaultYakitPprofDir() string {
 // Path: ~/yakit-projects/ai-skills
 func GetDefaultAISkillsDir() string {
 	pt := filepath.Join(GetDefaultYakitBaseDir(), "ai-skills")
+	if !utils.IsDir(pt) {
+		os.MkdirAll(pt, 0o777)
+	}
+	return pt
+}
+
+// GetDefaultYakitAIFocusDir returns the default directory for user-defined
+// yak focus modes. Each subdirectory under this path that contains a
+// *.ai-focus.yak entry file is treated as one focus mode and is registered
+// lazily (with cooldown) when the focus mode list is queried.
+//
+// Path: ~/yakit-projects/ai-focus  (or $YAKIT_HOME/ai-focus)
+//
+// 关键词: yak focus mode user dir, ai-focus directory, lazy registration
+func GetDefaultYakitAIFocusDir() string {
+	pt := filepath.Join(GetDefaultYakitBaseDir(), "ai-focus")
 	if !utils.IsDir(pt) {
 		os.MkdirAll(pt, 0o777)
 	}

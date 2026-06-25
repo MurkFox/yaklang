@@ -45,6 +45,9 @@ func (g *GLMClient) ChatStream(msg string) (io.Reader, error) {
 	return aispec.ChatWithStream(
 		g.targetUrl, g.config.Model, msg, g.config.HTTPErrorHandler,
 		g.config.ReasonStreamHandler, g.BuildHTTPOptions,
+		aispec.ChatBaseThinkingOptions(g.config, g.targetUrl),
+		aispec.WithChatBase_AISamplingFromConfig(g.config),
+		aispec.WithChatBase_RawHTTPResponseHeaderCallback(g.config.RawHTTPResponseHeaderCallback),
 		aispec.WithChatBase_RawHTTPResponseCallback(g.config.RawHTTPResponseCallback),
 		aispec.WithChatBase_RawHTTPRequestResponseCallback(g.config.RawHTTPRequestResponseCallback),
 	)
@@ -108,6 +111,7 @@ func (g *GLMClient) BuildHTTPOptions() ([]poc.PocConfigOption, error) {
 			"Authorization": k,
 		}),
 	}
+	opts = aispec.AppendCustomHeadersToPocOptions(opts, aispec.ExtraHeadersToMap(g.config.Headers))
 	opts = append(opts, poc.WithTimeout(g.config.Timeout))
 	if g.config.Proxy != "" {
 		opts = append(opts, poc.WithProxy(g.config.Proxy))
@@ -138,8 +142,12 @@ func (g *GLMClient) Chat(s string, f ...any) (string, error) {
 		aispec.WithChatBase_ReasonStreamHandler(g.config.ReasonStreamHandler),
 		aispec.WithChatBase_ErrHandler(g.config.HTTPErrorHandler),
 		aispec.WithChatBase_ImageRawInstance(g.config.Images...),
+		aispec.ChatBaseThinkingOptions(g.config, g.targetUrl),
+		aispec.WithChatBase_AISamplingFromConfig(g.config),
+		aispec.WithChatBase_RawHTTPResponseHeaderCallback(g.config.RawHTTPResponseHeaderCallback),
 		aispec.WithChatBase_RawHTTPResponseCallback(g.config.RawHTTPResponseCallback),
 		aispec.WithChatBase_RawHTTPRequestResponseCallback(g.config.RawHTTPRequestResponseCallback),
+		aispec.WithChatBase_RawMessages(g.config.RawMessages),
 	)
 }
 

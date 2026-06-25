@@ -72,6 +72,9 @@ func GetBaseURLFromConfig(config *AIConfig, defaultRootUrl, defaultUri string) s
 
 func GetBaseURLFromConfigEx(config *AIConfig, defaultRootUrl, defaultUri string, openaiMode bool) string {
 	fixDomain(config)
+	if config.EnableEndpoint && strings.TrimSpace(config.Endpoint) != "" {
+		return strings.TrimSpace(config.Endpoint)
+	}
 	normalizedDefaultURI := defaultUri
 	if normalizedDefaultURI == "" {
 		normalizedDefaultURI = "/"
@@ -81,7 +84,7 @@ func GetBaseURLFromConfigEx(config *AIConfig, defaultRootUrl, defaultUri string,
 
 	keepDefaultSuffix := func(s string) string {
 		trimSlash := strings.TrimRight(s, "/")
-		if !strings.HasSuffix(trimSlash, normalizedDefaultURI) && !strings.Contains(trimSlash, "chat/completions") {
+		if !strings.HasSuffix(trimSlash, normalizedDefaultURI) && !hasKnownEndpointSuffix(trimSlash) {
 			pathSegments := strings.Split(strings.Trim(normalizedDefaultURI, "/"), "/")
 			for i := len(pathSegments) - 1; i > 0; i-- {
 				overlap := "/" + strings.Join(pathSegments[:i], "/")
@@ -89,6 +92,13 @@ func GetBaseURLFromConfigEx(config *AIConfig, defaultRootUrl, defaultUri string,
 					s = trimSlash + "/" + strings.Join(pathSegments[i:], "/")
 					return s
 				}
+			}
+			// 当用户已经在 BaseURL/Domain 中显式提供了非空、非根路径，且该路径与 default URI 任何
+			// segment 都不重叠时，认为用户给的是完整 endpoint URL（典型如反代、网关自定义路径），
+			// 不再追加默认 URI，避免拼成 `/userPath/v1/chat/completions` 这种重复路径。
+			// 关键词: keepDefaultSuffix 显式路径尊重, BaseURL 完整 endpoint, 反代路径透传
+			if u, err := url.Parse(trimSlash); err == nil && u.Path != "" && u.Path != "/" {
+				return s
 			}
 			s = trimSlash + normalizedDefaultURI
 		}
@@ -127,6 +137,23 @@ func GetBaseURLFromConfigEx(config *AIConfig, defaultRootUrl, defaultUri string,
 		urlPath = keepDefaultSuffix(urlPath)
 	}
 	return urlPath
+}
+
+func GetBaseURLRootFromConfig(config *AIConfig, defaultRootUrl, defaultUri string) string {
+	endpoint := strings.TrimSpace(GetBaseURLFromConfig(config, defaultRootUrl, defaultUri))
+	if endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return strings.TrimRight(trimKnownEndpointSuffix(endpoint), "/")
+	}
+	u.Path = trimKnownEndpointSuffix(u.Path)
+	u.RawPath = ""
+	if u.Path == "/" {
+		u.Path = ""
+	}
+	return strings.TrimRight(u.String(), "/")
 }
 
 // fixDomain 修复不规范的domain配置
@@ -171,6 +198,41 @@ func fixDomain(c *AIConfig) {
 	}
 }
 
+func hasKnownEndpointSuffix(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	for _, suffix := range knownAIEndpointSuffixes() {
+		if strings.HasSuffix(raw, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func trimKnownEndpointSuffix(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimRight(raw, "/")
+	for _, suffix := range knownAIEndpointSuffixes() {
+		if strings.HasSuffix(raw, suffix) {
+			return strings.TrimSuffix(raw, suffix)
+		}
+	}
+	return raw
+}
+
+func knownAIEndpointSuffixes() []string {
+	return []string{
+		"/responses",
+		"/v1/responses",
+		"/api/v1/responses",
+		"/chat/completions",
+		"/v1/chat/completions",
+		"/api/v1/chat/completions",
+		"/compatible-mode/v1/chat/completions",
+		"/api/v3/chat/completions",
+		"/api/paas/v4/chat/completions",
+	}
+}
+
 // BuildOptionsFromConfig builds aispec.AIConfigOption slice from AIModelConfig.
 func BuildOptionsFromConfig(config *ypb.AIModelConfig) []AIConfigOption {
 	if config == nil {
@@ -196,6 +258,22 @@ func buildOptionsFromProviderAndModel(provider *ypb.ThirdPartyApplicationConfig,
 		opts = append(opts, WithDomain(provider.Domain))
 	}
 
+	if provider.GetBaseURL() != "" {
+		opts = append(opts, WithBaseURL(provider.GetBaseURL()))
+	}
+
+	if provider.GetEndpoint() != "" {
+		opts = append(opts, WithEndpoint(provider.GetEndpoint()))
+	}
+
+	if provider.GetEnableEndpoint() {
+		opts = append(opts, WithEnableEndpoint(provider.GetEnableEndpoint()))
+	}
+
+	if len(provider.GetHeaders()) > 0 {
+		opts = append(opts, WithExtraHeader(ExtraHeadersToMap(provider.GetHeaders())))
+	}
+
 	// Set type
 	if provider.Type != "" {
 		opts = append(opts, WithType(provider.Type))
@@ -211,6 +289,33 @@ func buildOptionsFromProviderAndModel(provider *ypb.ThirdPartyApplicationConfig,
 
 	if provider.APIType != "" {
 		opts = append(opts, WithAPIType(provider.APIType))
+	}
+
+	if provider.EnableThinkingOpt != nil {
+		opts = append(opts, WithEnableThinking(*provider.EnableThinkingOpt))
+	} else if provider.GetEnableThinking() {
+		opts = append(opts, WithEnableThinking(provider.GetEnableThinking()))
+	}
+
+	if provider.MaxTokens != nil {
+		opts = append(opts, WithMaxTokens(*provider.MaxTokens))
+	}
+	if provider.Temperature != nil {
+		opts = append(opts, WithTemperature(*provider.Temperature))
+	}
+	if provider.TopP != nil {
+		opts = append(opts, WithTopP(*provider.TopP))
+	}
+	if provider.TopK != nil {
+		opts = append(opts, WithTopK(*provider.TopK))
+	}
+	if provider.FrequencyPenalty != nil {
+		opts = append(opts, WithFrequencyPenalty(*provider.FrequencyPenalty))
+	}
+	if provider.ReasoningEffort != nil {
+		if s := strings.TrimSpace(*provider.ReasoningEffort); s != "" {
+			opts = append(opts, WithReasoningEffort(s))
+		}
 	}
 
 	if modelName != "" {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -29,19 +28,10 @@ func TestExec_CreateMirrors_SingleAITag(t *testing.T) {
 
 			if aiCallCount == 1 {
 				// 第一次调用：从prompt中提取nonce并返回带正确nonce的AITag
-				re := regexp.MustCompile(`<\|GEN_CODE_([^|]+)\|>`)
-				matches := re.FindStringSubmatch(prompt)
-				var nonceStr string
-				if len(matches) > 1 {
-					nonceStr = matches[1]
-				}
+				nonceStr := aicommon.MustExtractDynamicSectionNonce(t, prompt)
 
 				// 调试输出
 				t.Logf("Extracted nonce: '%s' from prompt", nonceStr)
-				if nonceStr == "" {
-					t.Logf("No nonce found in prompt, using default")
-					nonceStr = "test123"
-				}
 
 				// 使用提取的nonce返回AITag内容和write_code action
 				rsp.EmitOutputStream(bytes.NewBufferString(utils.MustRenderTemplate(`{"@action": "write_code"}
@@ -68,7 +58,7 @@ func testFunc() {
 
 	loop, err := reactloops.NewReActLoop("aitag-single-loop", reactIns,
 		reactloops.WithAITagField("GEN_CODE", "generated_code"),
-		reactloops.WithPersistentInstruction("Generate code using <|GEN_CODE_{{ .Nonce }}|>code<|GEN_CODE_END_{{ .Nonce }}|> format"),
+		reactloops.WithPersistentInstruction("Generate code using <|GEN_CODE_CURRENT_NONCE|>code<|GEN_CODE_END_CURRENT_NONCE|> format"),
 		reactloops.WithRegisterLoopAction(
 			"write_code",
 			"Write generated code",
@@ -568,12 +558,7 @@ func TestExec_EdgeCase_VeryLongResponse(t *testing.T) {
 			// 检查是否是reactloops的调用（包含AITag模板）
 			if utils.MatchAllOfSubString(prompt, "write_code", "@action", "GEN_CODE") {
 				// 提取nonce
-				re := regexp.MustCompile(`<\|GEN_CODE_([^|]+)\|>`)
-				matches := re.FindStringSubmatch(prompt)
-				var nonceStr string
-				if len(matches) > 1 {
-					nonceStr = matches[1]
-				}
+				nonceStr := aicommon.MustExtractDynamicSectionNonce(t, prompt)
 
 				// 生成一个很长的代码响应（>5KB）
 				var longCode strings.Builder
@@ -608,7 +593,7 @@ func TestExec_EdgeCase_VeryLongResponse(t *testing.T) {
 
 	loop, err := reactloops.NewReActLoop("long-response-loop", reactIns,
 		reactloops.WithAITagField("GEN_CODE", "long_code"),
-		reactloops.WithPersistentInstruction("Generate code using <|GEN_CODE_{{ .Nonce }}|>code<|GEN_CODE_END_{{ .Nonce }}|> format"),
+		reactloops.WithPersistentInstruction("Generate code using <|GEN_CODE_CURRENT_NONCE|>code<|GEN_CODE_END_CURRENT_NONCE|> format"),
 		reactloops.WithRegisterLoopAction(
 			"write_code",
 			"Write long code",
@@ -656,8 +641,14 @@ func TestExec_EdgeCase_RapidIterations(t *testing.T) {
 			iterCount++
 			rsp := i.NewAIResponse()
 
-			// directly_answer 应该一次就结束
-			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "directly_answer", "answer_payload": "Rapid task completed"}`))
+			// directly_answer 只发答复不终结, 循环继续; 真正结束由显式 finish 完成.
+			// 第一轮发答复, 第二轮用 finish 收口.
+			// 关键词: directly_answer 永不 Exit, finish 唯一终结器
+			if iterCount == 1 {
+				rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "directly_answer", "answer_payload": "Rapid task completed"}`))
+			} else {
+				rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "finish"}`))
+			}
 
 			rsp.Close()
 			return rsp, nil
@@ -682,8 +673,8 @@ func TestExec_EdgeCase_RapidIterations(t *testing.T) {
 		t.Fatalf("Execute failed: %v", err)
 	}
 
-	if iterCount != 1 {
-		t.Errorf("Expected 1 iteration (directly_answer should exit), got: %d", iterCount)
+	if iterCount != 2 {
+		t.Errorf("Expected 2 iterations (directly_answer emits, then finish ends), got: %d", iterCount)
 	}
 
 	t.Logf("Rapid iterations completed: %d iterations in %v", iterCount, duration)

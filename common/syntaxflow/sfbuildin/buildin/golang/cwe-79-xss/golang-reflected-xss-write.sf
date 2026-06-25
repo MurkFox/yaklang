@@ -1,7 +1,7 @@
 desc(
 	title: "Check Golang Reflected XSS Vulnerability"
 	type: audit
-	level: high
+	level: mid
 	risk: "跨站脚本（XSS）"
 	desc: <<<DESC
 ### 漏洞描述
@@ -96,20 +96,20 @@ REFERENCE
 )
 
 <include('golang-user-input')> as $input;
-<include('golang-http-sink')> as $output;
-$output.Write(*<slice(index=1)>?{opcode: make} as $sink)
+http.ResponseWriter as $write;
 
-$sink #{
-    until: "HTMLEscapeString",
-}-> as $key
+template.HTMLEscapeString() as $safe
 
-$key(* #-> as $unsafe)
+fmt.Sprintf() as $unsafe
+$write.Write()?{*<cfgDominates(target: "$unsafe")>?{have: "true"}} as $func
 
-$sink #{
-    until: "* & $input - $unsafe",
-}-> as $high
+$func<getCallee()>?(* #{
+    until: `* & $input`,
+    exclude_reachable: `$safe`,
+}-> )  as $mid
 
-alert $high for {
+
+alert $mid for {
 	title: "Golang Reflected XSS Vulnerability Was Detected",
 	risk: "跨站脚本（XSS）",
 	title_zh: "检测到Golang反射型XSS漏洞",
@@ -198,111 +198,238 @@ http.ListenAndServe(":8080", nil);
 - 攻击者可以对用户进行钓鱼攻击，获取敏感信息。
 - 攻击者可以篡改网页内容，进行恶意植入或传播恶意软件。
 DESC
-	level: "high",
+	level: "mid",
 	type: "vuln",
 	message: "检测到Golang反射型XSS漏洞，并且从数据源（source）到污染汇聚点（sink）间，没有发现任何过滤函数信息。",
-	name: "high",
+	name: "mid",
 }
 
 desc(
 	lang: golang
-	alert_high: 1
+	alert_mid: 1
 	'file://unsafe.go': <<<UNSAFE
-package main
+package vulinbox
 
 import (
-	"bufio"
-	"bytes"
-	"context"
-	"crypto/tls"
+	_ "embed"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"html/template"
-	"io"
-	"math/rand"
-	"net"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/yaklang/yaklang/common/go-funk"
+	"github.com/yaklang/yaklang/common/mutate"
+	"github.com/yaklang/yaklang/common/utils"
 	"net/http"
-	"os"
-	"os/user"
 	"strings"
-	"sync"
-	"testing"
-	"time"
-
-	ws "github.com/gorilla/websocket"
-	"golang.org/x/net/websocket"
-
-	"github.com/miekg/dns"
-	"github.com/pkg/errors"
-	"github.com/yaklang/yaklang/common/gmsm/gmtls"
-	"github.com/yaklang/yaklang/common/log"
-	"golang.org/x/net/http2"
 )
 
-func test() {
-    srv := &http.Server{Addr: HostPort(host, port), Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-        r, err := HttpDumpWithBody(request, true)
-        if err != nil {
-            log.Error(err)
-            return
-        }
-        fmt.Println(string(r))
-        if handle != nil {
-            raw := handle(r)
-            escapedOutput := raw
-            writer.Write([]byte(escapedOutput))
-            return
-        }
-        writer.Write([]byte("HELLO GMTLS"))
-    })}
+func buildLoginHandles(s *VulinServer, key []byte, profileUrl string) func(writer http.ResponseWriter, request *http.Request) {
+	var keyF jwt.Keyfunc = func(token *jwt.Token) (interface{}, error) {
+		return []byte(key), nil
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == "GET" {
+			// 不存在登录信息
+			writer.Header().Set("Content-Type", "text/html")
+			data, _ := mutate.FuzzTagExec(jwtLoginPage, mutate.Fuzz_WithParams(map[string]any{
+				"profileUrl": "/jwt" + profileUrl,
+			}))
+			writer.Write([]byte(data[0]))
+			return
+		}
+
+		if request.Method == "POST" {
+			// 登录
+			username := request.FormValue("username")
+			password := request.FormValue("password")
+			if username == "" || password == "" {
+				writer.WriteHeader(400)
+				writer.Write([]byte("username or password cannot be empty"))
+				return
+			}
+
+			users, err := s.database.GetUserByUsername(username)
+			if err != nil {
+				writer.WriteHeader(500)
+				writer.Write([]byte("internal error, cannot found user: " + username))
+				return
+			}
+			if len(users) == 0 {
+				writer.WriteHeader(400)
+				writer.Write([]byte("username or password incorrect"))
+				return
+			}
+
+			user := users[0]
+			if user.Password != password {
+				writer.WriteHeader(400)
+				writer.Write([]byte("username or password incorrect"))
+				return
+			}
+
+			token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"username": user.Username,
+			})
+			token.Header["kid"] = user.ID
+			token.Header["username"] = user.Username
+			token.Header["age"] = user.Age
+
+			k, _ := keyF(token)
+			tokenString, err := token.SignedString(k)
+			if err != nil {
+				writer.WriteHeader(500)
+				writer.Write([]byte("internal error, cannot sign token: " + err.Error() + "\n " + spew.Sdump(key)))
+				return
+			}
+
+			writer.Header().Set("Content-Type", "text/html")
+			//jsonBytes := []byte(`{"token": "` + string(tokenString) + `"}`)
+			data, _ := mutate.FuzzTagExec(jwtLoginProfileSetJWTPage, mutate.Fuzz_WithParams(map[string]any{
+				"jsonRaw": fmt.Sprintf("%s", tokenString),
+			}))
+			writer.Write([]byte(data[0]))
+			return
+		}
+
+		writer.WriteHeader(405)
+		writer.Write([]byte("method not allowed"))
+	}
 }
 UNSAFE
 	'safefile://safe.go': <<<SAFE
-package main
+package vulinbox
 
 import (
-	"bufio"
-	"bytes"
-	"context"
-	"crypto/tls"
+	_ "embed"
+	"encoding/json"
 	"fmt"
-	"html/template"
-	"io"
-	"math/rand"
-	"net"
 	"net/http"
-	"os"
-	"os/user"
 	"strings"
-	"sync"
-	"testing"
-	"time"
 
-	ws "github.com/gorilla/websocket"
-	"golang.org/x/net/websocket"
-
-	"github.com/miekg/dns"
-	"github.com/pkg/errors"
-	"github.com/yaklang/yaklang/common/gmsm/gmtls"
-	"github.com/yaklang/yaklang/common/log"
-	"golang.org/x/net/http2"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/yaklang/yaklang/common/mutate"
+	"github.com/yaklang/yaklang/common/utils"
+	"html"
 )
 
-func test() {
-    srv := &http.Server{Addr: HostPort(host, port), Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-        r, err := HttpDumpWithBody(request, true)
-        if err != nil {
-            log.Error(err)
-            return
-        }
-        fmt.Println(string(r))
-        if handle != nil {
-            raw := handle(r)
-            escapedOutput := template.HTMLEscapeString(string(raw))
-            writer.Write([]byte(escapedOutput))
-            return
-        }
-        writer.Write([]byte("HELLO GMTLS"))
-    })}
+func buildLoginHandles(
+	s *VulinServer,
+	key []byte,
+	profileUrl string,
+) func(writer http.ResponseWriter, request *http.Request) {
+
+	var keyF jwt.Keyfunc = func(token *jwt.Token) (interface{}, error) {
+		return key, nil
+	}
+
+	return func(writer http.ResponseWriter, request *http.Request) {
+
+		// ===== GET：登录页 =====
+		if request.Method == http.MethodGet {
+
+			// ✅ 1. 安全处理 profileUrl
+			profileUrl = strings.TrimSpace(profileUrl)
+			if !strings.HasPrefix(profileUrl, "/") {
+				profileUrl = "/"
+			}
+			safeProfileUrl := html.EscapeString(profileUrl)
+
+			writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+			data, err := mutate.FuzzTagExec(
+				jwtLoginPage,
+				mutate.Fuzz_WithParams(map[string]any{
+					"profileUrl": safeProfileUrl,
+				}),
+			)
+			if err != nil {
+				writer.WriteHeader(500)
+				writer.Write([]byte("internal error"))
+				return
+			}
+
+			writer.Write([]byte(data[0]))
+			return
+		}
+
+		// ===== POST：登录 =====
+		if request.Method == http.MethodPost {
+			username := request.FormValue("username")
+			password := request.FormValue("password")
+
+			if username == "" || password == "" {
+				writer.WriteHeader(400)
+				writer.Write([]byte("username or password cannot be empty"))
+				return
+			}
+
+			users, err := s.database.GetUserByUsername(username)
+			if err != nil || len(users) == 0 {
+				writer.WriteHeader(400)
+				writer.Write([]byte("username or password incorrect"))
+				return
+			}
+
+			user := users[0]
+			if user.Password != password {
+				writer.WriteHeader(400)
+				writer.Write([]byte("username or password incorrect"))
+				return
+			}
+
+			// ✅ 2. 安全签发 JWT
+			token := jwt.NewWithClaims(
+				jwt.SigningMethodHS256,
+				jwt.MapClaims{
+					"username": user.Username,
+				},
+			)
+			token.Header["kid"] = user.ID
+			token.Header["username"] = user.Username
+			token.Header["age"] = user.Age
+
+			k, _ := keyF(token)
+			tokenString, err := token.SignedString(k)
+			if err != nil {
+				// ✅ 3. 不回传 spew / key
+				log.Errorf("sign token error: %v", err)
+				writer.WriteHeader(500)
+				writer.Write([]byte("internal error"))
+				return
+			}
+
+			writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+			// ✅ 4. 使用 JSON 序列化，避免 HTML 注入
+			jsonToken, err := json.Marshal(map[string]string{
+				"token": tokenString,
+			})
+			if err != nil {
+				writer.WriteHeader(500)
+				writer.Write([]byte("internal error"))
+				return
+			}
+
+			data, err := mutate.FuzzTagExec(
+				jwtLoginProfileSetJWTPage,
+				mutate.Fuzz_WithParams(map[string]any{
+					"jsonRaw": string(jsonToken),
+				}),
+			)
+			if err != nil {
+				writer.WriteHeader(500)
+				writer.Write([]byte("internal error"))
+				return
+			}
+
+			writer.Write([]byte(data[0]))
+			return
+		}
+
+		writer.WriteHeader(405)
+		writer.Write([]byte("method not allowed"))
+	}
 }
 SAFE
 )

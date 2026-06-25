@@ -2,11 +2,14 @@ package yakit
 
 import (
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jinzhu/gorm"
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
 func TestAISessionMetaCRUD(t *testing.T) {
@@ -27,6 +30,7 @@ func TestAISessionMetaCRUD(t *testing.T) {
 	got, err := GetAISessionMetaBySessionID(db, "sess-1")
 	require.NoError(t, err)
 	require.Equal(t, "updated title", got.Title)
+	require.Equal(t, emptyRelatedRuntimeIDsJSON, got.RelatedRuntimeIDS)
 
 	list, err := QueryAISessionMeta(db, "updated", 10, 0)
 	require.NoError(t, err)
@@ -58,6 +62,7 @@ func TestEnsureAISessionMetaDefaultTitle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, defaultAISessionTitle, got.Title)
 	require.False(t, got.TitleInitialized)
+	require.Equal(t, emptyRelatedRuntimeIDsJSON, got.RelatedRuntimeIDS)
 }
 
 func TestEnsureAISessionMetaNotOverrideExistingTitle(t *testing.T) {
@@ -75,6 +80,235 @@ func TestEnsureAISessionMetaNotOverrideExistingTitle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "自定义标题", got.Title)
 	require.True(t, got.TitleInitialized)
+	require.Equal(t, emptyRelatedRuntimeIDsJSON, got.RelatedRuntimeIDS)
+}
+
+func TestAppendAISessionMetaRelatedRuntimeID(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	sessionID := "sess-runtime-ids"
+	runtimeID1 := "runtime-a"
+	runtimeID2 := "runtime-b"
+	_, err = CreateOrUpdateAISessionMeta(db, sessionID, "title")
+	require.NoError(t, err)
+
+	err = AppendAISessionMetaRelatedRuntimeID(db, sessionID, runtimeID1)
+	require.NoError(t, err)
+	err = AppendAISessionMetaRelatedRuntimeID(db, sessionID, " "+runtimeID1+" ")
+	require.NoError(t, err)
+	err = AppendAISessionMetaRelatedRuntimeID(db, sessionID, runtimeID2)
+	require.NoError(t, err)
+
+	got, err := GetAISessionMetaBySessionID(db, sessionID)
+	require.NoError(t, err)
+	require.Equal(t, `["`+runtimeID1+`","`+runtimeID2+`"]`, got.RelatedRuntimeIDS)
+}
+
+func TestAppendAISessionMetaRelatedRuntimeID_NotFoundIgnored(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	err = AppendAISessionMetaRelatedRuntimeID(db, "missing-session", uuid.NewString())
+	require.NoError(t, err)
+}
+
+func TestAppendAISessionMetaRelatedRuntimeID_InvalidStoredJSON(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	sessionID := "sess-invalid-runtime-json"
+	_, err = CreateOrUpdateAISessionMeta(db, sessionID, "title")
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&schema.AISession{}).
+		Where("session_id = ?", sessionID).
+		UpdateColumn("related_runtime_ids", `{invalid-json}`).Error)
+
+	err = AppendAISessionMetaRelatedRuntimeID(db, sessionID, uuid.NewString())
+	require.Error(t, err)
+}
+
+func TestAppendAISessionMetaRelatedRuntimeID_PlainString(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	sessionID := "sess-plain-runtime-id"
+	_, err = CreateOrUpdateAISessionMeta(db, sessionID, "title")
+	require.NoError(t, err)
+
+	err = AppendAISessionMetaRelatedRuntimeID(db, sessionID, "not-a-uuid")
+	require.NoError(t, err)
+
+	got, err := GetAISessionMetaBySessionID(db, sessionID)
+	require.NoError(t, err)
+	require.Equal(t, `["not-a-uuid"]`, got.RelatedRuntimeIDS)
+}
+
+func TestEnsureAISessionMetaSetsSource(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	meta, err := EnsureAISessionMeta(db, "sess-src-new", "ide")
+	require.NoError(t, err)
+	require.Equal(t, "ide", meta.Source)
+
+	got, err := GetAISessionMetaBySessionID(db, "sess-src-new")
+	require.NoError(t, err)
+	require.Equal(t, "ide", got.Source)
+
+	// Second start with a different source must not overwrite an existing value.
+	_, err = EnsureAISessionMeta(db, "sess-src-new", "cli")
+	require.NoError(t, err)
+	got, err = GetAISessionMetaBySessionID(db, "sess-src-new")
+	require.NoError(t, err)
+	require.Equal(t, "ide", got.Source)
+}
+
+func TestEnsureAISessionMetaBackfillSource(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	_, err = CreateOrUpdateAISessionMeta(db, "sess-backfill", "t")
+	require.NoError(t, err)
+	got, err := GetAISessionMetaBySessionID(db, "sess-backfill")
+	require.NoError(t, err)
+	require.Equal(t, "", got.Source)
+
+	_, err = EnsureAISessionMeta(db, "sess-backfill", "yak")
+	require.NoError(t, err)
+	got, err = GetAISessionMetaBySessionID(db, "sess-backfill")
+	require.NoError(t, err)
+	require.Equal(t, "yak", got.Source)
+}
+
+func TestAISessionMetaStartParamsCRUD(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	params := &ypb.AIStartParams{
+		ReviewPolicy:              "ai",
+		AIService:                 "openai",
+		AIModelName:               "gpt-test",
+		EnablePlan:                true,
+		TimelineSessionID:         "sess-start-params",
+		PreferSessionCachedConfig: true,
+	}
+
+	gotMeta, err := CreateOrUpdateAISessionMetaStartParams(db, "sess-start-params", params)
+	require.NoError(t, err)
+	require.NotEmpty(t, gotMeta.StartParams)
+
+	got, err := GetAISessionMetaStartParamsBySessionID(db, "sess-start-params")
+	require.NoError(t, err)
+	require.Equal(t, "ai", got.GetReviewPolicy())
+	require.Equal(t, "openai", got.GetAIService())
+	require.Equal(t, "gpt-test", got.GetAIModelName())
+	require.True(t, got.GetEnablePlan())
+	require.True(t, got.GetPreferSessionCachedConfig())
+}
+
+func TestGetAISessionMetaStartParams_DiscardUnknownFields(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	sessionID := "sess-unknown-start-field"
+	_, err = CreateOrUpdateAISessionMeta(db, sessionID, "test")
+	require.NoError(t, err)
+
+	// Simulates start_params written by an older build that had UserPlanPrompt in AIStartParams.
+	legacyJSON := `{"ReviewPolicy":"ai","AIService":"openai","UserPlanPrompt":"legacy plan hint"}`
+	result := db.Model(&schema.AISession{}).
+		Where("session_id = ?", sessionID).
+		UpdateColumn("start_params", legacyJSON)
+	require.NoError(t, result.Error)
+
+	got, err := GetAISessionMetaStartParamsBySessionID(db, sessionID)
+	require.NoError(t, err)
+	require.Equal(t, "ai", got.GetReviewPolicy())
+	require.Equal(t, "openai", got.GetAIService())
+}
+
+func TestTouchAISessionMetaLastUsedAt(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	lastUsedAt := time.Unix(1716200000, 0)
+	got, err := TouchAISessionMetaLastUsedAt(db, "sess-last-used", lastUsedAt)
+	require.NoError(t, err)
+	require.Equal(t, "sess-last-used", got.SessionID)
+	require.Equal(t, lastUsedAt.Unix(), got.LastUsedAt.Unix())
+	require.Equal(t, lastUsedAt.Unix(), got.UpdatedAt.Unix())
+
+	got, err = GetAISessionMetaBySessionID(db, "sess-last-used")
+	require.NoError(t, err)
+	require.Equal(t, lastUsedAt.Unix(), got.LastUsedAt.Unix())
+	require.Equal(t, lastUsedAt.Unix(), got.UpdatedAt.Unix())
+}
+
+func TestCreateOrUpdateAISessionMetaOnStart(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	lastUsedAt := time.Unix(1716201234, 0)
+	params := &ypb.AIStartParams{
+		AIService:         "openai",
+		AIModelName:       "gpt-test",
+		TimelineSessionID: "sess-on-start",
+	}
+
+	got, err := CreateOrUpdateAISessionMetaOnStart(db, "sess-on-start", params, lastUsedAt)
+	require.NoError(t, err)
+	require.Equal(t, "sess-on-start", got.SessionID)
+	require.Equal(t, lastUsedAt.Unix(), got.LastUsedAt.Unix())
+	require.Equal(t, lastUsedAt.Unix(), got.UpdatedAt.Unix())
+	require.NotEmpty(t, got.StartParams)
+
+	savedParams, err := GetAISessionMetaStartParamsBySessionID(db, "sess-on-start")
+	require.NoError(t, err)
+	require.Equal(t, "openai", savedParams.GetAIService())
+	require.Equal(t, "gpt-test", savedParams.GetAIModelName())
+	require.Equal(t, "sess-on-start", savedParams.GetTimelineSessionID())
+}
+
+func TestOverlayAISessionStartParams(t *testing.T) {
+	base := &ypb.AIStartParams{
+		ReviewPolicy:         "manual",
+		AIService:            "deepseek",
+		AIModelName:          "model-a",
+		EnablePlan:           true,
+		UserInteractLimit:    9,
+		TimelineSessionID:    "sess-1",
+		DisableToolUse:       true,
+		DisableAISearchForge: true,
+		UserPresetPrompt:     "cached",
+	}
+	patch := &ypb.AIStartParams{
+		AIService:         "openai",
+		AIModelName:       "model-b",
+		ReviewPolicy:      "ai",
+		UserInteractLimit: 3,
+	}
+
+	next := OverlayAISessionStartParams(base, patch)
+	require.Equal(t, "openai", next.GetAIService())
+	require.Equal(t, "model-b", next.GetAIModelName())
+	require.Equal(t, "ai", next.GetReviewPolicy())
+	require.Equal(t, int64(3), next.GetUserInteractLimit())
+	require.True(t, next.GetEnablePlan())
+	require.True(t, next.GetDisableToolUse())
+	require.True(t, next.GetDisableAISearchForge())
+	require.Equal(t, "cached", next.GetUserPresetPrompt())
+	require.Equal(t, "sess-1", next.GetTimelineSessionID())
 }
 
 func TestMigrateAISessionMetaFromEvents(t *testing.T) {

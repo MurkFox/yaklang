@@ -3,80 +3,35 @@ package aihttp
 import (
 	"net/http"
 
-	"github.com/gorilla/mux"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
 func (gw *AIAgentHTTPGateway) handlePushEvent(w http.ResponseWriter, r *http.Request) {
-	runID := mux.Vars(r)["run_id"]
-
-	session, ok := gw.runManager.Get(runID)
-	if !ok {
-		writeError(w, http.StatusNotFound, "run not found: "+runID)
-		return
-	}
-
-	if session.Status != RunStatusRunning && session.Status != RunStatusPending {
-		writeError(w, http.StatusConflict, "run is not active, current status: "+string(session.Status))
-		return
-	}
-
-	var req PushEventRequest
-	if err := readJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
-		return
-	}
-
-	inputEvent := convertPushToInputEvent(req, runID)
-	if !hasInputPayload(inputEvent) {
-		writeError(w, http.StatusBadRequest, "input event is empty")
-		return
-	}
-	session.PushInput(inputEvent)
-
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status": "accepted",
-	})
+	gw.handleStreamInput(w, r, false)
 }
 
-func convertPushToInputEvent(req PushEventRequest, runID string) *ypb.AIInputEvent {
-	event := &ypb.AIInputEvent{
-		IsStart:          req.IsStart,
-		IsConfigHotpatch: req.IsConfigHotpatch,
-		HotpatchType:     req.HotpatchType,
-		FocusModeLoop:    req.FocusModeLoop,
+func readAIInputEventRequest(r *http.Request) (*ypb.AIInputEvent, error) {
+	var event ypb.AIInputEvent
+	if err := readProtoJSON(r, &event); err != nil {
+		return nil, err
 	}
-	if req.Params != nil {
-		event.Params = ConvertAIParamsToYPB(*req.Params, runID)
+	return &event, nil
+}
+
+func readOptionalAIInputEventRequest(r *http.Request) (*ypb.AIInputEvent, error) {
+	body, err := readOptionalRawBody(r)
+	if err != nil {
+		return nil, err
 	}
-	if len(req.AttachedFiles) > 0 {
-		event.AttachedFilePath = append([]string(nil), req.AttachedFiles...)
+	if len(body) == 0 {
+		return nil, nil
 	}
 
-	isInteractive := req.IsInteractiveMessage || req.Type == "interactive"
-	isFreeInput := req.IsFreeInput || req.Type == "free_input"
-	isSync := req.IsSyncMessage || req.Type == "sync"
-
-	if isInteractive {
-		event.IsInteractiveMessage = true
-		event.InteractiveId = req.InteractiveID
-		event.InteractiveJSONInput = req.InteractiveJSONInput
+	var event ypb.AIInputEvent
+	if err := readProtoJSONBytes(body, &event); err != nil {
+		return nil, err
 	}
-	if isFreeInput {
-		event.IsFreeInput = true
-		event.FreeInput = req.FreeInput
-		if event.FreeInput == "" {
-			event.FreeInput = req.Content
-		}
-	}
-	if isSync {
-		event.IsSyncMessage = true
-		event.SyncType = req.SyncType
-		event.SyncJsonInput = req.SyncJSONInput
-		event.SyncID = req.SyncID
-	}
-
-	return event
+	return &event, nil
 }
 
 func hasInputPayload(event *ypb.AIInputEvent) bool {

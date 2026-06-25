@@ -56,6 +56,9 @@ func buildFileContent(
 
 	if err := prog.Build(ast, fileContent.Editor, builder); err != nil {
 		log.Errorf("parse %#v failed: %v", path, err)
+	} else {
+		// Drop duplicate *MemEditor ref from the slice; IR still holds editors via memedit.Range where needed.
+		fileContent.Editor = nil
 	}
 }
 
@@ -103,17 +106,27 @@ func collectCompileTargets(
 	return targets
 }
 
+// parseProjectWithFS compiles a whole project from a filesystem.
+//
+// Pipeline: parallel read/ParseAST is inside f1 only (FilesHandler -> channel). One goroutine
+// consumes the channel (PreHandlerProject) and fills fileContents. f3 walks targets and Build
+// sequentially — it does not consume the AST channel. Observability: log=info prints
+// [ssa.compile.summary]; log=debug prints ssa.compile.phase enter f1_pre_handler / f3_main_build / …
+// and ProcessInfof lines are prefixed with the current phase tag.
 func (c *Config) parseProjectWithFS(
 	filesystem filesys_interface.FileSystem,
 	processCallback func(float64, string, ...any),
 ) (*Program, error) {
-
-	var calculateTime, preHandlerTime, parseTime, saveTime time.Duration
+	var calculateTime, preHandlerTime, parseTime, finishTime, saveTime time.Duration
+	overallStart := time.Now()
 	defer func() {
 		log.Debugf("calculate time: %v", calculateTime)
 		log.Debugf("pre-handler time: %v", preHandlerTime)
-		log.Debugf("parse time: %v", parseTime)
+		log.Debugf("parse time (main build f3): %v", parseTime)
+		log.Debugf("finish time (f4 Finish+metadata): %v", finishTime)
 		log.Debugf("save time: %v", saveTime)
+		log.Debugf("ssa.compile.phase_segments: %v", calculateTime+preHandlerTime+parseTime+finishTime+saveTime)
+		log.Debugf("ssa.compile.wall: %v", time.Since(overallStart))
 	}()
 
 	defer func() {
@@ -126,6 +139,9 @@ func (c *Config) parseProjectWithFS(
 
 	wg := sync.WaitGroup{}
 
+	// compilePhase labels UI / callback messages and debug logs so operators can align htop with f1/f3/f5.
+	compilePhase := "f0_scan"
+
 	programName := c.GetProgramName()
 	programPath := c.programPath
 	preHandlerTotal := 0
@@ -137,8 +153,9 @@ func (c *Config) parseProjectWithFS(
 	var err error
 	start := time.Now()
 
-	processCallback(0.0, fmt.Sprintf("parse project in fs: %v, path: %v", filesystem, c.GetCodeSource().ToJSONString()))
-	processCallback(0.0, "calculate total size of project")
+	log.Debugf("ssa.compile.phase enter %s", compilePhase)
+	processCallback(0.0, fmt.Sprintf("[%s] parse project in fs: %v, path: %v", compilePhase, filesystem, c.GetCodeSource().ToJSONString()))
+	processCallback(0.0, fmt.Sprintf("[%s] calculate total size of project", compilePhase))
 
 	folder2Save := make([][]string, 0)
 	if programName != "" {
@@ -171,10 +188,16 @@ func (c *Config) parseProjectWithFS(
 	if err != nil {
 		return nil, err
 	}
+	// Feed the total compile-input bytes into the adaptive IR cache policy.
+	// This is runtime tuning input, not persistent project metadata.
+	c.Config.SetCompileProjectBytes(scanResult.HandlerBytes)
 
 	prog, builder, err := c.init(filesystem, handlerTotal)
 	if err != nil {
 		return nil, err
+	}
+	if rec := c.DiagnosticsRecorder(); rec != nil {
+		prog.SetDiagnosticsRecorder(rec)
 	}
 
 	wg.Add(1)
@@ -188,10 +211,14 @@ func (c *Config) parseProjectWithFS(
 
 	process := 0.0
 	prog.ProcessInfof = func(s string, v ...any) {
-		processCallback(
-			process,
-			s, v...,
-		)
+		msg := s
+		if len(v) > 0 {
+			msg = fmt.Sprintf(s, v...)
+		}
+		if compilePhase != "" {
+			msg = fmt.Sprintf("[%s] %s", compilePhase, msg)
+		}
+		processCallback(process, msg)
 	}
 
 	if c.isStop() {
@@ -220,6 +247,9 @@ func (c *Config) parseProjectWithFS(
 	filePerfRecorder := c.filePerformanceRecorder
 	// pre handler  0-40%
 	f1 := func() error {
+		if prog.Cache != nil {
+			prog.Cache.DisableInstructionSpill()
+		}
 		preHandlerNum := 0
 		preHandlerProcess := func() {
 			preHandlerNum++
@@ -312,6 +342,9 @@ func (c *Config) parseProjectWithFS(
 	}
 
 	f3 := func() error {
+		if prog.Cache != nil {
+			prog.Cache.EnableInstructionSpill()
+		}
 		process = 0.4 // 40%
 		// parse project 40%-90%
 		prog.ProcessInfof("parse project start")
@@ -322,9 +355,10 @@ func (c *Config) parseProjectWithFS(
 		}
 		handlerProcess := func() {
 			handlerNum++
-			process = 0.4 + (float64(handlerNum)/float64(totalToBuild))*0.5
-			if process > 0.9 {
-				process = 0.9 // limit to 90%
+			// Reserve [0.88, 0.90) for program metadata (f4) and [0.90, 1.0] for IR flush (f5).
+			process = 0.4 + (float64(handlerNum)/float64(totalToBuild))*0.48
+			if process > 0.88 {
+				process = 0.88
 			}
 		}
 		prog.SetPreHandler(false)
@@ -353,7 +387,9 @@ func (c *Config) parseProjectWithFS(
 	}
 
 	f4 := func() error {
-		process = 0.9 // %90
+		f4Start := time.Now()
+		defer func() { finishTime = time.Since(f4Start) }()
+		process = 0.88
 		prog.Finish()
 		// 在保存到数据库之前，设置增量编译信息（如果存在）
 		if baseProgramName := c.GetBaseProgramName(); baseProgramName != "" {
@@ -369,47 +405,87 @@ func (c *Config) parseProjectWithFS(
 			prog.FileHashMap = make(map[string]int)
 		}
 		if prog.DatabaseKind != ssa.ProgramCacheMemory { // save program
-			start := time.Now()
+			prog.ProcessInfof("[SSA/persist] program %s saving program metadata (ir_program)", prog.Name)
+			metaStart := time.Now()
 			prog.UpdateToDatabaseWithWG(&wg)
-			since := time.Since(start)
+			since := time.Since(metaStart)
 			log.Infof("program %s save to database cost: %s", prog.Name, since)
+			prog.ProcessInfof("[SSA/persist] program %s program metadata saved, cost %v", prog.Name, since)
 		}
+		process = 0.90
 		return nil
 	}
 
 	f5 := func() error {
-		total := prog.Cache.CountInstruction()
-		process = 0.9
+		saveStart := time.Now()
+		remaining := prog.Cache.CountInstruction()
+		persisted := prog.Cache.InstructionPersistedCount()
+		total := remaining + persisted
+		process = 0.90
 		if prog.DatabaseKind != ssa.ProgramCacheMemory {
-			prog.ProcessInfof("program %s finishing save cache instruction(len:%d) to database", prog.Name, total)
+			prog.ProcessInfof("[SSA/persist] program %s flushing IR cache (remaining=%d persisted=%d total=%d) to database",
+				prog.Name, remaining, persisted, total)
 		} else {
-			prog.ProcessInfof("program %s finishing cache instruction(len:%d) (memory only, not saved)", prog.Name, total)
+			prog.ProcessInfof("[SSA/persist] program %s finishing cache instruction(len:%d) (memory only, not saved)", prog.Name, remaining)
 		}
 
-		var index int
-		prevProcess := 0.9
-		_ = prevProcess
-		lock := sync.Mutex{}
-		prog.Cache.SaveToDatabase(func(size int) {
-			lock.Lock()
-			defer lock.Unlock()
-			index += size
-			process = 0.9 + (float64(index)/float64(total))*0.1
-			if (process - prevProcess) > 0.0001 { // is 90.01%/90.02%/....
-				prog.ProcessInfof("Saving instructions: %d complete(total %d)", index, total)
-				prevProcess = process
-			}
-		})
-		saveTime = time.Since(start)
+		if err := prog.Cache.SaveToDatabase(irSaveProgressCallback(prog, total, persisted, 0.90, 1.0, func(p float64) {
+			process = p
+		})); err != nil {
+			return utils.Errorf("persist IR to database failed: %w", err)
+		}
+		saveTime = time.Since(saveStart)
+		if prog.DatabaseKind != ssa.ProgramCacheMemory {
+			prog.ProcessInfof("[SSA/persist] program %s IR cache flush finished, cost %v", prog.Name, saveTime)
+		}
 		return nil
 	}
 	f6 := func() error {
 		wg.Wait()
 		return nil
 	}
-	if err := c.DiagnosticsTrack("ParseProjectWithFS", f1, f2, f3, f4, f5, f6); err != nil {
+	wrapPhase := func(phase string, fn func() error) func() error {
+		return func() error {
+			compilePhase = phase
+			log.Debugf("ssa.compile.phase enter %s", compilePhase)
+			return fn()
+		}
+	}
+	phaseSteps := []func() error{
+		wrapPhase("f1_pre_handler", f1),
+		wrapPhase("f2_after_pre", f2),
+		wrapPhase("f3_main_build", f3),
+		wrapPhase("f4_finish", f4),
+		wrapPhase("f5_save_db", f5),
+		wrapPhase("f6_wait", f6),
+	}
+	if rec := c.DiagnosticsRecorder(); rec != nil {
+		err = rec.Track("ParseProjectWithFS", phaseSteps...)
+	} else {
+		for _, step := range phaseSteps {
+			if err = step(); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
 		return nil, err
 	}
+
+	// wall := time.Since(overallStart)
+	// totalCompile := calculateTime + preHandlerTime + parseTime + finishTime + saveTime
+	// log.Infof(
+	// 	"[ssa.compile.summary] program=%s handler_files=%d wall=%s scan=%s pre_handler=%s main_build=%s finish=%s save_instructions=%s phase_sum=%s",
+	// 	prog.Name,
+	// 	len(handlerFilesMap),
+	// 	wall,
+	// 	calculateTime,
+	// 	preHandlerTime,
+	// 	parseTime,
+	// 	finishTime,
+	// 	saveTime,
+	// 	totalCompile,
+	// )
 
 	// 输出文件性能汇总表格
 	if enableFilePerfLog && filePerfRecorder != nil {
@@ -422,4 +498,50 @@ func (c *Config) parseProjectWithFS(
 		}
 	}
 	return NewProgram(prog, c), nil
+}
+
+const irSaveHeartbeatInterval = 5 * time.Second
+
+// irSaveProgressCallback builds a SaveToDatabase progress func: updates optional
+// compile bar in [processMin, processMax], logs delta steps (>0.0001 on that
+// range), and emits a heartbeat every irSaveHeartbeatInterval while work advances.
+func irSaveProgressCallback(prog *ssa.Program, total int, baseSaved int, processMin, processMax float64, setProcess func(float64)) func(int) {
+	var mu sync.Mutex
+	var index int
+	prevP := processMin
+	if total > 0 && baseSaved > 0 {
+		prevP = processMin + (float64(baseSaved)/float64(total))*(processMax-processMin)
+	}
+	lastHB := time.Now()
+	lastIdxAtHB := 0
+	return func(size int) {
+		mu.Lock()
+		defer mu.Unlock()
+		index += size
+		effective := baseSaved + index
+		var p float64
+		if total > 0 {
+			p = processMin + (float64(effective)/float64(total))*(processMax-processMin)
+		} else {
+			p = processMax
+		}
+		if setProcess != nil {
+			setProcess(p)
+		}
+		if total > 0 && (p-prevP) > 0.0001 {
+			prog.ProcessInfof("[SSA/persist] Saving instructions: %d / %d", effective, total)
+			prevP = p
+		}
+		now := time.Now()
+		if total > 0 && index > lastIdxAtHB && now.Sub(lastHB) >= irSaveHeartbeatInterval {
+			elapsed := now.Sub(lastHB).Seconds()
+			if elapsed <= 0 {
+				elapsed = 1e-9
+			}
+			rate := float64(index-lastIdxAtHB) / elapsed
+			prog.ProcessInfof("[SSA/persist] IR save heartbeat: %d / %d (~%.0f inst/s over %.0fs)", effective, total, rate, elapsed)
+			lastHB = now
+			lastIdxAtHB = index
+		}
+	}
 }

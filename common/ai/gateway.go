@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/yaklang/yaklang/common/ai/aibalance"
+	"github.com/yaklang/yaklang/common/ai/aid/aicache"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/yaklang/yaklang/common/ai/dashscopebase"
@@ -49,13 +51,7 @@ func init() {
 		return &tongyi.GatewayClient{}
 	})
 	aispec.Register("volcengine", func() aispec.AIClient {
-		return &volcengine.GatewayClient{
-			ExtraOptions: []aispec.AIConfigOption{
-				aispec.WithEnableThinkingEx("thinking", map[string]any{
-					"type": "disabled",
-				}),
-			},
-		}
+		return &volcengine.GatewayClient{}
 	})
 	aispec.Register("comate", func() aispec.AIClient {
 		return &comate.Client{}
@@ -117,11 +113,19 @@ func (g *Gateway) Chat(s string, f ...any) (string, error) {
 		aispec.WithChatBase_ReasonStreamHandler(g.Config.ReasonStreamHandler),
 		aispec.WithChatBase_ErrHandler(g.Config.HTTPErrorHandler),
 		aispec.WithChatBase_ImageRawInstance(g.Config.Images...),
+		aispec.ChatBaseThinkingOptions(g.Config, g.TargetUrl),
+		aispec.WithChatBase_AISamplingFromConfig(g.Config),
 		aispec.WithChatBase_ToolCallCallback(g.Config.ToolCallCallback),
 		aispec.WithChatBase_Tools(g.Config.Tools),
 		aispec.WithChatBase_ToolChoice(g.Config.ToolChoice),
+		aispec.WithChatBase_RawHTTPResponseHeaderCallback(g.Config.RawHTTPResponseHeaderCallback),
 		aispec.WithChatBase_RawHTTPResponseCallback(g.Config.RawHTTPResponseCallback),
 		aispec.WithChatBase_RawHTTPRequestResponseCallback(g.Config.RawHTTPRequestResponseCallback),
+		aispec.WithChatBase_RawMessages(g.Config.RawMessages),
+		// UsageCallback 透传：让 yak 用户层 ai.usageCallback(...) 注册的回调
+		// 能拿到上游 LLM SSE 末帧的 token 用量（包含 cached_tokens 等隐式缓存命中信息）。
+		// 关键词: Gateway.Chat UsageCallback 透传, cached_tokens 暴露给 yak
+		aispec.WithChatBase_UsageCallback(g.Config.UsageCallback),
 	)
 }
 
@@ -137,6 +141,9 @@ func (g *Gateway) ChatStream(s string) (io.Reader, error) {
 		g.Config.HTTPErrorHandler,
 		g.Config.StreamHandler,
 		g.AIClient.BuildHTTPOptions,
+		aispec.ChatBaseThinkingOptions(g.Config, g.TargetUrl),
+		aispec.WithChatBase_AISamplingFromConfig(g.Config),
+		aispec.WithChatBase_RawHTTPResponseHeaderCallback(g.Config.RawHTTPResponseHeaderCallback),
 		aispec.WithChatBase_RawHTTPResponseCallback(g.Config.RawHTTPResponseCallback),
 		aispec.WithChatBase_RawHTTPRequestResponseCallback(g.Config.RawHTTPRequestResponseCallback),
 	)
@@ -146,7 +153,7 @@ func NewGateway() *Gateway {
 	return &Gateway{}
 }
 
-func tryCreateAIGateway(t string, cb func(string, aispec.AIClient) bool) error {
+func tryCreateAIGateway(t string, disableProviderFallback bool, cb func(string, aispec.AIClient) (bool, error)) error {
 	createAIGatewayByType := func(typ string) aispec.AIClient {
 		gw, ok := aispec.Lookup(typ)
 		if !ok {
@@ -159,14 +166,52 @@ func tryCreateAIGateway(t string, cb func(string, aispec.AIClient) bool) error {
 	if utils.StringArrayContains(total, t) {
 		gw := createAIGatewayByType(t)
 		if gw != nil {
-			if cb(t, gw) {
+			ok, err := cb(t, gw)
+			if ok {
 				return nil
 			}
+			if disableProviderFallback {
+				if err != nil {
+					return err
+				}
+				return errors.New("specified ai provider failed and provider fallback is disabled")
+			}
 		}
+	}
+	if disableProviderFallback && t != "" {
+		return fmt.Errorf("unsupported ai type: %s", t)
 	}
 	if t != "" {
 		log.Warnf("unsupported ai type: %s, use default config ai type", t)
 	}
+
+	if tiered := consts.GetTieredAIConfig(); tiered != nil {
+		priorityOrders := [][]*ypb.AIModelConfig{
+			consts.GetIntelligentAIConfigs(),
+			consts.GetLightweightAIConfigs(),
+			consts.GetVisionAIConfigs(),
+		}
+		for _, configs := range priorityOrders {
+			for _, modelCfg := range configs {
+				if modelCfg == nil || modelCfg.GetProvider() == nil {
+					continue
+				}
+				providerType := strings.TrimSpace(modelCfg.GetProvider().GetType())
+				if providerType == "" {
+					continue
+				}
+				agent := createAIGatewayByType(providerType)
+				if agent == nil {
+					continue
+				}
+				ok, _ := cb(providerType, agent)
+				if ok {
+					return nil
+				}
+			}
+		}
+	}
+
 	cfg := yakit.GetNetworkConfig()
 	if cfg == nil {
 		return nil
@@ -195,7 +240,8 @@ func tryCreateAIGateway(t string, cb func(string, aispec.AIClient) bool) error {
 	for _, typ := range cfg.AiApiPriority {
 		agent := createAIGatewayByType(typ)
 		if agent != nil {
-			if cb(typ, agent) {
+			ok, _ := cb(typ, agent)
+			if ok {
 				return nil
 			}
 		} else {
@@ -438,21 +484,21 @@ func legacyChat(msg string, opts ...aispec.AIConfigOption) (string, error) {
 	config := aispec.NewDefaultAIConfig(opts...)
 	var responseRsp string
 	var err error
-	err = tryCreateAIGateway(config.Type, func(typ string, gateway aispec.AIClient) bool {
+	err = tryCreateAIGateway(config.Type, config.DisableProviderFallback, func(typ string, gateway aispec.AIClient) (bool, error) {
 		gateway.LoadOption(append([]aispec.AIConfigOption{aispec.WithType(typ)}, opts...)...)
 		if err := gateway.CheckValid(); err != nil {
 			log.Debugf("check valid by %s failed: %s", typ, err)
-			return false
+			return false, err
 		}
 		invokeModelInfoCallback(gateway, typ)
 		log.Infof("start to chat completions by %v", typ)
 		responseRsp, err = gateway.Chat(msg)
 		if err != nil {
 			log.Warnf("chat by %s failed: %s", typ, err)
-			return false
+			return false, err
 		}
 		invokeModelInfoConfirmCallback(gateway, typ)
-		return true
+		return true, nil
 	})
 	if err != nil {
 		return "", err
@@ -616,17 +662,59 @@ func TieredChatWithTier(tier ModelTier, msg string, opts ...aispec.AIConfigOptio
 	return chatWithConfigs(msg, configs, opts...)
 }
 
-// IntelligentChat uses the intelligent (high-quality) model
+// IntelligentChat 使用智能（高质量）模型分层进行对话（导出名为 ai.IntelligentChat）
+// 参数:
+//   - msg: 要发送给 AI 的消息内容
+//   - opts: AI 配置选项，如 ai.apiKey、ai.model 等
+//
+// 返回值:
+//   - AI 返回的回复内容
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的 AI 服务（示意性示例）
+// response = ai.IntelligentChat("分析这条漏洞利用链")~
+// println(response)
+// ```
 func IntelligentChat(msg string, opts ...aispec.AIConfigOption) (string, error) {
 	return TieredChatWithTier(TierIntelligent, msg, opts...)
 }
 
-// LightweightChat uses the lightweight (fast) model
+// LightweightChat 使用轻量（快速）模型分层进行对话（导出名为 ai.LightweightChat）
+// 参数:
+//   - msg: 要发送给 AI 的消息内容
+//   - opts: AI 配置选项，如 ai.apiKey、ai.model 等
+//
+// 返回值:
+//   - AI 返回的回复内容
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的 AI 服务（示意性示例）
+// response = ai.LightweightChat("用一句话总结这段文本")~
+// println(response)
+// ```
 func LightweightChat(msg string, opts ...aispec.AIConfigOption) (string, error) {
 	return TieredChatWithTier(TierLightweight, msg, opts...)
 }
 
-// VisionChat uses the vision model
+// VisionChat 使用视觉模型分层进行对话，可结合图片输入（导出名为 ai.VisionChat）
+// 参数:
+//   - msg: 要发送给 AI 的消息内容
+//   - opts: AI 配置选项，通常配合 ai.imageFile、ai.imageBase64 等使用
+//
+// 返回值:
+//   - AI 返回的回复内容
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的视觉 AI 服务（示意性示例）
+// response = ai.VisionChat("描述这张截图", ai.imageFile("/tmp/demo.png"))~
+// println(response)
+// ```
 func VisionChat(msg string, opts ...aispec.AIConfigOption) (string, error) {
 	return TieredChatWithTier(TierVision, msg, opts...)
 }
@@ -635,11 +723,11 @@ func legacyFunctionCall(input string, funcs any, opts ...aispec.AIConfigOption) 
 	config := aispec.NewDefaultAIConfig(opts...)
 	var responseRsp map[string]any
 	var err error
-	err = tryCreateAIGateway(config.Type, func(typ string, gateway aispec.AIClient) bool {
+	err = tryCreateAIGateway(config.Type, config.DisableProviderFallback, func(typ string, gateway aispec.AIClient) (bool, error) {
 		gateway.LoadOption(append([]aispec.AIConfigOption{aispec.WithType(typ)}, opts...)...)
 		if err := gateway.CheckValid(); err != nil {
 			log.Debugf("check valid by %s failed: %s", typ, err)
-			return false
+			return false, err
 		}
 		var ok bool
 		for i := 0; i < config.FunctionCallRetryTimes; i++ {
@@ -652,9 +740,9 @@ func legacyFunctionCall(input string, funcs any, opts ...aispec.AIConfigOption) 
 			}
 		}
 		if !ok {
-			return false
+			return false, err
 		}
-		return true
+		return true, nil
 	})
 	if err != nil {
 		return nil, err
@@ -762,14 +850,65 @@ func TieredFunctionCallWithTier(tier ModelTier, input string, funcs any, opts ..
 	return functionCallWithConfigs(input, funcs, configs, opts...)
 }
 
+// IntelligentFunctionCall 使用智能（高质量）模型进行函数调用（导出名为 ai.IntelligentFunctionCall）
+// 参数:
+//   - input: 用户输入的自然语言指令
+//   - funcs: 函数定义（支持结构体或函数列表）
+//   - opts: AI 配置选项
+//
+// 返回值:
+//   - 函数调用结果
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的 AI 服务（示意性示例）
+// funcs = { "scan": func(target) { return {"target": target} } }
+// result = ai.IntelligentFunctionCall("扫描 example.com", funcs)~
+// dump(result)
+// ```
 func IntelligentFunctionCall(input string, funcs any, opts ...aispec.AIConfigOption) (map[string]any, error) {
 	return TieredFunctionCallWithTier(TierIntelligent, input, funcs, opts...)
 }
 
+// LightweightFunctionCall 使用轻量（快速）模型进行函数调用（导出名为 ai.LightweightFunctionCall）
+// 参数:
+//   - input: 用户输入的自然语言指令
+//   - funcs: 函数定义（支持结构体或函数列表）
+//   - opts: AI 配置选项
+//
+// 返回值:
+//   - 函数调用结果
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的 AI 服务（示意性示例）
+// funcs = { "scan": func(target) { return {"target": target} } }
+// result = ai.LightweightFunctionCall("快速提取目标", funcs)~
+// dump(result)
+// ```
 func LightweightFunctionCall(input string, funcs any, opts ...aispec.AIConfigOption) (map[string]any, error) {
 	return TieredFunctionCallWithTier(TierLightweight, input, funcs, opts...)
 }
 
+// VisionFunctionCall 使用视觉模型进行函数调用，可结合图片输入（导出名为 ai.VisionFunctionCall）
+// 参数:
+//   - input: 用户输入的自然语言指令
+//   - funcs: 函数定义（支持结构体或函数列表）
+//   - opts: AI 配置选项，通常配合 ai.imageFile 等使用
+//
+// 返回值:
+//   - 函数调用结果
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的视觉 AI 服务（示意性示例）
+// funcs = { "describe": func(text) { return {"text": text} } }
+// result = ai.VisionFunctionCall("识别图片内容", funcs, ai.imageFile("/tmp/demo.png"))~
+// dump(result)
+// ```
 func VisionFunctionCall(input string, funcs any, opts ...aispec.AIConfigOption) (map[string]any, error) {
 	return TieredFunctionCallWithTier(TierVision, input, funcs, opts...)
 }
@@ -807,17 +946,17 @@ func VisionFunctionCall(input string, funcs any, opts ...aispec.AIConfigOption) 
 func StructuredStream(input string, opts ...aispec.AIConfigOption) (chan *aispec.StructuredData, error) {
 	config := aispec.NewDefaultAIConfig(opts...)
 	var selectedGateway aispec.AIClient
-	tryCreateAIGateway(config.Type, func(typ string, gateway aispec.AIClient) bool {
+	tryCreateAIGateway(config.Type, config.DisableProviderFallback, func(typ string, gateway aispec.AIClient) (bool, error) {
 		gateway.LoadOption(append([]aispec.AIConfigOption{aispec.WithType(typ)}, opts...)...)
 		if err := gateway.CheckValid(); err != nil {
 			log.Debugf("check valid by %s failed: %s", typ, err)
-			return false
+			return false, err
 		}
 
 		if gateway.SupportedStructuredStream() {
 			selectedGateway = gateway
 		}
-		return true
+		return true, nil
 	})
 	if selectedGateway == nil {
 		return nil, errors.New("not found valid ai agent")
@@ -1014,11 +1153,31 @@ var Exports = map[string]any{
 	"imageFile":                      aispec.WithImageFile,
 	"imageBase64":                    aispec.WithImageBase64,
 	"imageRaw":                       aispec.WithImageRaw,
+	"videoUrl":                       aispec.WithVideoUrl,
+	"videoBase64":                    aispec.WithVideoBase64,
+	"videoRaw":                       aispec.WithVideoRaw,
 	"toolCallCallback":               aispec.WithToolCallCallback,
 	"modelInfoCallback":              aispec.WithModelInfoCallback,
 	"modelInfoConfirmCallback":       aispec.WithModelInfoConfirmCallback,
+	"rawHTTPResponseHeaderCallback":  aispec.WithRawHTTPResponseHeaderCallback,
 	"rawHTTPResponseCallback":        aispec.WithRawHTTPResponseCallback,
 	"rawHTTPRequestResponseCallback": aispec.WithRawHTTPRequestResponseCallback,
+	"rawMessages":                    aispec.WithRawMessages,
+
+	// usageCallback 让 yak 脚本可以接收上游 LLM 在 SSE 末帧返回的 token 用量
+	// （含 prompt_tokens_details.cached_tokens 隐式缓存命中信息）。
+	// 使用方法：ai.usageCallback(func(usage){ println(usage.PromptTokens, usage.PromptTokensDetails.CachedTokens) })
+	// 注：触发该回调依赖上游开启 stream_options.include_usage=true，
+	// aispec 会在检测到 ctx.UsageCallback 时自动注入这一参数。
+	// 关键词: yak ai usageCallback, 隐式缓存可见, cached_tokens 暴露给脚本
+	"usageCallback": aispec.WithUsageCallback,
+
+	// aicacheSession 暴露当前进程的 aicache 调试落盘根目录绝对路径。
+	// 用法：sessionDir = ai.aicacheSession()
+	// 触发条件：仅在 utils.InDebugMode()（DEBUG / PALMDEBUG / YAKLANGDEBUG 任一非空）
+	// 或测试场景下，aicache.Observe 才会异步落盘 000XXX.txt；返回路径稳定可复用。
+	// 关键词: yak ai aicacheSession, dump 目录暴露, cachebench
+	"aicacheSession": aicache.SessionDir,
 }
 
 // CreateChatterFromConfig creates a chat function from AIModelConfig.

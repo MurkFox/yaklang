@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -24,7 +25,18 @@ type AIThirdPartyConfig struct {
 	UserSecret     string          `json:"user_secret"`
 	Namespace      string          `json:"namespace"`
 	Domain         string          `json:"domain"`
-	WebhookURL     string          `json:"webhook_url"`
+	BaseURL        string          `json:"base_url"`
+	Endpoint       string          `json:"endpoint"`
+	EnableEndpoint bool            `json:"enable_endpoint" gorm:"default:false"`
+	EnableThinking bool            `json:"enable_thinking" gorm:"default:false"`
+	// 以下为可选模型参数（nil 表示未配置）
+	MaxTokens          *int64   `json:"max_tokens,omitempty" gorm:"column:max_tokens"`
+	Temperature        *float64 `json:"temperature,omitempty" gorm:"column:temperature"`
+	TopP               *float64 `json:"top_p,omitempty" gorm:"column:top_p"`
+	TopK               *int64   `json:"top_k,omitempty" gorm:"column:top_k"`
+	FrequencyPenalty   *float64 `json:"frequency_penalty,omitempty" gorm:"column:frequency_penalty"`
+	ReasoningEffort    string   `json:"reasoning_effort,omitempty" gorm:"column:reasoning_effort"`
+	WebhookURL         string   `json:"webhook_url"`
 	ExtraParams    MapStringString `json:"extra_params" gorm:"type:text"`
 	APIType        string          `json:"api_type"`
 	Disabled       bool            `json:"disabled" gorm:"default:false"`
@@ -55,11 +67,35 @@ func (c *AIThirdPartyConfig) CalcHash() string {
 		c.UserSecret,
 		c.Namespace,
 		c.Domain,
+		c.BaseURL,
+		c.Endpoint,
 		c.WebhookURL,
 		builder.String(),
 		c.Proxy,
 		c.NoHttps,
+		c.EnableEndpoint,
+		c.EnableThinking,
+		optionalInt64ForHash(c.MaxTokens),
+		optionalFloat64ForHash(c.Temperature),
+		optionalFloat64ForHash(c.TopP),
+		optionalInt64ForHash(c.TopK),
+		optionalFloat64ForHash(c.FrequencyPenalty),
+		c.ReasoningEffort,
 	)
+}
+
+func optionalInt64ForHash(p *int64) string {
+	if p == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d", *p)
+}
+
+func optionalFloat64ForHash(p *float64) string {
+	if p == nil {
+		return ""
+	}
+	return fmt.Sprintf("%g", *p)
 }
 
 func (c *AIThirdPartyConfig) BeforeSave() error {
@@ -82,11 +118,39 @@ func (c *AIThirdPartyConfig) ToThirdPartyConfig() *ypb.ThirdPartyApplicationConf
 		UserSecret:     c.UserSecret,
 		Namespace:      c.Namespace,
 		Domain:         c.Domain,
+		BaseURL:        c.BaseURL,
+		Endpoint:       c.Endpoint,
+		EnableEndpoint: c.EnableEndpoint,
+		EnableThinking: c.EnableThinking,
 		WebhookURL:     c.WebhookURL,
 		Disabled:       c.Disabled,
 		Proxy:          c.Proxy,
 		NoHttps:        c.NoHttps,
 		APIType:        c.APIType,
+	}
+	if c.MaxTokens != nil {
+		v := *c.MaxTokens
+		cfg.MaxTokens = &v
+	}
+	if c.Temperature != nil {
+		v := *c.Temperature
+		cfg.Temperature = &v
+	}
+	if c.TopP != nil {
+		v := *c.TopP
+		cfg.TopP = &v
+	}
+	if c.TopK != nil {
+		v := *c.TopK
+		cfg.TopK = &v
+	}
+	if c.FrequencyPenalty != nil {
+		v := *c.FrequencyPenalty
+		cfg.FrequencyPenalty = &v
+	}
+	if strings.TrimSpace(c.ReasoningEffort) != "" {
+		s := strings.TrimSpace(c.ReasoningEffort)
+		cfg.ReasoningEffort = &s
 	}
 	if len(c.ExtraParams) > 0 {
 		cfg.ExtraParams = make([]*ypb.KVPair, 0, len(c.ExtraParams))
@@ -121,13 +185,17 @@ func AIThirdPartyConfigFromGRPC(cfg *ypb.ThirdPartyApplicationConfig) *AIThirdPa
 		log.Errorf("ImportAppConfigToStruct failed: %v", err)
 	}
 
-	return &AIThirdPartyConfig{
+	out := &AIThirdPartyConfig{
 		Type:           cfg.GetType(),
 		APIKey:         cfg.GetAPIKey(),
 		UserIdentifier: cfg.GetUserIdentifier(),
 		UserSecret:     cfg.GetUserSecret(),
 		Namespace:      cfg.GetNamespace(),
 		Domain:         cfg.GetDomain(),
+		BaseURL:        cfg.GetBaseURL(),
+		Endpoint:       cfg.GetEndpoint(),
+		EnableEndpoint: cfg.GetEnableEndpoint(),
+		EnableThinking: cfg.GetEnableThinking(),
 		WebhookURL:     cfg.GetWebhookURL(),
 		ExtraParams:    extra,
 		Disabled:       cfg.GetDisabled(),
@@ -135,4 +203,28 @@ func AIThirdPartyConfigFromGRPC(cfg *ypb.ThirdPartyApplicationConfig) *AIThirdPa
 		NoHttps:        cfg.GetNoHttps(),
 		APIType:        cfg.GetAPIType(),
 	}
+	if cfg.MaxTokens != nil {
+		v := *cfg.MaxTokens
+		out.MaxTokens = &v
+	}
+	if cfg.Temperature != nil {
+		v := *cfg.Temperature
+		out.Temperature = &v
+	}
+	if cfg.TopP != nil {
+		v := *cfg.TopP
+		out.TopP = &v
+	}
+	if cfg.TopK != nil {
+		v := *cfg.TopK
+		out.TopK = &v
+	}
+	if cfg.FrequencyPenalty != nil {
+		v := *cfg.FrequencyPenalty
+		out.FrequencyPenalty = &v
+	}
+	if cfg.ReasoningEffort != nil {
+		out.ReasoningEffort = strings.TrimSpace(*cfg.ReasoningEffort)
+	}
+	return out
 }

@@ -1,188 +1,299 @@
 package ssa
 
 import (
-	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jinzhu/gorm"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+	"go.uber.org/atomic"
 )
 
-// Cache : a cache in middle layer of database and application.
-//
-//	application will Get/Set Instruction,
-//
-// and save the data to database when the data is expired,
-// and load the data from database when the data is not in cache.
+type ProgramCacheKind int
+
+const (
+	_ ProgramCacheKind = iota
+	ProgramCacheMemory
+	ProgramCacheDBRead
+	ProgramCacheDBWrite
+)
 
 type ProgramCache struct {
-	program          *Program // mark which program handled
-	ProgramCacheKind ProgramCacheKind
-	DB               *gorm.DB
+	program *Program
+	db      *gorm.DB
 
-	InstructionCache *Cache[Instruction]
-	TypeCache        *Cache[Type]
-
-	VariableIndex *SimpleCache[Instruction]
-	MemberIndex   *SimpleCache[Instruction]
-	ClassIndex    *SimpleCache[Instruction]
-	ConstCache    *SimpleCache[Instruction]
-
-	indexCache  *SimpleCache[*ssadb.IrIndex]
-	offsetCache *SimpleCache[*ssadb.IrOffset]
-	editorCache *SimpleCache[*ssadb.IrSource]
-
-	afterSaveNotify func(int)
-
-	waitGroup *sync.WaitGroup // wait for all goroutines to finish
-
-	// For pre-fetching IDs
-	cacheCtxCancel context.CancelFunc
+	instructions *instructionStore
+	types        *typeStore
+	sources      *sourceStore
+	indexes      *indexStore
 }
 
-// NewDBCache : create a new ssa db cache. if ttl is 0, the cache will never expire, and never save to database.
-func NewDBCache(compileCtx context.Context, prog *Program, databaseKind ProgramCacheKind, fileSize int, ConfigTTL ...time.Duration) *ProgramCache {
-	// compileCtx := context.Background()
-	cacheCtx, cancel := context.WithCancel(compileCtx)
+func NewDBCache(cfg *ssaconfig.Config, prog *Program, databaseKind ProgramCacheKind, fileSize int) *ProgramCache {
+	cfg = ensureProgramConfig(cfg)
 	cache := &ProgramCache{
-		program:          prog,
-		ProgramCacheKind: databaseKind,
-		// set ttl
-		cacheCtxCancel: cancel,
-		waitGroup:      &sync.WaitGroup{},
+		program: prog,
 	}
+
 	var programName string
-	if databaseKind != ProgramCacheMemory { // database write/read
+	if databaseKind != ProgramCacheMemory {
 		programName = prog.GetApplication().GetProgramName()
-		cache.DB = ssadb.GetDB().Where("program_name = ?", programName)
+		cache.db = ssadb.GetDB().Where("program_name = ?", programName)
 	}
-	fetchSize := min(max(fileSize*5, defaultFetchSize), maxFetchSize)
+	if databaseKind != ProgramCacheMemory && instructionCacheDebugEnabled() {
+		cacheTTL, cacheMax := resolveInstructionCacheSettings(cfg)
+		log.Debugf("[ssa-ir-cache] init: program=%s ttl=%s max=%d kind=%d",
+			programName, cacheTTL, cacheMax, databaseKind,
+		)
+	}
+
 	saveSize := min(max(fileSize*5, defaultSaveSize), maxSaveSize)
-	log.Debugf("asyncdb Channel: ReSetSize: fileSize(%d) fetchSize(%d) saveSize(%d)", fileSize, fetchSize, saveSize)
-	cache.initIndex(databaseKind, saveSize/2)
-	cache.afterSaveNotify = func(i int) {}
-	cache.InstructionCache = createInstructionCache(
-		cacheCtx, databaseKind,
-		cache.DB, prog,
-		programName, fetchSize, saveSize,
-		func(size int) {
-			cache.afterSaveNotify(size)
-		},
-	)
-	cache.TypeCache = createTypeCache(
-		cacheCtx, cache.DB, prog,
-		programName, saveSize,
-	)
+	log.Debugf("asyncdb Channel: ReSetSize: fileSize(%d) saveSize(%d)", fileSize, saveSize)
+
+	cache.sources = newSourceStore(prog, databaseKind, cache.db)
+	cache.indexes = newIndexStore(cfg, prog, databaseKind, cache.db, saveSize/2)
+	cache.types = newTypeStore(cfg, prog, databaseKind, cache.db, programName, saveSize)
+	cache.instructions = newInstructionStore(cfg, prog, databaseKind, cache.db, saveSize)
 	return cache
 }
 
 func (c *ProgramCache) HaveDatabaseBackend() bool {
-	return c.DB != nil
+	return c != nil && c.db != nil
 }
 
-// =============================================== Instruction =======================================================
+func (c *ProgramCache) DebugDB() {
+	if c == nil || c.db == nil {
+		return
+	}
+	c.db = c.db.Debug()
+}
 
-// SetInstruction : set instruction to cache.
+func (c *ProgramCache) DisableInstructionSpill() {
+	if c == nil || !c.HaveDatabaseBackend() || c.instructions == nil {
+		return
+	}
+	c.instructions.DisableSpill()
+}
+
+func (c *ProgramCache) EnableInstructionSpill() {
+	if c == nil || !c.HaveDatabaseBackend() || c.instructions == nil {
+		return
+	}
+	c.instructions.EnableSpill()
+}
+
+func (c *ProgramCache) IsInstructionSpillDisabled() bool {
+	if c == nil || !c.HaveDatabaseBackend() || c.instructions == nil {
+		return false
+	}
+	return c.instructions.IsSpillDisabled()
+}
+
 func (c *ProgramCache) SetInstruction(inst Instruction) {
 	if utils.IsNil(inst) {
 		log.Errorf("BUG: SetInstruction called with nil instruction")
 		return
 	}
-	if !utils.IsNil(c.offsetCache) {
-		c.offsetCache.Add("", ConvertValue2Offset(inst))
+	if c != nil && c.indexes != nil {
+		c.indexes.AddInstructionOffsets(inst)
 	}
-	c.InstructionCache.Set(inst)
+	if c != nil && c.instructions != nil {
+		c.instructions.Set(inst)
+	}
 }
 
 func (c *ProgramCache) DeleteInstruction(inst Instruction) {
-	c.InstructionCache.Delete(inst.GetId())
+	if c == nil || c.instructions == nil || utils.IsNil(inst) {
+		return
+	}
+	c.instructions.Delete(inst.GetId())
 }
 
-// GetInstruction : get instruction from cache.
 func (c *ProgramCache) GetInstruction(id int64) Instruction {
-	if id == 0 {
+	if c == nil || c.instructions == nil || id == 0 {
 		return nil
 	}
-	if ret, ok := c.InstructionCache.Get(id); ok {
-		return ret
-	}
-
-	if c.ProgramCacheKind == ProgramCacheDBRead {
-		if inst, err := NewLazyInstruction(c.program, id); err == nil {
-			c.InstructionCache.Set(inst)
-			return inst
-		} else {
-			log.Debugf("LazyInstruction Create faild: %v", err)
-		}
-	}
-	return nil
-
+	return c.instructions.Get(id)
 }
 
-// PreloadInstructionsByIDsFast fills instruction cache with lazy instructions without neighbor prefetch.
 func (c *ProgramCache) PreloadInstructionsByIDsFast(ids []int64) {
-	if c == nil || c.ProgramCacheKind != ProgramCacheDBRead || c.program == nil {
+	if c == nil || c.instructions == nil {
 		return
 	}
-	if len(ids) == 0 {
-		return
-	}
-	ssadb.PreloadIrCodesByIdsFast(ssadb.GetDB(), c.program.Name, ids)
-	cache := ssadb.GetIrCodeCache(c.program.Name)
-	for _, id := range ids {
-		if id <= 0 {
-			continue
-		}
-		if _, ok := c.InstructionCache.Get(id); ok {
-			continue
-		}
-		if ir, ok := cache.Get(id); ok {
-			if inst, err := NewLazyInstructionFromIrCode(ir, c.program); err == nil {
-				c.InstructionCache.Set(inst)
-			}
-		}
-	}
+	c.instructions.PreloadByIDsFast(ids)
 }
-
-// =============================================== Variable =======================================================
 
 func (c *ProgramCache) AddConst(inst Instruction) {
-	c.ConstCache.Add(inst.GetName(), inst)
+	if c == nil || c.indexes == nil {
+		return
+	}
+	c.indexes.AddConst(inst)
 }
 
 func (c *ProgramCache) AddVariable(name string, inst Instruction) {
-	member := ""
-	// field
-	if strings.HasPrefix(name, "#") { // member-call variable contain #, see common/yak/ssa/member_call.go:checkCanMemberCall
-		if _, memberName, ok := strings.Cut(name, "."); ok {
-			member = memberName
-		}
-
-		if _, memberKey, ok := strings.Cut(name, "["); ok {
-			member, _ = strings.CutSuffix(memberKey, "]")
-		}
+	if c == nil || c.indexes == nil {
+		return
 	}
-	if len(name) > 1 {
-		name = strings.TrimPrefix(name, "$")
-	}
-	if member != "" {
-		c.MemberIndex.Add(member, inst)
-	} else {
-		c.VariableIndex.Add(name, inst)
-	}
+	c.indexes.AddVariable(name, inst)
 }
 
 func (c *ProgramCache) RemoveVariable(name string, inst Instruction) {
-	member := ""
-	// field
-	if strings.HasPrefix(name, "#") { // member-call variable contain #, see common/yak/ssa/member_call.go:checkCanMemberCall
+	if c == nil || c.indexes == nil {
+		return
+	}
+	c.indexes.RemoveVariable(name, inst)
+}
+
+func (c *ProgramCache) AddClassInstance(name string, inst Instruction) {
+	if c == nil || c.indexes == nil {
+		return
+	}
+	c.indexes.AddClassInstance(name, inst)
+}
+
+func (c *ProgramCache) SaveToDatabase(cb ...func(int)) error {
+	if !c.HaveDatabaseBackend() {
+		return nil
+	}
+	progress := func(int) {}
+	if len(cb) > 0 && cb[0] != nil {
+		progress = cb[0]
+	}
+
+	steps := []func() error{
+		func() error {
+			if c.types != nil {
+				c.types.close()
+				log.Infof("Type Cache closed")
+			}
+			return nil
+		},
+		func() error {
+			if c.indexes != nil {
+				c.indexes.Close()
+			}
+			return nil
+		},
+		func() error {
+			if c.instructions != nil {
+				if err := c.instructions.Close(progress); err != nil {
+					return err
+				}
+				log.Infof("Instruction cache closed")
+			}
+			return nil
+		},
+		func() error {
+			if c.sources != nil {
+				c.sources.Close()
+			}
+			return nil
+		},
+		func() error {
+			if c.program != nil && c.instructions != nil {
+				stats := c.instructions.Stats()
+				log.Debugf("[ssa-ir-cache-saver] program=%s %s", c.program.GetProgramName(), stats)
+			}
+			return nil
+		},
+	}
+	return c.diagnosticsTrackErr("ssa.ProgramCache.SaveToDatabase", steps...)
+}
+
+func (c *ProgramCache) CountInstruction() int {
+	if c == nil || c.instructions == nil {
+		return 0
+	}
+	return c.instructions.Count()
+}
+
+func (c *ProgramCache) CoolDownFunctionInstructions(function *Function) {
+	if c == nil || c.instructions == nil || !c.HaveDatabaseBackend() || c.program == nil || c.program.DatabaseKind != ProgramCacheDBWrite {
+		return
+	}
+	c.instructions.TrackFunctionFinish(function)
+}
+
+func (c *ProgramCache) rememberType(typ Type) {
+	if c == nil || c.types == nil || utils.IsNil(typ) {
+		return
+	}
+	c.types.remember(typ)
+}
+
+func (c *ProgramCache) getType(id int64) (Type, bool) {
+	if c == nil || c.types == nil {
+		return nil, false
+	}
+	return c.types.get(id)
+}
+
+func (c *ProgramCache) residentType(id int64) (Type, bool) {
+	if c == nil || c.types == nil || c.types.resident == nil {
+		return nil, false
+	}
+	return c.types.resident.Get(id)
+}
+
+func (c *ProgramCache) coolDownInstructions(ids []int64, ttl time.Duration) {
+	if c == nil || c.instructions == nil {
+		return
+	}
+	c.instructions.CoolDown(ids, ttl)
+}
+
+func (c *ProgramCache) deleteInstructionByID(id int64) {
+	if c == nil || c.instructions == nil {
+		return
+	}
+	c.instructions.Delete(id)
+}
+
+func (c *ProgramCache) residentInstructions() map[int64]Instruction {
+	if c == nil || c.instructions == nil {
+		return nil
+	}
+	return c.instructions.GetAllResident()
+}
+
+func (c *ProgramCache) hasResidentInstruction(id int64) bool {
+	if id <= 0 {
+		return false
+	}
+	_, ok := c.residentInstructions()[id]
+	return ok
+}
+
+func (c *ProgramCache) findByVariableEx(mod ssadb.MatchMode, checkValue func(string) bool) []Instruction {
+	if c == nil || c.indexes == nil {
+		return nil
+	}
+	return c.indexes.FindByVariableEx(mod, checkValue, c.GetInstruction)
+}
+
+// setAtomicMaxIfGreater updates the atomic counter only when the new value is
+// larger than the current one.
+func setAtomicMaxIfGreater(counter *atomic.Int64, value int64) {
+	if counter == nil {
+		return
+	}
+	for {
+		current := counter.Load()
+		if value <= current {
+			return
+		}
+		if counter.CAS(current, value) {
+			return
+		}
+	}
+}
+
+func normalizeVariableName(name string) (normalized, member string) {
+	if strings.HasPrefix(name, "#") {
 		if _, memberName, ok := strings.Cut(name, "."); ok {
 			member = memberName
 		}
-
 		if _, memberKey, ok := strings.Cut(name, "["); ok {
 			member, _ = strings.CutSuffix(memberKey, "]")
 		}
@@ -190,86 +301,5 @@ func (c *ProgramCache) RemoveVariable(name string, inst Instruction) {
 	if len(name) > 1 {
 		name = strings.TrimPrefix(name, "$")
 	}
-	if member != "" {
-		c.MemberIndex.Delete(member, inst)
-	} else {
-		c.VariableIndex.Delete(name, inst)
-	}
-}
-
-func (c *ProgramCache) AddClassInstance(name string, inst Instruction) {
-	c.ClassIndex.Add(name, inst)
-}
-
-// =============================================== Database =======================================================
-// only LazyInstruction and false marshal will not be saved to database
-
-func (c *ProgramCache) SaveToDatabase(cb ...func(int)) {
-	if !c.HaveDatabaseBackend() {
-		return
-	}
-	if len(cb) > 0 {
-		c.afterSaveNotify = cb[0]
-	}
-	f1 := func() error {
-		c.InstructionCache.Close()
-		log.Infof("Instruction cache closed")
-		return nil
-	}
-	f2 := func() error {
-		c.TypeCache.Close()
-		log.Infof("Type Cache closed")
-		return nil
-	}
-	f3 := func() error {
-		return nil
-	}
-	f4 := func() error {
-		c.VariableIndex.Close()
-		return nil
-	}
-	f5 := func() error {
-		c.MemberIndex.Close()
-		return nil
-	}
-	f6 := func() error {
-		c.ClassIndex.Close()
-		return nil
-	}
-	f7 := func() error {
-		c.ConstCache.Close()
-		return nil
-	}
-	f8 := func() error {
-		c.offsetCache.Close()
-		c.editorCache.Close()
-		c.indexCache.Close()
-		return nil
-	}
-	f9 := func() error {
-		c.cacheCtxCancel()
-		return nil
-	}
-	steps := []func() error{f1, f2, f3, f4, f5, f6, f7, f8, f9}
-	c.diagnosticsTrack("ssa.ProgramCache.SaveToDatabase", steps...)
-}
-
-func (c *ProgramCache) CountInstruction() int {
-	return c.InstructionCache.Count()
-}
-
-func (c *ProgramCache) IsExistedSourceCodeHash(programName string, hashString string) bool {
-	if programName == "" || !c.HaveDatabaseBackend() {
-		return false
-	}
-
-	var count int
-	if ret := c.DB.Model(&ssadb.IrCode{}).Where(
-		"source_code_hash = ?", hashString,
-	).Where(
-		"program_name = ?", programName,
-	).Count(&count).Error; ret != nil {
-		log.Warnf("IsExistedSourceCodeHash error: %v", ret)
-	}
-	return count > 0
+	return name, member
 }

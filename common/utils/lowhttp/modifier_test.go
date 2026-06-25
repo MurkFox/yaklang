@@ -256,6 +256,15 @@ HOST: www.example.com`,
 			whites:      []string{"HOST: new.example.com"},
 			expectKeyIn: "HOST",
 		},
+		{
+			packet: `GET / HTTP/1.1
+ Host : www.example.com`,
+			key:         "Host",
+			value:       "new.example.com",
+			black:       "www.example.com",
+			whites:      []string{"Host: new.example.com"},
+			expectKeyIn: "Host",
+		},
 	}
 
 	for _, c := range testcases {
@@ -276,6 +285,14 @@ HOST: www.example.com`,
 			}
 		}
 	}
+
+	t.Run("replace header with extra whitespace without appending", func(t *testing.T) {
+		packet := []byte("GET / HTTP/1.1\r\n Host : example.com\r\n\r\n")
+		result := ReplaceHTTPPacketHeader(packet, "Host", "new.example.com")
+
+		require.Equal(t, 1, strings.Count(string(result), "Host: new.example.com"))
+		require.NotContains(t, string(result), " Host : example.com")
+	})
 }
 
 func TestDeleteHTTPPacketHeader(t *testing.T) {
@@ -1517,6 +1534,16 @@ Host: www.baidu.com
 Host: www.baidu.com
 `,
 		},
+		{
+			origin: `GET /user/id-b64-json?c=index&c=index2 HTTP/1.1
+Host: 127.0.0.1:8787
+`,
+			key:   "c",
+			value: "value",
+			expected: `GET /user/id-b64-json?c=value&c=value HTTP/1.1
+Host: 127.0.0.1:8787
+`,
+		},
 	}
 	for _, testcase := range testcases {
 		actual := ReplaceHTTPPacketQueryParam([]byte(testcase.origin), testcase.key, testcase.value)
@@ -1542,6 +1569,16 @@ Host: www.baidu.com
 			value: "%26",
 			expected: `GET /?a=%26&b=2 HTTP/1.1
 Host: www.baidu.com
+`,
+		},
+		{
+			origin: `GET /user/id-b64-json?c=index&c=index2 HTTP/1.1
+Host: 127.0.0.1:8787
+`,
+			key:   "c",
+			value: "%26",
+			expected: `GET /user/id-b64-json?c=%26&c=%26 HTTP/1.1
+Host: 127.0.0.1:8787
 `,
 		},
 	}
@@ -1729,6 +1766,17 @@ a=1&b=2%3D`,
 			value:      "3=",
 			whitelists: []string{"\r\n\r\na=3%3D&b=2", "Content-Type: application/x-www-form-urlencoded"},
 			blacklists: []string{"a=1", "%25"},
+		},
+		{
+			origin: `POST /submit HTTP/1.1
+Host: 127.0.0.1:8787
+Content-Type: application/x-www-form-urlencoded
+
+c=index&c=index2`,
+			key:        "c",
+			value:      "value",
+			whitelists: []string{"\r\n\r\nc=value&c=value", "Content-Type: application/x-www-form-urlencoded"},
+			blacklists: []string{"c=index", "c=index2"},
 		},
 	}
 	for _, testcase := range testcases {

@@ -49,6 +49,10 @@ type AIAgentRuntime struct {
 	// RecentToolsCache stores JSON-serialized recently-used tool entries for directly_call_tool.
 	// Persisted per persistent_session so that tools used in one conversation are available in the next.
 	RecentToolsCache string `json:"recent_tools_cache"`
+
+	// QuotedEvidence stores session-level evidence as quoted JSON (EvidenceStore).
+	// Persisted per persistent_session so that observations survive across loops and conversations.
+	QuotedEvidence string `json:"quoted_evidence"`
 }
 
 type AIAgentUserInputRecord struct {
@@ -66,6 +70,13 @@ func (a *AIAgentRuntime) GetTimeline() string {
 		return a.QuotedTimeline
 	}
 	return result
+}
+
+func (a *AIAgentRuntime) GetEvidence() string {
+	if a == nil {
+		return ""
+	}
+	return strings.TrimSpace(string(codec.StrConvUnquoteForce(a.QuotedEvidence)))
 }
 
 func (a *AIAgentRuntime) GetUserInputHistory() []AIAgentUserInputRecord {
@@ -181,182 +192,6 @@ func (c *AiCheckpoint) BeforeSave() error {
 	}
 
 	return nil
-}
-
-type AiProvider struct {
-	gorm.Model
-
-	WrapperName  string `json:"wrapper_name" gorm:"index"`
-	ModelName    string `json:"model_name" gorm:"index"`
-	TypeName     string `json:"type_name" gorm:"index"`
-	DomainOrURL  string `json:"domain_or_url" gorm:"index"`
-	APIKey       string `json:"api_key" gorm:"index"`
-	NoHTTPS      bool   `json:"no_https"`
-	ProviderMode        string `json:"provider_mode" gorm:"default:'chat'"` // Provider 模式: "chat" 或 "embedding"
-	OptionalAllowReason string `json:"optional_allow_reason" gorm:"default:''"`
-
-	// 可用性指标
-	SuccessCount  int64 `json:"success_count"`  // 成功请求总数
-	FailureCount  int64 `json:"failure_count"`  // 失败请求总数
-	TotalRequests int64 `json:"total_requests"` // 总请求数
-
-	// 最后一次请求信息
-	LastRequestTime   time.Time `json:"last_request_time"`   // 最后一次请求时间
-	LastRequestStatus bool      `json:"last_request_status"` // 最后一次请求状态 (true=成功, false=失败)
-	LastLatency       int64     `json:"last_latency"`        // 最后一次请求延迟 (毫秒)
-
-	// 健康状态
-	IsHealthy             bool      `json:"is_healthy"`                                    // 提供者是否健康
-	HealthCheckTime       time.Time `json:"health_check_time"`                             // 最后一次健康检查时间
-	IsFirstCheckCompleted bool      `json:"is_first_check_completed" gorm:"default:false"` // 首次健康检查是否完成
-}
-
-type AiApiKeys struct {
-	gorm.Model
-	APIKey        string    `json:"api_key" gorm:"index"`
-	AllowedModels string    `json:"allowed_models"`
-	InputBytes    int64     `json:"input_bytes"`                // 输入字节数统计
-	OutputBytes   int64     `json:"output_bytes"`               // 输出字节数统计
-	UsageCount    int64     `json:"usage_count"`                // 使用次数统计
-	SuccessCount  int64     `json:"success_count"`              // 成功请求数
-	FailureCount  int64     `json:"failure_count"`              // 失败请求数
-	LastUsedTime  time.Time `json:"last_used_time"`             // 上次使用时间
-	Active        bool      `json:"active" gorm:"default:true"` // API Key 激活状态
-
-	// Web Search 使用统计
-	WebSearchCount int64 `json:"web_search_count" gorm:"default:0"` // Web Search 使用次数
-
-	// 流量限制相关字段
-	TrafficLimit       int64 `json:"traffic_limit" gorm:"default:0"`            // 流量限额(字节)，0表示不限制
-	TrafficUsed        int64 `json:"traffic_used" gorm:"default:0"`             // 已使用流量(经倍数计算后)
-	TrafficLimitEnable bool  `json:"traffic_limit_enable" gorm:"default:false"` // 是否启用流量限制
-
-	// Creator tracking (for OPS user audit)
-	CreatedByOpsID   uint   `json:"created_by_ops_id" gorm:"index"`  // Creator OpsUser.ID (0 means admin created)
-	CreatedByOpsName string `json:"created_by_ops_name" gorm:"index"` // Creator username
-}
-
-type LoginSession struct {
-	gorm.Model
-
-	SessionID string    `json:"session_id" gorm:"index"`
-	ExpiresAt time.Time `json:"expires_at"`
-
-	// User information for role-based access control
-	UserID   uint   `json:"user_id" gorm:"index"`          // Associated user ID (0 for root admin)
-	Username string `json:"username" gorm:"index"`         // Username for quick access
-	UserRole string `json:"user_role" gorm:"default:'admin'"` // User role: admin/ops
-}
-
-// OpsUser represents an operations user
-type OpsUser struct {
-	gorm.Model
-
-	Username     string `json:"username" gorm:"unique_index"`      // Username
-	Password     string `json:"password"`                          // Password (bcrypt encrypted)
-	OpsKey       string `json:"ops_key" gorm:"unique_index"`       // ops-{uuid} format key for API access
-	Role         string `json:"role" gorm:"default:'ops'"`         // Role: admin/ops
-	Active       bool   `json:"active" gorm:"default:true"`        // Whether the user is active
-	DefaultLimit int64  `json:"default_limit" gorm:"default:52428800"` // Default traffic limit (50MB)
-}
-
-// OpsActionLog records operations user actions
-type OpsActionLog struct {
-	gorm.Model
-
-	OperatorID   uint   `json:"operator_id" gorm:"index"`   // Operator user ID
-	OperatorName string `json:"operator_name" gorm:"index"` // Operator username
-	Action       string `json:"action" gorm:"index"`        // Action type: create_api_key, reset_ops_key, change_password
-	TargetType   string `json:"target_type"`                // Target type: api_key, ops_user
-	TargetID     string `json:"target_id"`                  // Target ID
-	Detail       string `json:"detail" gorm:"type:text"`    // Action detail (JSON)
-	IPAddress    string `json:"ip_address"`                 // Client IP address
-}
-
-// WebSearchConfig stores global configuration for web search (singleton row, ID=1)
-type WebSearchConfig struct {
-	gorm.Model
-
-	Proxy                  string `json:"proxy"`                      // Global proxy for all web search requests
-	AllowFreeUserWebSearch bool   `json:"allow_free_user_web_search"` // Allow free users (Trace-ID only, no API key) to use web-search
-	TotalWebSearchRequests int64  `json:"total_web_search_requests"`  // Persistent cumulative web-search request count (survives restarts)
-}
-
-func (w *WebSearchConfig) TableName() string {
-	return "web_search_configs"
-}
-
-// WebSearchApiKey stores API keys for web search providers (Brave, Tavily, ChatGLM, Bocha, Unifuncs)
-type WebSearchApiKey struct {
-	gorm.Model
-
-	SearcherType string `json:"searcher_type" gorm:"index"` // "brave", "tavily", "chatglm", "bocha" or "unifuncs"
-	APIKey       string `json:"api_key"`
-	BaseURL      string `json:"base_url"`                     // Optional custom base URL
-	Proxy        string `json:"proxy"`                        // Optional proxy
-	Active       bool   `json:"active" gorm:"default:true"`   // Whether the key is active
-
-	// Statistics
-	SuccessCount         int64     `json:"success_count"`
-	FailureCount         int64     `json:"failure_count"`
-	ConsecutiveFailures  int64     `json:"consecutive_failures"`  // Reset to 0 on success, incremented on failure
-	TotalRequests        int64     `json:"total_requests"`
-	LastUsedTime         time.Time `json:"last_used_time"`
-	LastLatency          int64     `json:"last_latency"` // Milliseconds
-	IsHealthy            bool      `json:"is_healthy" gorm:"default:true"`
-}
-
-// AmapConfig stores global configuration for Amap API proxy (singleton row, ID=1)
-type AmapConfig struct {
-	gorm.Model
-
-	AllowFreeUserAmap  bool  `json:"allow_free_user_amap"`  // Allow free users (TOTP only) to use amap proxy
-	TotalAmapRequests  int64 `json:"total_amap_requests"`   // Persistent cumulative amap request count (survives restarts)
-}
-
-func (a *AmapConfig) TableName() string {
-	return "amap_configs"
-}
-
-// AmapApiKey stores API keys for Amap (Gaode Maps) API proxy
-type AmapApiKey struct {
-	gorm.Model
-
-	APIKey string `json:"api_key"`
-	Active bool   `json:"active" gorm:"default:true"` // Whether the key is active
-
-	// Health check
-	IsHealthy       bool      `json:"is_healthy" gorm:"default:true"`
-	HealthCheckTime time.Time `json:"health_check_time"` // Last health check time
-	LastCheckError  string    `json:"last_check_error"`  // Last check error message, empty means success
-
-	// Statistics
-	SuccessCount        int64     `json:"success_count"`
-	FailureCount        int64     `json:"failure_count"`
-	ConsecutiveFailures int64     `json:"consecutive_failures"` // Reset to 0 on success, incremented on failure
-	TotalRequests       int64     `json:"total_requests"`
-	LastUsedTime        time.Time `json:"last_used_time"`
-	LastLatency         int64     `json:"last_latency"` // Milliseconds
-}
-
-func (a *AmapApiKey) TableName() string {
-	return "amap_api_keys"
-}
-
-// AiProviderHealthRecord stores historical health check results for uptime tracking
-type AiProviderHealthRecord struct {
-	gorm.Model
-
-	ProviderID  uint      `json:"provider_id" gorm:"index"`
-	WrapperName string    `json:"wrapper_name" gorm:"index"`
-	IsHealthy   bool      `json:"is_healthy"`
-	LatencyMs   int64     `json:"latency_ms"`
-	CheckTime   time.Time `json:"check_time" gorm:"index"`
-	ErrorMessage string   `json:"error_message" gorm:"type:text"`
-}
-
-func (a *AiProviderHealthRecord) TableName() string {
-	return "ai_provider_health_records"
 }
 
 // AIMemoryEntity 存储AI记忆条目

@@ -11,6 +11,33 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 )
 
+// LoopVarCodeLineBase is the loop variable storing the 0-based offset between full_code line
+// indices and absolute editor file line numbers when full_code is a selection snippet.
+const LoopVarCodeLineBase = "code_line_base"
+
+// NormalizeActionLineNumber maps AI-supplied line numbers onto full_code indices.
+// When code_line_base > 0, the model may pass absolute file line numbers (e.g. 28) while
+// full_code only holds a selection; convert to 1-based indices inside full_code (e.g. 1).
+func NormalizeActionLineNumber(loop *reactloops.ReActLoop, fullCodeVar string, line int) int {
+	if loop == nil || line <= 0 {
+		return line
+	}
+	base := loop.GetInt(LoopVarCodeLineBase)
+	if base <= 0 {
+		return line
+	}
+	relative := line - base
+	if relative < 1 {
+		return line
+	}
+	fullCode := loop.Get(fullCodeVar)
+	lineCount := len(utils.ParseStringToRawLines(fullCode))
+	if relative <= lineCount {
+		return relative
+	}
+	return line
+}
+
 // FileChangedCallback is called after file content is modified
 // Returns: (errorMessage string, hasBlockingErrors bool)
 type FileChangedCallback func(content string, operator *reactloops.LoopActionHandlerOperator) (string, bool)
@@ -45,7 +72,9 @@ type SingleFileModificationSuiteFactory struct {
 	eventType string
 
 	// Behavior flags
-	exitAfterWrite bool // whether to call operator.Exit() after successful write (default: true)
+	exitAfterWrite      bool // whether to call operator.Exit() after successful write (default: true)
+	exitWhenSyntaxClean bool // whether to call operator.Exit() after modify/insert/delete when syntax check passes
+	deferDiskWrite      bool // keep code in loop memory only; frontend writes disk after user accepts diff
 }
 
 // SingleFileModificationOption is an option for configuring the factory
@@ -54,13 +83,13 @@ type SingleFileModificationOption func(*SingleFileModificationSuiteFactory)
 // NewSingleFileModificationSuiteFactory creates a new factory with the given options
 func NewSingleFileModificationSuiteFactory(runtime aicommon.AIInvokeRuntime, opts ...SingleFileModificationOption) *SingleFileModificationSuiteFactory {
 	f := &SingleFileModificationSuiteFactory{
-		prefix:        "content",
-		actionSuffix:  "content", // default suffix: write_content, modify_content, etc.
-		fileExtension: ".txt",
-		aiTagName:     "GEN_CONTENT",
-		aiTagVariable: "content",
-		aiNodeId:      "content",
-		contentType:   "text/plain",
+		prefix:         "content",
+		actionSuffix:   "content", // default suffix: write_content, modify_content, etc.
+		fileExtension:  ".txt",
+		aiTagName:      "GEN_CONTENT",
+		aiTagVariable:  "content",
+		aiNodeId:       "content",
+		contentType:    "text/plain",
 		eventType:      "yaklang_code_editor",
 		exitAfterWrite: true,
 		runtime:        runtime,
@@ -157,6 +186,48 @@ func WithExitAfterWrite(exit bool) SingleFileModificationOption {
 // ShouldExitAfterWrite returns whether the loop should exit after a successful write action
 func (f *SingleFileModificationSuiteFactory) ShouldExitAfterWrite() bool {
 	return f.exitAfterWrite
+}
+
+// WithExitWhenSyntaxClean controls whether modify/insert/delete should exit the loop
+// once OnFileChanged reports no blocking syntax errors (e.g. Yak Runner static analysis).
+func WithExitWhenSyntaxClean(exit bool) SingleFileModificationOption {
+	return func(f *SingleFileModificationSuiteFactory) {
+		f.exitWhenSyntaxClean = exit
+	}
+}
+
+func (f *SingleFileModificationSuiteFactory) ShouldExitWhenSyntaxClean() bool {
+	return f.exitWhenSyntaxClean
+}
+
+// WithDeferDiskWrite skips os.WriteFile in write/modify/insert/delete actions.
+// Loop state and yaklang_code_change events still update; the frontend applies to disk after review.
+func WithDeferDiskWrite(deferWrite bool) SingleFileModificationOption {
+	return func(f *SingleFileModificationSuiteFactory) {
+		f.deferDiskWrite = deferWrite
+	}
+}
+
+func (f *SingleFileModificationSuiteFactory) ShouldDeferDiskWrite() bool {
+	return f.deferDiskWrite
+}
+
+func (f *SingleFileModificationSuiteFactory) applySyntaxLintResult(
+	loop *reactloops.ReActLoop,
+	op *reactloops.LoopActionHandlerOperator,
+	hasBlockingErrors bool,
+	exitOnClean bool,
+) {
+	lintStatusVar := f.GetLintStatusVariableName()
+	if hasBlockingErrors {
+		loop.Set(lintStatusVar, "false")
+		op.DisallowNextLoopExit()
+		return
+	}
+	loop.Set(lintStatusVar, "true")
+	if exitOnClean {
+		op.Exit()
+	}
 }
 
 // GetAITagOption returns the ReActLoopOption for configuring AI tag extraction

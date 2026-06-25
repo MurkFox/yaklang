@@ -3,11 +3,8 @@ package yaklangcodetests
 import (
 	"bytes"
 	"fmt"
-	"os"
-	"regexp"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/segmentio/ksuid"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
@@ -18,7 +15,7 @@ import (
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
-func mockedYaklangWritingAndModifyCauseError(i aicommon.AICallerConfigIf, req *aicommon.AIRequest, code string, stat *mockStats_forWriteAndModify) (*aicommon.AIResponse, error) {
+func mockedYaklangWritingAndModifyCauseError(t *testing.T, i aicommon.AICallerConfigIf, req *aicommon.AIRequest, code string, stat *mockStats_forWriteAndModify) (*aicommon.AIResponse, error) {
 	prompt := req.GetPrompt()
 
 	if utils.MatchAllOfSubString(prompt, "analyze-requirement-and-search", "create_new_file") {
@@ -65,12 +62,7 @@ func mockedYaklangWritingAndModifyCauseError(i aicommon.AICallerConfigIf, req *a
 	}
 
 	if utils.MatchAllOfSubString(prompt, `"grep_yaklang_samples"`, `"require_tool"`, `"write_code"`, `"@action"`) {
-		re := regexp.MustCompile(`<\|GEN_CODE_([^|]+)\|>`)
-		matches := re.FindStringSubmatch(prompt)
-		var nonceStr string
-		if len(matches) > 1 {
-			nonceStr = matches[1]
-		}
+		nonceStr := aicommon.MustExtractDynamicSectionNonce(t, prompt)
 		rsp := i.NewAIResponse()
 		if !stat.writeDone {
 			rsp.EmitOutputStream(bytes.NewBufferString(utils.MustRenderTemplate(`{"@action": "write_code"}
@@ -92,6 +84,7 @@ println("modifiedcodecodecode")
 <|GEN_CODE_END_{{ .nonce }}|>`, map[string]any{
 				"nonce": nonceStr,
 			})))
+			stat.modifyDone = true
 		}
 
 		rsp.Close()
@@ -113,7 +106,7 @@ func TestFocusMode_WriteYaklangCodeCauseErrorAndThenModify(t *testing.T) {
 	flag := ksuid.New().String()
 	_ = flag
 	in := make(chan *ypb.AIInputEvent, 10)
-	out := make(chan *ypb.AIOutputEvent, 10)
+	out := make(chan *ypb.AIOutputEvent, 100)
 
 	var haveError bool
 
@@ -128,7 +121,7 @@ func TestFocusMode_WriteYaklangCodeCauseErrorAndThenModify(t *testing.T) {
 					haveError = true
 				}
 			}
-			return mockedYaklangWritingAndModifyCauseError(i, r, "demo", stat)
+			return mockedYaklangWritingAndModifyCauseError(t, i, r, "demo", stat)
 		}),
 		aicommon.WithEventInputChan(in),
 		aicommon.WithEventHandler(func(e *schema.AiOutputEvent) {
@@ -147,56 +140,34 @@ func TestFocusMode_WriteYaklangCodeCauseErrorAndThenModify(t *testing.T) {
 		}
 	}()
 
-	du := time.Duration(3)
-	if utils.InGithubActions() {
-		du = time.Duration(2)
-	}
-	after := time.After(du * time.Second)
-
-	var filenames []string
-LOOP:
-	for {
-		select {
-		case e := <-out:
-			if e.Type == string(schema.EVENT_TYPE_FILESYSTEM_PIN_FILENAME) {
-				content := string(e.GetContent())
-				filenames = append(filenames, utils.InterfaceToString(jsonpath.FindFirst(content, "$.path")))
-			}
-			if e.Type == string(schema.EVENT_TYPE_YAKLANG_CODE_EDITOR) {
-				if e.GetNodeId() == "modify_code" {
-					break LOOP
-				}
-			}
-		case <-after:
-			break LOOP
-		}
-	}
+	// Syntax-error scenario may never finish the loop; wait for deferred yaklang_code_change instead of disk.
+	waitResult := waitForYaklangDeferredEditorSync(out, focusModeWriteYaklangTestTimeout())
 	close(in)
+	ins.Wait()
 
-	var filename string
-	for _, name := range filenames {
-		if strings.Contains(name, "gen_code_") {
-			filename = name
-			break
+	if !stat.modifyDone {
+		t.Fatal("mock modify_code was not invoked before timeout")
+	}
+
+	if len(waitResult.codeChangeEvents) > 0 {
+		lastChange := waitResult.codeChangeEvents[len(waitResult.codeChangeEvents)-1]
+		op := utils.InterfaceToString(jsonpath.FindFirst(string(lastChange.GetContent()), "$.op"))
+		if op != "create" {
+			t.Fatalf("preview mode deferred yaklang_code_change should use op create, got %q", op)
+		}
+		finalContent := utils.InterfaceToString(jsonpath.FindFirst(string(lastChange.GetContent()), "$.code.content"))
+		if !strings.Contains(finalContent, "modifiedcodecodecode") {
+			t.Fatalf("deferred yaklang_code_change content mismatch: %q", finalContent)
 		}
 	}
-	if filename == "" {
-		t.Fatal("gen_code_ filename not found")
-	}
+
+	_ = assertPreviewGenCodeArtifactPath(t, waitResult.filenames, waitResult.codeChangeEvents)
 
 	fmt.Println("--------------------------------------")
 	tl := ins.DumpTimeline()
 	fmt.Println(tl)
 	fmt.Println("--------------------------------------")
 
-	result, err := os.ReadFile(filename)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fmt.Println(string(result))
-	if !strings.Contains(string(result), "modifiedcodecodecode") {
-		t.Fatal("modified code not match")
-	}
 	if !haveError {
 		t.Fatal("should have error, but not found, maybe the write_code then check syntax not work?")
 	}

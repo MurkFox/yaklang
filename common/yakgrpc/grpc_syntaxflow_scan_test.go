@@ -3,7 +3,9 @@ package yakgrpc_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -41,6 +43,12 @@ type GRPCBasicScanTestConfig struct {
 	UseDuplexConnection   bool               // 是否使用双工连接
 	Language              ssaconfig.Language // 编译语言
 	ProgramFileSystem     map[string]string  // 程序文件系统（如果为空则使用默认）
+}
+
+type grpcBasicScanNotificationResult struct {
+	matchTaskID bool
+	matchRisk   bool
+	err         error
 }
 
 // checkGRPCBasicScanTest 统一的基础扫描测试检查函数
@@ -86,11 +94,17 @@ func checkGRPCBasicScanTest(t *testing.T, client ypb.YakClient, config GRPCBasic
 
 	// 设置双工连接（如果需要）
 	var notify ypb.Yak_DuplexConnectionClient
+	var notifyDone chan grpcBasicScanNotificationResult
+	var notifyCancel context.CancelFunc
 	var notifyErr error
 	if config.UseDuplexConnection {
 		log.Infof("[checkGRPCBasicScanTest] Step 2: Setting up duplex connection")
-		notify, notifyErr = client.DuplexConnection(ctx)
+		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		notifyCancel = cancel
+		defer notifyCancel()
+		notify, notifyErr = client.DuplexConnection(notifyCtx)
 		require.NoError(t, notifyErr, "[checkGRPCBasicScanTest] Failed to create duplex connection")
+		notifyDone = make(chan grpcBasicScanNotificationResult, 1)
 	}
 
 	// 启动扫描
@@ -108,6 +122,11 @@ func checkGRPCBasicScanTest(t *testing.T, client ypb.YakClient, config GRPCBasic
 	if config.UseDuplexConnection && notify != nil {
 		log.Infof("[checkGRPCBasicScanTest] Step 4: Setting up notification handler")
 		go func() {
+			result := grpcBasicScanNotificationResult{}
+			defer func() {
+				notifyDone <- result
+			}()
+
 			for {
 				res, err := notify.Recv()
 				if err != nil {
@@ -116,27 +135,42 @@ func checkGRPCBasicScanTest(t *testing.T, client ypb.YakClient, config GRPCBasic
 						return
 					}
 					log.Errorf("[checkGRPCBasicScanTest] Notification recv error: %v", err)
+					result.err = fmt.Errorf("[checkGRPCBasicScanTest] notification recv error: %w", err)
 					return
 				}
 				log.Infof("[checkGRPCBasicScanTest] Received notification: MessageType=%v", res.MessageType)
 				if res.MessageType == ssadb.ServerPushType_SyntaxflowResult {
 					var tmp map[string]string
 					err = json.Unmarshal(res.GetData(), &tmp)
-					require.NoError(t, err, "[checkGRPCBasicScanTest] Failed to unmarshal notification data")
+					if err != nil {
+						result.err = fmt.Errorf("[checkGRPCBasicScanTest] failed to unmarshal notification data: %w", err)
+						return
+					}
 					log.Infof("[checkGRPCBasicScanTest] Notification taskid: %#v", tmp)
 					if tmp["task_id"] == taskID {
-						matchTaskID = true
+						result.matchTaskID = true
 						log.Infof("[checkGRPCBasicScanTest] Task ID matched in notification")
-						res, err := client.QuerySyntaxFlowResult(ctx, &ypb.QuerySyntaxFlowResultRequest{
+						resultResp, err := client.QuerySyntaxFlowResult(context.Background(), &ypb.QuerySyntaxFlowResultRequest{
 							Filter: &ypb.SyntaxFlowResultFilter{
 								TaskIDs: []string{taskID},
 							},
 						})
-						require.NoError(t, err, "[checkGRPCBasicScanTest] Failed to query syntax flow result")
+						if err != nil {
+							result.err = fmt.Errorf("[checkGRPCBasicScanTest] failed to query syntax flow result: %w", err)
+							return
+						}
 						if config.ExpectedResultCount > 0 {
-							require.Greater(t, len(res.Results), 0, "[checkGRPCBasicScanTest] Should have at least one result")
-							if config.ExpectedResultKind != "" {
-								require.Equal(t, res.Results[0].Kind, config.ExpectedResultKind, "[checkGRPCBasicScanTest] Result kind mismatch")
+							if len(resultResp.Results) == 0 {
+								result.err = fmt.Errorf("[checkGRPCBasicScanTest] should have at least one result for task %s", taskID)
+								return
+							}
+							if config.ExpectedResultKind != "" && resultResp.Results[0].Kind != config.ExpectedResultKind {
+								result.err = fmt.Errorf(
+									"[checkGRPCBasicScanTest] result kind mismatch: got %q want %q",
+									resultResp.Results[0].Kind,
+									config.ExpectedResultKind,
+								)
+								return
 							}
 						}
 					}
@@ -144,12 +178,19 @@ func checkGRPCBasicScanTest(t *testing.T, client ypb.YakClient, config GRPCBasic
 				if res.MessageType == schema.ServerPushType_SSARisk {
 					var tmp map[string]string
 					err = json.Unmarshal(res.GetData(), &tmp)
-					require.NoError(t, err, "[checkGRPCBasicScanTest] Failed to unmarshal risk notification data")
+					if err != nil {
+						result.err = fmt.Errorf("[checkGRPCBasicScanTest] failed to unmarshal risk notification data: %w", err)
+						return
+					}
 					log.Infof("[checkGRPCBasicScanTest] Risk notification taskid: %#v", tmp)
 					if tmp["task_id"] == taskID {
-						matchRisk = true
+						result.matchRisk = true
 						log.Infof("[checkGRPCBasicScanTest] Risk matched in notification")
 					}
+				}
+
+				if (!config.ExpectedMatchTaskID || result.matchTaskID) && (!config.ExpectedMatchRisk || result.matchRisk) {
+					return
 				}
 			}
 		}()
@@ -182,6 +223,13 @@ func checkGRPCBasicScanTest(t *testing.T, client ypb.YakClient, config GRPCBasic
 	if config.ExpectedFinishStatus != "" {
 		require.Equal(t, config.ExpectedFinishStatus, finishStatus, "[checkGRPCBasicScanTest] Finish status mismatch")
 	}
+	if config.UseDuplexConnection && notifyDone != nil {
+		log.Infof("[checkGRPCBasicScanTest] Step 6: Waiting for notification handler")
+		notifyResult := <-notifyDone
+		require.NoError(t, notifyResult.err)
+		matchTaskID = notifyResult.matchTaskID
+		matchRisk = notifyResult.matchRisk
+	}
 	if config.ExpectedMatchTaskID {
 		require.True(t, matchTaskID, "[checkGRPCBasicScanTest] Should match task ID in notification")
 	}
@@ -199,6 +247,7 @@ type GRPCCancelScanTestConfig struct {
 	CancelAtProcess       float64            // 在哪个进度时取消（0.5 表示50%时取消）
 	ExpectedHasProcess    bool               // 是否预期有进度更新
 	ExpectedFinishProcess float64            // 预期的完成进度（应该小于1.0）
+	Concurrency           uint32             // 扫描并发度（0 表示使用默认值）
 	Language              ssaconfig.Language // 编译语言
 	ProgramFileSystem     map[string]string  // 程序文件系统
 }
@@ -221,7 +270,7 @@ func checkGRPCCancelScanTest(t *testing.T, client ypb.YakClient, config GRPCCanc
 
 	// 启动扫描
 	log.Infof("[checkGRPCCancelScanTest] Step 2: Starting scan")
-	id, stream := startScan(client, t, progID, ctx)
+	id, stream := startScanWithConcurrency(client, t, progID, ctx, config.Concurrency)
 	log.Infof("[checkGRPCCancelScanTest] Step 2: Scan started, task ID: %s", id)
 
 	// 检查扫描消息并在指定进度取消
@@ -348,6 +397,10 @@ func checkSfScanRecvMsg(t *testing.T, stream ypb.Yak_SyntaxFlowScanClient, handl
 }
 
 func startScan(client ypb.YakClient, t *testing.T, progID string, ctx context.Context, filters ...*ypb.SyntaxFlowRuleFilter) (string, ypb.Yak_SyntaxFlowScanClient) {
+	return startScanWithConcurrency(client, t, progID, ctx, 0, filters...)
+}
+
+func startScanWithConcurrency(client ypb.YakClient, t *testing.T, progID string, ctx context.Context, concurrency uint32, filters ...*ypb.SyntaxFlowRuleFilter) (string, ypb.Yak_SyntaxFlowScanClient) {
 	filter := &ypb.SyntaxFlowRuleFilter{}
 	if len(filters) > 0 {
 		filter = filters[0]
@@ -358,6 +411,7 @@ func startScan(client ypb.YakClient, t *testing.T, progID string, ctx context.Co
 	stream.Send(&ypb.SyntaxFlowScanRequest{
 		ControlMode: "start",
 		Filter:      filter,
+		Concurrency: concurrency,
 		ProgramName: []string{
 			progID,
 		},
@@ -403,6 +457,7 @@ func TestGRPCMUSTPASS_SyntaxFlow_Scan_Cancel(t *testing.T) {
 		CancelAtProcess:       0.5,
 		ExpectedHasProcess:    true,
 		ExpectedFinishProcess: 1.0,
+		Concurrency:           1,
 		Language:              ssaconfig.JAVA,
 	}
 
@@ -418,7 +473,7 @@ func TestGRPCMUSTPASS_SyntaxFlow_Scan_Cancel_Multiple(t *testing.T) {
 	defer f()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	id1, stream1 := startScan(client, t, progID, ctx)
+	id1, stream1 := startScanWithConcurrency(client, t, progID, ctx, 1)
 	id2, stream2 := startScan(client, t, progID, context.Background())
 	_ = id1
 	_ = id2
@@ -1417,6 +1472,7 @@ func checkGRPCIncrementalCompileTest(t *testing.T, client ypb.YakClient, config 
 
 	// 如果提供了 ExpectedTaskResults，使用详细验证模式
 	if len(config.ExpectedTaskResults) > 0 {
+		rsp.Data = reorderSyntaxFlowScanTasksByTaskIDs(rsp.Data, []string{taskIDBase, taskIDDiff}, true)
 		log.Infof("[checkGRPCIncrementalCompileTest] Using ExpectedTaskResults verification mode")
 		require.Equal(t, len(config.ExpectedTaskResults), len(rsp.Data),
 			"[checkGRPCIncrementalCompileTest] Expected %d tasks, got %d", len(config.ExpectedTaskResults), len(rsp.Data))
@@ -1631,6 +1687,30 @@ type TaskResultConfig struct {
 	NewRiskCount int64    // 预期新增总风险数量
 }
 
+func reorderSyntaxFlowScanTasksByTaskIDs(tasks []*ypb.SyntaxFlowScanTask, taskIDs []string, newestFirst bool) []*ypb.SyntaxFlowScanTask {
+	orderMap := make(map[string]int, len(taskIDs))
+	for i, taskID := range taskIDs {
+		orderMap[taskID] = i
+	}
+
+	reordered := append([]*ypb.SyntaxFlowScanTask(nil), tasks...)
+	sort.SliceStable(reordered, func(i, j int) bool {
+		leftOrder, leftOk := orderMap[reordered[i].TaskId]
+		rightOrder, rightOk := orderMap[reordered[j].TaskId]
+		if leftOk && rightOk {
+			if newestFirst {
+				return leftOrder > rightOrder
+			}
+			return leftOrder < rightOrder
+		}
+		if leftOk != rightOk {
+			return leftOk
+		}
+		return false
+	})
+	return reordered
+}
+
 // checkGRPCDiffProgScanTest 统一的多版本增量扫描测试检查函数
 func checkGRPCDiffProgScanTest(t *testing.T, client ypb.YakClient, config GRPCDiffProgScanTestConfig) {
 	ctx := context.Background()
@@ -1759,6 +1839,7 @@ func checkGRPCDiffProgScanTest(t *testing.T, client ypb.YakClient, config GRPCDi
 		ShowDiffRisk: true,
 	})
 	require.NoError(t, err, "[checkGRPCDiffProgScanTest] Failed to query scan task results")
+	rsp.Data = reorderSyntaxFlowScanTasksByTaskIDs(rsp.Data, taskIDs, true)
 	require.Equal(t, len(config.ExpectedTaskResults), len(rsp.Data),
 		"[checkGRPCDiffProgScanTest] Expected %d tasks, got %d", len(config.ExpectedTaskResults), len(rsp.Data))
 
@@ -1811,6 +1892,7 @@ func checkGRPCDiffProgScanTest(t *testing.T, client ypb.YakClient, config GRPCDi
 }
 
 func TestGRPCMUSTPASS_SyntaxFlow_Scan_With_DiffProg(t *testing.T) {
+	// for i := 0; i < 100; i++ {
 	client, err := yakgrpc.NewLocalClient(true)
 	require.NoError(t, err)
 
@@ -1923,4 +2005,5 @@ alert $low for {
 	t.Run(config.Name, func(t *testing.T) {
 		checkGRPCDiffProgScanTest(t, client, config)
 	})
+	// }
 }

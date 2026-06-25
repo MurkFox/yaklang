@@ -6,7 +6,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/jinzhu/gorm"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
+	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiskillloader"
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
@@ -160,13 +162,26 @@ type FastMatchResult struct {
 	// MatchedLoops contains loop metadata matched by description
 	MatchedLoops []*reactloops.LoopMetadata
 
+	// MatchedSkills contains skills explicitly matched by name mention.
+	MatchedSkills []*aiskillloader.SkillMeta
+
+	// MatchedCapabilityMentions contains exact-name capability mentions found in user input.
+	MatchedCapabilityMentions *reactloops.CapabilityNameMatchResult
+
+	// MatchedMCPTools holds MCP tool configs matched via cached metadata BM25
+	// keyword search (same pattern as MatchedTools). Populated only when MCP
+	// servers are allowed for this runtime;
+	MatchedMCPTools []*schema.MCPServerToolConfig
+
 	// ContextSummary is a pre-formatted string summarizing matched capabilities
 	ContextSummary string
 }
 
-// HasMatches returns true if any tools, forges, or loops were matched.
+// HasMatches returns true if any tools, forges, loops, or MCP tools were matched.
 func (r *FastMatchResult) HasMatches() bool {
-	return len(r.MatchedTools) > 0 || len(r.MatchedForges) > 0 || len(r.MatchedLoops) > 0
+	return len(r.MatchedTools) > 0 || len(r.MatchedForges) > 0 || len(r.MatchedLoops) > 0 ||
+		len(r.MatchedSkills) > 0 || len(r.MatchedMCPTools) > 0 ||
+		(r.MatchedCapabilityMentions != nil && r.MatchedCapabilityMentions.HasMatches())
 }
 
 // NeedsDeepAnalysis returns true when fast matching is insufficient and
@@ -242,15 +257,26 @@ func FastIntentMatch(r aicommon.AIInvokeRuntime, input string) *FastMatchResult 
 			}
 		}
 
-		forges, err := yakit.SearchAIForgeBM25(db, &yakit.AIForgeSearchFilter{
-			ForgeTypes: schema.RunnableForgeTypes(),
-			Keywords:   []string{trimmed},
-		}, 5, 0)
-		if err != nil {
-			log.Warnf("fast intent match: BM25 forge search failed: %v", err)
-		} else if len(forges) > 0 {
-			result.MatchedForges = forges
-			log.Infof("fast intent match: found %d forges via BM25 for: %s", len(forges), trimmed)
+		if reactloops.IsPlanAndExecAllowed(nil, r) {
+			forges, err := yakit.SearchAIForgeBM25(db, &yakit.AIForgeSearchFilter{
+				ForgeTypes: schema.RunnableForgeTypes(),
+				Keywords:   []string{trimmed},
+			}, 5, 0)
+			if err != nil {
+				log.Warnf("fast intent match: BM25 forge search failed: %v", err)
+			} else if len(forges) > 0 {
+				result.MatchedForges = forges
+				log.Infof("fast intent match: found %d forges via BM25 for: %s", len(forges), trimmed)
+			}
+		}
+
+		// MCP tools use a separate metadata table; skip when MCP is disabled for this runtime.
+		if reactloops.IsMCPServersAllowed(r) {
+			mcpTools := searchMCPToolsForFastIntent(db, trimmed, 5)
+			if len(mcpTools) > 0 {
+				result.MatchedMCPTools = mcpTools
+				log.Infof("fast intent match: found %d MCP tools for: %s", len(mcpTools), trimmed)
+			}
 		}
 	}
 
@@ -289,6 +315,23 @@ func FastIntentMatch(r aicommon.AIInvokeRuntime, input string) *FastMatchResult 
 	}
 
 	return result
+}
+
+// searchMCPToolsForFastIntent searches cached MCP tool metadata via BM25 keyword matching.
+func searchMCPToolsForFastIntent(db *gorm.DB, query string, limit int) []*schema.MCPServerToolConfig {
+	if db == nil || strings.TrimSpace(query) == "" {
+		return nil
+	}
+	if limit <= 0 {
+		limit = 5
+	}
+
+	mcpTools, err := yakit.SearchMCPServerToolsBM25(db, query, limit)
+	if err != nil {
+		log.Warnf("fast intent match: MCP tool BM25 search failed: %v", err)
+		return nil
+	}
+	return mcpTools
 }
 
 // containsAnyToken checks if the searchFields contain any word-level token from the input.
@@ -375,6 +418,31 @@ func buildFastMatchSummary(result *FastMatchResult) string {
 		sb.WriteString("\n")
 	}
 
+	if len(result.MatchedMCPTools) > 0 {
+		sb.WriteString("### Matched MCP Tools\n")
+		sb.WriteString("Call via `require_tool` using the full name `mcp_{server}_{tool}`.\n\n")
+		for _, t := range result.MatchedMCPTools {
+			fullName := fmt.Sprintf("mcp_%s_%s", t.ServerName, t.ToolName)
+			sb.WriteString(fmt.Sprintf("- **%s** [MCP:%s]: %s\n", fullName, t.ServerName, truncateString(t.Description, 120)))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(result.MatchedSkills) > 0 {
+		sb.WriteString("### Matched Skills\n")
+		for _, skill := range result.MatchedSkills {
+			sb.WriteString(fmt.Sprintf("- **%s**: %s\n", skill.Name, truncateString(skill.Description, 120)))
+		}
+		sb.WriteString("\n")
+	}
+
+	if result.MatchedCapabilityMentions != nil && result.MatchedCapabilityMentions.HasMatches() {
+		if section := result.MatchedCapabilityMentions.RenderYakScriptMarkdown("### Matched Yakit Plugins"); section != "" {
+			sb.WriteString(section)
+		}
+		sb.WriteString("\n\n")
+	}
+
 	return sb.String()
 }
 
@@ -398,7 +466,10 @@ func applyFastMatchResult(r aicommon.AIInvokeRuntime, loop *reactloops.ReActLoop
 	if result.IsSimpleQuery {
 		loop.Set("intent_hint", "simple_query")
 		loop.Set("intent_scale", "micro_or_small")
-		r.AddToTimeline("intent_classification", "Input classified as simple query (greeting/status). Prefer directly_answer action.")
+		r.AddToTimeline("intent_classification",
+			"Input classified as simple query (greeting/status). "+
+				"Use directly_answer once to reply to the user. "+
+				"If that reply is already in the timeline and CURRENT-TASK has no other goal, use finish — do not repeat directly_answer.")
 		log.Infof("intent classification: simple query, hint set to directly_answer")
 		return
 	}
@@ -435,6 +506,58 @@ func applyFastMatchResult(r aicommon.AIInvokeRuntime, loop *reactloops.ReActLoop
 	}
 }
 
+func applyCapabilityMatchesToFastMatchResult(result *FastMatchResult, matches *reactloops.CapabilityNameMatchResult) {
+	if result == nil || matches == nil || !matches.HasMatches() {
+		return
+	}
+
+	result.MatchedCapabilityMentions = matches
+
+	toolSeen := make(map[string]bool)
+	for _, tool := range result.MatchedTools {
+		if tool != nil {
+			toolSeen[tool.Name] = true
+		}
+	}
+	for _, tool := range matches.MatchedAITools {
+		if tool == nil || toolSeen[tool.Name] {
+			continue
+		}
+		toolSeen[tool.Name] = true
+		result.MatchedTools = append(result.MatchedTools, tool)
+	}
+
+	forgeSeen := make(map[string]bool)
+	for _, forge := range result.MatchedForges {
+		if forge != nil {
+			forgeSeen[forge.ForgeName] = true
+		}
+	}
+	for _, forge := range matches.MatchedForges {
+		if forge == nil || forgeSeen[forge.ForgeName] {
+			continue
+		}
+		forgeSeen[forge.ForgeName] = true
+		result.MatchedForges = append(result.MatchedForges, forge)
+	}
+
+	skillSeen := make(map[string]bool)
+	for _, skill := range result.MatchedSkills {
+		if skill != nil {
+			skillSeen[skill.Name] = true
+		}
+	}
+	for _, skill := range matches.MatchedSkills {
+		if skill == nil || skillSeen[skill.Name] {
+			continue
+		}
+		skillSeen[skill.Name] = true
+		result.MatchedSkills = append(result.MatchedSkills, skill)
+	}
+
+	result.ContextSummary = buildFastMatchSummary(result)
+}
+
 // populateExtraCapabilitiesFromFastMatch adds fast match results to the loop's ExtraCapabilitiesManager.
 // Fast match already has resolved objects (schema.AIYakTool, schema.AIForge, LoopMetadata),
 // so no name-to-object resolution is needed.
@@ -444,11 +567,14 @@ func populateExtraCapabilitiesFromFastMatch(r aicommon.AIInvokeRuntime, loop *re
 		return
 	}
 
+	addedToolNames := make(map[string]bool)
+
 	// Convert schema.AIYakTool to aitool.Tool and add
 	if len(result.MatchedTools) > 0 {
 		toolMgr := r.GetConfig().GetAiToolManager()
 		if toolMgr != nil {
 			for _, schTool := range result.MatchedTools {
+				addedToolNames[schTool.Name] = true
 				tool, err := toolMgr.GetToolByName(schTool.Name)
 				if err != nil {
 					log.Debugf("extra capabilities (fast): skip tool %q: %v", schTool.Name, err)
@@ -459,8 +585,60 @@ func populateExtraCapabilitiesFromFastMatch(r aicommon.AIInvokeRuntime, loop *re
 		}
 	}
 
+	if result.MatchedCapabilityMentions != nil && result.MatchedCapabilityMentions.HasMatches() {
+		toolMgr := r.GetConfig().GetAiToolManager()
+		if toolMgr != nil {
+			for _, name := range result.MatchedCapabilityMentions.ToolNames() {
+				if addedToolNames[name] {
+					continue
+				}
+				tool, err := toolMgr.GetToolByName(name)
+				if err != nil {
+					log.Debugf("extra capabilities (fast): skip yak script %q: %v", name, err)
+					continue
+				}
+				addedToolNames[name] = true
+				ecm.AddTools(tool)
+			}
+		}
+	}
+
+	if len(result.MatchedMCPTools) > 0 && reactloops.IsMCPServersAllowed(r) {
+		toolMgr := r.GetConfig().GetAiToolManager()
+		if toolMgr != nil {
+			for _, t := range result.MatchedMCPTools {
+				if t == nil {
+					continue
+				}
+				fullName := fmt.Sprintf("mcp_%s_%s", t.ServerName, t.ToolName)
+				if addedToolNames[fullName] {
+					continue
+				}
+				tool, err := toolMgr.GetToolByName(fullName)
+				if err != nil {
+					log.Debugf("extra capabilities (fast): skip MCP tool %q: %v", fullName, err)
+					continue
+				}
+				addedToolNames[fullName] = true
+				ecm.AddTools(tool)
+			}
+		}
+	}
+
+	if len(result.MatchedSkills) > 0 {
+		for _, skill := range result.MatchedSkills {
+			if skill == nil {
+				continue
+			}
+			ecm.AddSkills(reactloops.ExtraSkillInfo{
+				Name:        skill.Name,
+				Description: skill.Description,
+			})
+		}
+	}
+
 	// Add matched forges
-	if len(result.MatchedForges) > 0 {
+	if len(result.MatchedForges) > 0 && reactloops.IsPlanAndExecAllowed(loop, r) {
 		for _, forge := range result.MatchedForges {
 			ecm.AddForges(reactloops.ExtraForgeInfo{
 				Name:        forge.ForgeName,
@@ -481,8 +659,8 @@ func populateExtraCapabilitiesFromFastMatch(r aicommon.AIInvokeRuntime, loop *re
 	}
 
 	if ecm.HasCapabilities() {
-		log.Infof("extra capabilities populated from fast match: %d tools, %d forges, %d focus modes",
-			ecm.ToolCount(), len(ecm.ListForges()), len(ecm.ListFocusModes()))
+		log.Infof("extra capabilities populated from fast match: %d tools, %d forges, %d skills, %d focus modes",
+			ecm.ToolCount(), len(ecm.ListForges()), len(ecm.ListSkills()), len(ecm.ListFocusModes()))
 	}
 }
 

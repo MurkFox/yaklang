@@ -10,11 +10,19 @@ import (
 
 // Decompile 反编译一个 jar包或者 class
 // 返回值是反编译后的 java 文件路径
+// 参数:
+//   - from: 待反编译的 jar/war/class 文件路径
+//   - to: 反编译结果输出的目录或文件路径
+//
+// 返回值:
+//   - error: 反编译失败时返回错误
+//
 // Example:
 // ```
-// err = Decompile("test.jar", "test/"); die(err)
-// err = Decompile("test.war", "test/"); die(err)
-// Decompile("a.class", "a.java"); die(err)
+// // 无法本地验证: 需要磁盘上真实存在的 jar/war/class 文件(请替换为真实路径)
+// err = java.Decompile("test.jar", "test/"); die(err)   // 反编译 jar 到目录
+// err = java.Decompile("test.war", "test/"); die(err)   // 反编译 war 到目录
+// err = java.Decompile("a.class", "a.java"); die(err)   // 反编译单个 class 到文件
 // ```
 func AutoDecompile(from, to string) error {
 	// check from suffix

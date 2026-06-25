@@ -10,6 +10,7 @@ import (
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 
 	"github.com/google/uuid"
+	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/memedit"
@@ -310,6 +311,25 @@ func NewImportSSARiskManager(opts ...ImportSSARiskOption) *ImportSSARiskManager 
 	return m
 }
 
+// ImportSSARiskFromJSON 从 JSON 报告数据中导入 SSA 风险记录到数据库
+// 导出名为 sfreport.ImportSSARiskFromJSON
+// 参数:
+//   - ctx: 上下文，用于控制取消
+//   - db: 目标数据库连接
+//   - jsonData: 报告 JSON 数据（字节）
+//   - callBacks: 可选的进度回调，参数为 (message, progress)
+//
+// 返回值:
+//   - 错误信息
+//
+// Example:
+// ```
+// // 导入此前导出的 SSA 风险报告（示意性示例）
+// ctx = context.Background()
+// jsonData = file.ReadFile("ssa_report.json")~
+// err = sfreport.ImportSSARiskFromJSON(ctx, db.GetGormProjectDatabase(), jsonData)
+// if err != nil { die(err) }
+// ```
 func ImportSSARiskFromJSON(
 	ctx context.Context,
 	db *gorm.DB,
@@ -427,4 +447,53 @@ func (m *ImportSSARiskManager) importFilesFromReport(report *Report, cb func(str
 		}
 	}
 	return nil
+}
+
+// GenerateSSAReportMarkdownForTask 根据扫描任务 ID 在进程内生成 SSA 的 Markdown 报告
+// 导出名为 sfreport.GenerateSSAReportMarkdownForTask，行为对齐 gRPC 的 Yak.GenerateSSAReport
+// 参数:
+//   - taskID: SSA 扫描任务 ID
+//   - reportName: 生成的报告名称
+//
+// 返回值:
+//   - 报告记录的数据库 ID
+//   - 生成的 Markdown 报告内容
+//   - 错误信息
+//
+// Example:
+// ```
+// // 根据已完成的扫描任务生成报告（示意性示例）
+// id, markdown, err = sfreport.GenerateSSAReportMarkdownForTask("task-uuid", "my-report")
+// if err != nil { die(err) }
+// println(markdown)
+// ```
+func GenerateSSAReportMarkdownForTask(taskID, reportName string) (int, string, error) {
+	ctx := context.Background()
+	db := consts.GetGormSSAProjectDataBase()
+	if db == nil {
+		return 0, "", utils.Errorf("ssa project database is nil")
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return 0, "", utils.Errorf("task id is empty")
+	}
+	task, err := schema.GetSyntaxFlowScanTaskById(db, taskID)
+	if err != nil {
+		return 0, "", utils.Wrapf(err, "get syntax flow scan task failed")
+	}
+	ssaReport, err := GenerateSSAProjectReportFromTask(ctx, task)
+	if err != nil {
+		return 0, "", utils.Wrapf(err, "generate ssa project report failed")
+	}
+	reportInstance := yakit.NewReport()
+	reportInstance.From("ssa-scan")
+	reportInstance.Title(strings.TrimSpace(reportName))
+	if err := GenerateYakitReportContent(reportInstance, ssaReport); err != nil {
+		return 0, "", utils.Wrapf(err, "generate yakit report content failed")
+	}
+	rid := reportInstance.SaveForIRify()
+	if rid == 0 {
+		return 0, "", utils.Errorf("save report failed")
+	}
+	return rid, schema.JoinReportItemsMarkdown(reportInstance.Items), nil
 }

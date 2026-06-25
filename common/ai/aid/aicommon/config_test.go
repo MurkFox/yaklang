@@ -3,44 +3,32 @@ package aicommon
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
+	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 )
 
-func TestConfig_Smoking(t *testing.T) {
-	config := NewConfig(context.Background())
-	require.NotNil(t, config)
-	require.NotNil(t, config.OriginalAICallback)
+func init() {
+	RegisterDefaultAIForgeFactoryProvider(func() AIForgeFactory {
+		return &mockForgeFactory{forges: map[string]*schema.AIForge{}}
+	})
 }
 
-func TestConfig_AIServiceName(t *testing.T) {
-	token := uuid.NewString()
-	token2 := uuid.NewString()
-	serviceNameOk := false
-	serviceModelOk := false
-	config := NewTestConfig(context.Background(),
-		WithAIChatInfo(token, token2),
-		WithEventHandler(func(e *schema.AiOutputEvent) {
-			if e.AIService == token {
-				serviceNameOk = true
-			}
-			if e.AIModelName == token2 {
-				serviceModelOk = true
-			}
-		}),
-	)
-	config.EmitInfo("abc")
+func TestConfig_Smoking(t *testing.T) {
+	originalTiered := consts.GetTieredAIConfig()
+	consts.SetTieredAIConfig(nil)
+	t.Cleanup(func() {
+		consts.SetTieredAIConfig(originalTiered)
+	})
 
-	if serviceNameOk == false {
-		t.Fatalf("AIServiceName not set correctly")
-	}
-
-	if serviceModelOk == false {
-		t.Fatalf("AIModelName not set correctly")
-	}
+	config := NewConfig(context.Background())
+	require.NotNil(t, config)
+	require.False(t, config.AICallbackAvailable())
 }
 
 // TestConfig_WithID_SyncsEmitterId verifies that WithID also updates the Emitter's internal id
@@ -102,6 +90,53 @@ func TestConfig_ToolComposeConcurrencyPropagation(t *testing.T) {
 	require.Equal(t, 5, child.ToolComposeConcurrency)
 }
 
+func TestConfig_DefaultPlanExecTaskConcurrency(t *testing.T) {
+	config := NewConfig(context.Background())
+	require.Equal(t, 1, config.PlanExecTaskConcurrency)
+}
+
+func TestConfig_PlanExecTaskConcurrencyPropagation(t *testing.T) {
+	parent := NewConfig(context.Background(), WithPlanExecTaskConcurrency(3))
+	child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+	require.Equal(t, 3, child.PlanExecTaskConcurrency)
+}
+
+func TestConfig_IntervalReviewConfigPropagation(t *testing.T) {
+	parent := NewConfig(
+		context.Background(),
+		WithDisableToolCallerIntervalReview(true),
+		WithToolCallerIntervalReviewDuration(7*time.Second),
+		WithToolCallIntervalReviewExtraPrompt("Cancel immediately if no heartbeat appears twice."),
+	)
+	child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+
+	require.True(t, child.DisableIntervalReview)
+	require.Equal(t, 7*time.Second, child.IntervalReviewDuration)
+	require.Equal(t,
+		"Cancel immediately if no heartbeat appears twice.",
+		child.ToolCallIntervalReviewExtraPrompt,
+	)
+	require.Equal(
+		t,
+		"Cancel immediately if no heartbeat appears twice.",
+		child.GetConfigString(ConfigKeyToolCallIntervalReviewExtraPrompt),
+	)
+}
+
+func TestConfig_GenerateReportPropagation(t *testing.T) {
+	t.Run("false", func(t *testing.T) {
+		parent := NewConfig(context.Background(), WithGenerateReport(false))
+		child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+		require.False(t, child.GenerateReport)
+	})
+
+	t.Run("true", func(t *testing.T) {
+		parent := NewConfig(context.Background(), WithGenerateReport(true))
+		child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+		require.True(t, child.GenerateReport)
+	})
+}
+
 func TestConfig_ToolManagerPropagation(t *testing.T) {
 	parent := NewConfig(context.Background())
 	require.NotNil(t, parent.GetAiToolManager())
@@ -111,4 +146,115 @@ func TestConfig_ToolManagerPropagation(t *testing.T) {
 
 	require.Same(t, parent.GetAiToolManager(), child.GetAiToolManager())
 	require.True(t, child.GetAiToolManager().IsRecentlyUsedTool("now"))
+}
+
+func TestConfig_AiForgeManagerPropagation(t *testing.T) {
+	parent := NewConfig(context.Background())
+	require.NotNil(t, parent.GetAIForgeManager())
+
+	custom := &mockForgeFactory{forges: map[string]*schema.AIForge{"demo": {ForgeName: "demo"}}}
+	parent.AiForgeManager = custom
+
+	child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+	require.Same(t, custom, child.GetAIForgeManager())
+}
+
+func TestConfig_SkillLoaderPropagation(t *testing.T) {
+	parent := NewConfig(context.Background())
+	require.NotNil(t, parent.GetSkillLoader())
+
+	child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+	require.Same(t, parent.GetSkillLoader(), child.GetSkillLoader())
+}
+
+func TestConfig_SessionPromptStatePropagation(t *testing.T) {
+	parent := NewConfig(context.Background())
+	parent.SetSessionTitle("shared-title")
+	_, err := parent.AppendUserInputHistory("round-1", time.Now())
+	require.NoError(t, err)
+
+	child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+	require.Same(t, parent.GetSessionPromptState(), child.GetSessionPromptState())
+	require.Equal(t, "shared-title", child.GetSessionTitle())
+	require.Equal(t, "round-1", child.GetPrevSessionUserInput())
+
+	_, err = child.AppendUserInputHistory("round-2", time.Now())
+	require.NoError(t, err)
+
+	history := parent.GetUserInputHistory()
+	require.Len(t, history, 2)
+	require.Equal(t, "round-2", parent.GetPrevSessionUserInput())
+}
+
+func TestConfig_ConvertConfigToOptions_RebindsTimelineConfigForArchiveStore(t *testing.T) {
+	parent := NewConfig(context.Background())
+	require.NotNil(t, parent.Timeline)
+	require.Nil(t, parent.TimelineArchiveStore)
+
+	child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+	require.Same(t, parent.Timeline, child.Timeline)
+
+	store := &mockTimelineArchiveStore{}
+	child.TimelineArchiveStore = store
+
+	got := child.Timeline.timelineArchiveStore()
+	require.NotNil(t, got)
+	require.True(t, got == store)
+}
+
+func TestConfig_ConvertConfigToOptions_PropagatesTimelineArchiveStore(t *testing.T) {
+	parent := NewConfig(context.Background())
+	store := &mockTimelineArchiveStore{}
+	parent.TimelineArchiveStore = store
+
+	child := NewConfig(context.Background(), ConvertConfigToOptions(parent)...)
+
+	require.Same(t, store, child.TimelineArchiveStore)
+	got := child.Timeline.timelineArchiveStore()
+	require.NotNil(t, got)
+	require.True(t, got == store)
+}
+
+func TestConfig_CreateOrUpdateRuntimeRecord(t *testing.T) {
+	runtimeUUID := uuid.NewString()
+	config := NewConfig(context.Background(), WithID(runtimeUUID))
+	require.NoError(t, config.GetDB().AutoMigrate(&schema.AIAgentRuntime{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, config.GetDB().Unscoped().Where("uuid = ?", runtimeUUID).Delete(&schema.AIAgentRuntime{}).Error)
+	})
+
+	runtime := &schema.AIAgentRuntime{
+		Uuid: runtimeUUID,
+		Name: "config-runtime-record-test",
+	}
+	require.NoError(t, config.CreateOrUpdateRuntimeRecord(runtime))
+	require.NotZero(t, config.DatabaseRecordID)
+	require.Equal(t, config.DatabaseRecordID, runtime.ID)
+
+	saved, err := yakit.GetAgentRuntime(config.GetDB(), runtimeUUID)
+	require.NoError(t, err)
+	require.Equal(t, runtimeUUID, saved.Uuid)
+	require.Equal(t, "config-runtime-record-test", saved.Name)
+}
+
+func TestConfig_CreateOrUpdateRuntimeRecord_Disabled(t *testing.T) {
+	runtimeUUID := uuid.NewString()
+	config := NewConfig(context.Background(), WithID(runtimeUUID))
+	require.NoError(t, config.GetDB().AutoMigrate(&schema.AIAgentRuntime{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, config.GetDB().Unscoped().Where("uuid = ?", runtimeUUID).Delete(&schema.AIAgentRuntime{}).Error)
+	})
+
+	config.DisableCreateDBRuntime = true
+	runtime := &schema.AIAgentRuntime{
+		Uuid: runtimeUUID,
+		Name: "config-runtime-record-disabled",
+	}
+	require.NoError(t, config.CreateOrUpdateRuntimeRecord(runtime))
+	require.Zero(t, config.DatabaseRecordID)
+	require.Zero(t, runtime.ID)
+
+	var count int
+	require.NoError(t, config.GetDB().Model(&schema.AIAgentRuntime{}).Where("uuid = ?", runtimeUUID).Count(&count).Error)
+	require.Zero(t, count)
 }

@@ -2,6 +2,7 @@ package yakgrpc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -40,13 +41,29 @@ func (s *Server) QueryAISession(ctx context.Context, req *ypb.QueryAISessionRequ
 		if item == nil {
 			continue
 		}
+		var lastUsedAt int64
+		var runtimeIDs []string
+		startParams, err := yakit.UnmarshalAISessionStartParams(item.StartParams)
+		if err != nil {
+			return nil, err
+		}
+		if !item.LastUsedAt.IsZero() {
+			lastUsedAt = item.LastUsedAt.Unix()
+		}
+		if strings.TrimSpace(item.RelatedRuntimeIDS) != "" {
+			json.Unmarshal([]byte(item.RelatedRuntimeIDS), &runtimeIDs)
+		}
 		respData = append(respData, &ypb.AISession{
-			Id:               int64(item.ID),
-			SessionID:        item.SessionID,
-			Title:            item.Title,
-			TitleInitialized: item.TitleInitialized,
-			CreatedAt:        item.CreatedAt.Unix(),
-			UpdatedAt:        item.UpdatedAt.Unix(),
+			Id:                int64(item.ID),
+			SessionID:         item.SessionID,
+			Title:             item.Title,
+			TitleInitialized:  item.TitleInitialized,
+			CreatedAt:         item.CreatedAt.Unix(),
+			UpdatedAt:         item.UpdatedAt.Unix(),
+			LastUsedAt:        lastUsedAt,
+			RelatedRuntimeIDs: runtimeIDs,
+			StartParams:       startParams,
+			Source:            item.Source,
 		})
 	}
 

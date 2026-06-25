@@ -39,7 +39,7 @@ func (c *Coordinator) ExecuteLoopTask(taskTypeName string, task aicommon.AIState
 	baseOpts := aicommon.ConvertConfigToOptions(c.Config)
 	baseOpts = append(baseOpts,
 		aicommon.WithID(c.Config.Id), // pe -> react should use same id
-		aicommon.WithAutoTieredAICallback(c.OriginalAICallback),
+		aicommon.WithAICallbacks(c.Config.GetRawAICallbacks()),
 		aicommon.WithAllowPlanUserInteract(true),
 		aicommon.WithEventInputChanx(inputChannel),
 		aicommon.WithContext(ctx),
@@ -47,17 +47,40 @@ func (c *Coordinator) ExecuteLoopTask(taskTypeName string, task aicommon.AIState
 		aicommon.WithEnablePlanAndExec(false),
 		aicommon.WithHotPatchOptionChan(hotpatchChan),
 	)
+	taskEmitter := task.GetEmitter()
+	if taskEmitter == nil && c.Config != nil && c.Config.GetEmitter() != nil {
+		taskEmitter = c.Config.GetEmitter().PushEventProcesser(func(e *schema.AiOutputEvent) *schema.AiOutputEvent {
+			if e != nil {
+				e.TaskUUID = task.GetUUID()
+				e.TaskId = task.GetId()
+			}
+			return e
+		})
+		task.SetEmitter(taskEmitter)
+	}
+	if taskEmitter != nil {
+		baseOpts = append(baseOpts, aicommon.WithEmitter(taskEmitter))
+	}
 
 	invoker, err := aicommon.AIRuntimeInvokerGetter(c.GetContext(), baseOpts...)
 	if err != nil {
 		return fmt.Errorf("创建 AI 调用运行时失败: %v", err)
 	}
+	invoker.SetCurrentTask(task)
+	if cfg := invoker.GetConfig(); cfg != nil {
+		if typedCfg, ok := cfg.(*aicommon.Config); ok {
+			typedCfg.SetHotpatchCurrentTaskIdResolver(func() string {
+				if current := invoker.GetCurrentTask(); current != nil {
+					return current.GetId()
+				}
+				return ""
+			})
+		}
+	}
 
-	defaultOptions := []reactloops.ReActLoopOption{
-		reactloops.WithMemoryTriage(c.MemoryTriage),
-		reactloops.WithMemoryPool(c.MemoryPool),
-		reactloops.WithMemorySizeLimit(int(c.MemoryPoolSize)),
-		reactloops.WithEnableSelfReflection(c.EnableSelfReflection),
+	defaultOptions := reactloops.BasicAICommonConfigOption(c.Config)
+
+	defaultOptions = append(defaultOptions,
 		reactloops.WithOnPostIteraction(func(loop *reactloops.ReActLoop, iteration int, task aicommon.AIStatefulTask, isDone bool, reason any, operator *reactloops.OnPostIterationOperator) {
 			operator.DeferAfterCallbacks(func() {
 				if c.MemoryTriage == nil {
@@ -103,7 +126,7 @@ func (c *Coordinator) ExecuteLoopTask(taskTypeName string, task aicommon.AIState
 								return
 							}
 							if len(searchResult.Memories) > 0 {
-								log.Infof("found %d relevant memories for completed task %s (total: %d bytes)", len(searchResult.Memories), task.GetId(), searchResult.ContentBytes)
+								log.Infof("found %d relevant memories for completed task %s (total: %d tokens)", len(searchResult.Memories), task.GetId(), searchResult.ContentTokens)
 								if c.DebugEvent {
 									log.Infof("memory search summary: %s", searchResult.SearchSummary)
 								}
@@ -114,8 +137,7 @@ func (c *Coordinator) ExecuteLoopTask(taskTypeName string, task aicommon.AIState
 					}()
 				})
 			})
-		}),
-	}
+		}))
 
 	defaultOptions = append(defaultOptions, options...)
 
@@ -129,7 +151,6 @@ func (c *Coordinator) ExecuteLoopTask(taskTypeName string, task aicommon.AIState
 	mainloop.RemoveAction(schema.AI_REACT_LOOP_ACTION_REQUEST_PLAN_EXECUTION)
 	mainloop.RemoveAction(schema.AI_REACT_LOOP_ACTION_REQUIRE_AI_BLUEPRINT)
 	task.SetAsyncMode(false)
-	invoker.SetCurrentTask(task)
 	err = mainloop.ExecuteWithExistedTask(task)
 	if err != nil {
 		return err

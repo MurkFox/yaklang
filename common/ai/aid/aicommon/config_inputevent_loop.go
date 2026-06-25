@@ -29,6 +29,9 @@ func (c *Config) StartEventLoopEx(ctx context.Context, startCall func(), doneCal
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			defer func() {
+				if c.EventLoopDoneHook != nil {
+					c.EventLoopDoneHook()
+				}
 				if doneCall != nil {
 					log.Infof("event loop done call for config %s", c.id)
 					doneCall()
@@ -39,15 +42,19 @@ func (c *Config) StartEventLoopEx(ctx context.Context, startCall func(), doneCal
 				log.Infof("event loop start call for config %s", c.id)
 				startCall()
 			}
+			if c.EventLoopStartHook != nil {
+				c.EventLoopStartHook()
+			}
 
 			consumptionNotification := func() {
-				if c.GetInputConsumption() > 0 || c.GetOutputConsumption() > 0 {
+				if c.GetInputConsumption() > 0 || c.GetOutputConsumption() > 0 || c.GetCacheHitToken() > 0 {
 					c.EmitJSON(
 						schema.EVENT_TYPE_CONSUMPTION,
 						"system",
 						map[string]any{
 							"input_consumption":  c.GetInputConsumption(),
 							"output_consumption": c.GetOutputConsumption(),
+							"cache_hit_token":    c.GetCacheHitToken(),
 							"consumption_uuid":   c.GetConsumptionUUID(),
 							"tier_consumption":   c.GetTierConsumptionSnapshot(),
 						},
@@ -65,7 +72,7 @@ func (c *Config) StartEventLoopEx(ctx context.Context, startCall func(), doneCal
 					})
 					select {
 					case <-validator:
-						log.Infof("coordinator validator working, (%v) start", c.id)
+						//log.Infof("coordinator validator working, (%v) start", c.id)
 						continue
 					case <-ticker.C:
 						tickerCallback()
@@ -85,7 +92,7 @@ func (c *Config) StartEventLoopEx(ctx context.Context, startCall func(), doneCal
 
 				select {
 				case <-validator:
-					log.Infof("coordinator validator working, (%v) start", c.id)
+					//log.Infof("coordinator validator working, (%v) start", c.id)
 					continue
 				case event, ok := <-c.EventInputChan.OutputChannel():
 					if !ok {
@@ -103,6 +110,7 @@ func (c *Config) StartEventLoopEx(ctx context.Context, startCall func(), doneCal
 
 					if event.IsConfigHotpatch {
 						hotPatchOptions := c.ProcessHotPatchMessage(event)
+						c.PersistSessionStartParamsFromHotpatch(event)
 						for _, option := range hotPatchOptions {
 							c.HotPatchOptionChan.SafeFeed(option)
 						}
@@ -118,7 +126,7 @@ func (c *Config) StartEventLoopEx(ctx context.Context, startCall func(), doneCal
 					tickerCallback()
 					continue
 				case <-ctx.Done():
-					log.Infof("event loop context cancelled for config %s, draining pending events", c.id)
+					//log.Infof("event loop context cancelled for config %s, draining pending events", c.id)
 					c.drainPendingEvents()
 					return
 				}

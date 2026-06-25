@@ -11,14 +11,16 @@ import (
 )
 
 var fuzzCookieAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoopOption {
-	return reactloops.WithRegisterLoopAction(
+	return reactloops.WithRegisterLoopActionWithStreamField(
 		"fuzz_cookie",
 		"Fuzz HTTP cookies. Use this to test session manipulation, cookie injection, or authentication bypass attacks.",
 		[]aitool.ToolOption{
 			aitool.WithStringParam("cookie_name", aitool.WithParam_Description("The cookie name to fuzz. If empty and raw_mode is true, will replace entire Cookie header")),
-			aitool.WithStringArrayParam("cookie_values", aitool.WithParam_Description("Values to test for the cookie"), aitool.WithParam_Required(true)),
+			aitool.WithStringArrayParam("cookie_values", aitool.WithParam_Description("Values to test for the cookie. Supports arbitrary fuzztag; see the FUZZTAG_REFERENCE and AVAILABLE_PAYLOAD_GROUPS context blocks for the current full tag manual and payload dictionary groups. For brute-force or dictionary-style testing, prefer concise fuzztag rules over long handwritten lists."), aitool.WithParam_Required(true)),
 			aitool.WithBoolParam("raw_mode", aitool.WithParam_Description("If true, replace entire Cookie header with the provided values")),
-			aitool.WithStringParam("reason", aitool.WithParam_Description("Explain why you want to test these cookie values")),
+		},
+		[]*reactloops.LoopStreamField{
+			{FieldName: "reason", AINodeId: "thought"},
 		},
 		func(l *reactloops.ReActLoop, action *aicommon.Action) error {
 			cookieValues := action.GetStringSlice("cookie_values")
@@ -58,7 +60,8 @@ var fuzzCookieAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoopOpti
 			}
 
 			// Execute and compare
-			diffResult, err := executeFuzzAndCompare(loop, fuzzResult, "fuzz_cookie")
+			paramSummary := fmt.Sprintf("cookie_name=%s; cookie_values=%v; raw_mode=%v; reason=%s", cookieName, cookieValues, rawMode, reason)
+			diffResult, verifyResult, err := executeFuzzAndCompare(loop, fuzzResult, "fuzz_cookie", paramSummary, action)
 			if err != nil {
 				operator.Fail(err)
 				return
@@ -68,9 +71,8 @@ var fuzzCookieAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoopOpti
 			if rawMode {
 				mode = "raw"
 			}
-			r.AddToTimeline("fuzz_cookie", fmt.Sprintf("Tested cookie %s (%s mode) with values: %v\n%s", cookieName, mode, cookieValues, diffResult))
-			operator.Feedback(diffResult)
+			r.AddToTimeline("fuzz_cookie", fmt.Sprintf("Tested cookie %s (%s mode) with values: %v\n%s", cookieName, mode, cookieValues, buildFuzzTimelineSummary(diffResult)))
+			applyFuzzVerificationOutcome(loop, operator, diffResult, verifyResult)
 		},
 	)
 }
-

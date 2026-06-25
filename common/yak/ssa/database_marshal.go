@@ -164,6 +164,15 @@ func marshalExtraInformation(raw Instruction) map[string]any {
 		params["block_preds"] = fetchIds(ret.Preds)
 		params["block_succs"] = fetchIds(ret.Succs)
 		params["block_can_be_reached"] = ret.canBeReached
+		if ret.ConditionInst > 0 {
+			params["block_condition_inst"] = ret.ConditionInst
+		}
+		if len(ret.ConditionValues) > 0 {
+			params["block_condition_values"] = fetchIds(ret.ConditionValues)
+		}
+		if len(ret.ConditionMeta) > 0 {
+			params["block_condition_meta"] = ret.ConditionMeta
+		}
 		if ret.Condition > 0 {
 			if ret.Condition > 0 {
 				params["block_condition"] = ret.Condition
@@ -319,6 +328,54 @@ func marshalExtraInformation(raw Instruction) map[string]any {
 	return params
 }
 
+// parseSwitchLabelsFromExtra unmarshals switch_label from DB/JSON where the slice
+// element type may be map[string]any (JSON) rather than []map[string]int64.
+func parseSwitchLabelsFromExtra(labels any) []SwitchLabel {
+	if labels == nil {
+		return nil
+	}
+	toLabel := func(m map[string]any) (SwitchLabel, bool) {
+		if m == nil {
+			return SwitchLabel{}, false
+		}
+		return SwitchLabel{
+			Value: int64(utils.InterfaceToInt(m["value"])),
+			Dest:  int64(utils.InterfaceToInt(m["dest"])),
+		}, true
+	}
+	switch sl := labels.(type) {
+	case []map[string]int64:
+		out := make([]SwitchLabel, len(sl))
+		for i, label := range sl {
+			out[i] = SwitchLabel{Value: label["value"], Dest: label["dest"]}
+		}
+		return out
+	case []map[string]any:
+		out := make([]SwitchLabel, 0, len(sl))
+		for _, m := range sl {
+			if l, ok := toLabel(m); ok {
+				out = append(out, l)
+			}
+		}
+		return out
+	case []any:
+		out := make([]SwitchLabel, 0, len(sl))
+		for _, item := range sl {
+			switch m := item.(type) {
+			case map[string]any:
+				if l, ok := toLabel(m); ok {
+					out = append(out, l)
+				}
+			case map[string]int64:
+				out = append(out, SwitchLabel{Value: m["value"], Dest: m["dest"]})
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 func unmarshalExtraInformation(cache *ProgramCache, inst Instruction, ir *ssadb.IrCode) {
 	params := ir.GetExtraInfo()
 	switch ret := inst.(type) {
@@ -329,7 +386,22 @@ func unmarshalExtraInformation(cache *ProgramCache, inst Instruction, ir *ssadb.
 	case *BasicBlock:
 		ret.Preds = utils.MapGetInt64Slice(params, "block_preds")
 		ret.Succs = utils.MapGetInt64Slice(params, "block_succs")
+		ret.ConditionInst = utils.MapGetInt64(params, "block_condition_inst")
+		ret.ConditionValues = utils.MapGetInt64Slice(params, "block_condition_values")
+		ret.ConditionMeta = utils.MapGetMapRaw(params, "block_condition_meta")
 		ret.Condition = utils.MapGetInt64(params, "block_condition")
+		if len(ret.ConditionValues) == 0 && ret.Condition > 0 {
+			ret.ConditionValues = []int64{ret.Condition}
+		}
+		if ret.ConditionInst <= 0 && ret.Condition > 0 {
+			ret.ConditionInst = ret.Condition
+		}
+		if ret.ConditionMeta == nil {
+			ret.ConditionMeta = map[string]any{}
+		}
+		if _, ok := ret.ConditionMeta["schema_version"]; !ok {
+			ret.ConditionMeta["schema_version"] = 1
+		}
 		ret.canBeReached = BasicBlockReachableKind(utils.MapGetInt(params, "block_can_be_reached"))
 		ret.Insts = utils.MapGetInt64Slice(params, "block_insts")
 		ret.Phis = utils.MapGetInt64Slice(params, "block_phis")
@@ -409,16 +481,11 @@ func unmarshalExtraInformation(cache *ProgramCache, inst Instruction, ir *ssadb.
 	case *Switch:
 		ret.Cond = utils.MapGetInt64(params, "switch_cond")
 		if labels, ok := params["switch_label"]; ok {
-			if _, isMap := labels.([]map[string]int64); !isMap {
-				log.Errorf("BUG: switch label should be map[string]int64, %v", labels)
-				return
+			parsed := parseSwitchLabelsFromExtra(labels)
+			if len(parsed) == 0 && labels != nil {
+				log.Warnf("switch_label could not be parsed (type %T): %v", labels, labels)
 			}
-			for _, label := range labels.([]map[string]int64) {
-				ret.Label = append(ret.Label, SwitchLabel{
-					Value: int64(utils.InterfaceToInt(label["value"])),
-					Dest:  int64(utils.InterfaceToInt(label["dest"])),
-				})
-			}
+			ret.Label = parsed
 		}
 	case *Make:
 		ret.low = utils.MapGetInt64(params, "make_low")
@@ -435,8 +502,12 @@ func unmarshalExtraInformation(cache *ProgramCache, inst Instruction, ir *ssadb.
 		if ret.FreeValues == nil {
 			ret.FreeValues = make(map[*Variable]int64)
 		}
+		progName := ""
+		if cache != nil && cache.program != nil {
+			progName = cache.program.GetProgramName()
+		}
 		for k, v := range free_values {
-			variable := GetVariableFromDB(v, k)
+			variable := GetVariableFromDB(v, k, progName)
 			ret.FreeValues[variable] = v
 		}
 		ret.ParameterMembers = utils.MapGetInt64Slice(params, "parameter_members")

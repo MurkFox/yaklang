@@ -3,7 +3,6 @@ package aireact
 import (
 	"context"
 	"encoding/json"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -22,19 +21,15 @@ import (
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
-func extractCurrentTaskContentFromPrompt(prompt string) string {
+func extractCurrentTaskContentFromPrompt(t *testing.T, prompt string) string {
 	if idx := strings.LastIndex(prompt, "--- CURRENT_TASK ---"); idx >= 0 {
 		rest := prompt[idx+len("--- CURRENT_TASK ---"):]
 		if end := strings.Index(rest, "--- CURRENT_TASK_END ---"); end >= 0 {
 			return strings.TrimSpace(rest[:end])
 		}
 	}
-	re := regexp.MustCompile(`(?s)<\\|CURRENT_TASK\\|>\\s*(.*?)\\s*<\\|CURRENT_TASK_END\\|>`)
-	matches := re.FindStringSubmatch(prompt)
-	if len(matches) >= 2 {
-		return matches[1]
-	}
-	return ""
+	block := aicommon.MustExtractAITagBlock(t, prompt, "CURRENT_TASK")
+	return strings.TrimSpace(block.Body)
 }
 
 func newRecoveryTaskForReAct(name, goal string) *aid.AiTask {
@@ -133,7 +128,7 @@ func TestReAct_RecoveryPlanAndExec_SkipCompletedTasks(t *testing.T) {
 			}
 
 			if !handledByIndex {
-				current := extractCurrentTaskContentFromPrompt(prompt)
+				current := extractCurrentTaskContentFromPrompt(t, prompt)
 				if strings.Contains(current, doneMarker) {
 					mu.Lock()
 					doneCalls++
@@ -152,10 +147,14 @@ func TestReAct_RecoveryPlanAndExec_SkipCompletedTasks(t *testing.T) {
 			}
 
 			rsp := cfg.NewAIResponse()
+			// 去 Exit 化后 directly_answer 只发答复并继续, 子任务 react 循环只能由唯一
+			// 终结器 finish 收口; 恢复流程只需每个未跳过任务触发 AI 调用并完成, 故决策
+			// 直接发 finish 让子任务循环收口.
+			// 关键词: directly_answer 永不 Exit, finish 唯一终结器, 子任务循环收口
 			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
 				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "ok", "task_short_summary": "ok", "task_long_summary": "ok"}`))
 			} else if strings.Contains(prompt, "directly_answer") {
-				rsp.EmitOutputStream(strings.NewReader(`{"@action": "directly_answer", "answer_payload": "ok"}`))
+				rsp.EmitOutputStream(strings.NewReader(`{"@action": "object", "next_action": {"type": "finish"}, "human_readable_thought": "ok"}`))
 			} else {
 				rsp.EmitOutputStream(strings.NewReader(`{"@action": "direct-answer", "direct_answer": "ok", "direct_answer_long": "ok"}`))
 			}
@@ -244,4 +243,172 @@ LOOP:
 	require.Equal(t, 0, doneCalls, "completed task should not trigger AI calls in recovery")
 	require.Greater(t, abortedCalls, 0, "aborted task should trigger AI calls in recovery")
 	require.Greater(t, todoCalls, 0, "pending task should trigger AI calls in recovery")
+}
+
+func TestReAct_RecoveryPlanAndExec_StartFromSpecifiedTask(t *testing.T) {
+	sessionID := uuid.NewString()
+	coordinatorID := uuid.NewString()
+
+	firstMarker := uuid.NewString()
+	startMarker := uuid.NewString()
+	lastMarker := uuid.NewString()
+
+	root := newRecoveryTaskForReAct("root", "root-goal")
+	firstTask := newRecoveryTaskForReAct("firstTask-"+firstMarker, "goal-"+firstMarker)
+	startTask := newRecoveryTaskForReAct("startTask-"+startMarker, "goal-"+startMarker)
+	lastTask := newRecoveryTaskForReAct("lastTask-"+lastMarker, "goal-"+lastMarker)
+
+	firstTask.ParentTask = root
+	startTask.ParentTask = root
+	lastTask.ParentTask = root
+	root.Subtasks = []*aid.AiTask{firstTask, startTask, lastTask}
+	root.GenerateIndex()
+
+	db := consts.GetGormProjectDatabase()
+	require.NoError(t, db.AutoMigrate(&schema.AISessionPlanAndExec{}).Error)
+	t.Cleanup(func() {
+		_ = db.Unscoped().
+			Where("coordinator_id = ?", coordinatorID).
+			Delete(&schema.AISessionPlanAndExec{}).Error
+	})
+
+	record := &schema.AISessionPlanAndExec{
+		SessionID:     sessionID,
+		CoordinatorID: coordinatorID,
+		TaskTree:      string(utils.Jsonify(root)),
+		TaskProgress:  string(utils.Jsonify(&aid.PlanAndExecProgress{Phase: "executing"})),
+	}
+	require.NoError(t, yakit.CreateOrUpdateAISessionPlanAndExec(db, record))
+
+	in := make(chan *ypb.AIInputEvent, 10)
+	out := make(chan *ypb.AIOutputEvent, 100)
+
+	var mu sync.Mutex
+	firstCalls := 0
+	startCalls := 0
+	lastCalls := 0
+
+	_, err := NewTestReAct(
+		aicommon.WithPersistentSessionId(sessionID),
+		aicommon.WithEventInputChan(in),
+		aicommon.WithEventHandler(func(e *schema.AiOutputEvent) {
+			out <- e.ToGRPC()
+		}),
+		aicommon.WithAgreeYOLO(true),
+		aicommon.WithAICallback(func(cfg aicommon.AICallerConfigIf, req *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			prompt := req.GetPrompt()
+			idx := req.GetTaskIndex()
+
+			mu.Lock()
+			switch idx {
+			case firstTask.Index:
+				firstCalls++
+			case startTask.Index:
+				startCalls++
+			case lastTask.Index:
+				lastCalls++
+			default:
+				current := extractCurrentTaskContentFromPrompt(t, prompt)
+				switch {
+				case strings.Contains(current, firstMarker):
+					firstCalls++
+				case strings.Contains(current, startMarker):
+					startCalls++
+				case strings.Contains(current, lastMarker):
+					lastCalls++
+				}
+			}
+			mu.Unlock()
+
+			rsp := cfg.NewAIResponse()
+			// 去 Exit 化后 directly_answer 只发答复并继续, 子任务 react 循环只能由唯一
+			// 终结器 finish 收口; 恢复流程只需每个未跳过任务触发 AI 调用并完成, 故决策
+			// 直接发 finish 让子任务循环收口.
+			// 关键词: directly_answer 永不 Exit, finish 唯一终结器, 子任务循环收口
+			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
+				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "ok", "task_short_summary": "ok", "task_long_summary": "ok"}`))
+			} else if strings.Contains(prompt, "directly_answer") {
+				rsp.EmitOutputStream(strings.NewReader(`{"@action": "object", "next_action": {"type": "finish"}, "human_readable_thought": "ok"}`))
+			} else {
+				rsp.EmitOutputStream(strings.NewReader(`{"@action": "direct-answer", "direct_answer": "ok", "direct_answer_long": "ok"}`))
+			}
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	require.NoError(t, err)
+
+	syncID := ksuid.New().String()
+	in <- &ypb.AIInputEvent{
+		IsSyncMessage: true,
+		SyncType:      SYNC_TYPE_RECOVERY_PLAN_AND_EXEC,
+		SyncJsonInput: `{"coordinator_id":"` + coordinatorID + `","start_task_index":"` + startTask.Index + `"}`,
+		SyncID:        syncID,
+	}
+
+	var (
+		syncStarted      bool
+		planStarted      bool
+		planEnded        bool
+		startIndexSyncOK bool
+		startIndexPlanOK bool
+	)
+
+	after := time.After(20 * time.Second)
+LOOP:
+	for {
+		select {
+		case e := <-out:
+			if e.IsSync && e.NodeId == "recover_plan_and_exec" && e.SyncID == syncID {
+				var payload map[string]any
+				if err := json.Unmarshal(e.Content, &payload); err == nil {
+					if errMsg, ok := payload["error"].(string); ok && errMsg != "" {
+						t.Fatalf("recovery sync error: %s", errMsg)
+					}
+					if started, ok := payload["started"].(bool); ok && started {
+						syncStarted = true
+					}
+					if gotIndex, ok := payload["start_task_index"].(string); ok && gotIndex == startTask.Index {
+						startIndexSyncOK = true
+					}
+				}
+			}
+
+			if e.Type == string(schema.EVENT_TYPE_START_PLAN_AND_EXECUTION) {
+				result := utils.InterfaceToString(jsonpath.FindFirst(e.Content, `$..coordinator_id`))
+				if result == coordinatorID {
+					planStarted = true
+					var payload map[string]any
+					if err := json.Unmarshal(e.Content, &payload); err == nil {
+						if gotIndex, ok := payload["start_task_index"].(string); ok && gotIndex == startTask.Index {
+							startIndexPlanOK = true
+						}
+					}
+				}
+			}
+			if e.Type == string(schema.EVENT_TYPE_END_PLAN_AND_EXECUTION) {
+				result := utils.InterfaceToString(jsonpath.FindFirst(e.Content, `$..coordinator_id`))
+				if result == coordinatorID {
+					planEnded = true
+					break LOOP
+				}
+			}
+		case <-after:
+			break LOOP
+		}
+	}
+
+	close(in)
+
+	require.True(t, syncStarted, "expected recovery sync event to start")
+	require.True(t, startIndexSyncOK, "expected recovery sync to carry start_task_index")
+	require.True(t, planStarted, "expected recovery plan execution to start")
+	require.True(t, startIndexPlanOK, "expected plan execution event to carry start_task_index")
+	require.True(t, planEnded, "expected recovery plan execution to end")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 0, firstCalls, "tasks before start_task_index should not trigger AI calls")
+	require.Greater(t, startCalls, 0, "specified start_task_index should trigger AI calls")
+	require.Greater(t, lastCalls, 0, "tasks after start_task_index should continue executing")
 }

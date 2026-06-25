@@ -3,6 +3,7 @@ package loop_intent
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiskillloader"
@@ -74,6 +75,10 @@ func makeSearchCapabilitiesAction(r aicommon.AIInvokeRuntime) reactloops.ReActLo
 		},
 		// Handler
 		func(loop *reactloops.ReActLoop, action *aicommon.Action, op *reactloops.LoopActionHandlerOperator) {
+			totalStart := time.Now()
+			defer func() {
+				reactloops.SetWorkspaceDebugDuration(loop, reactloops.IntentDebugCapabilityDurationKey, time.Since(totalStart))
+			}()
 			// if the intent_summary is provided by the intent analysis step, store it for context , can reduce the step of intent analysis in finalize_enrichment
 			if summary := action.GetString("intent_summary"); summary != "" {
 				loop.Set("intent_summary", reactloops.CompactIntentSummary(summary))
@@ -99,6 +104,7 @@ func makeSearchCapabilitiesAction(r aicommon.AIInvokeRuntime) reactloops.ReActLo
 			db := consts.GetGormProfileDatabase()
 			if db != nil {
 				loop.LoadingStatus("Start to load bm25+keyword search results for tools and AI forges... / 开始加载工具和AI蓝图的BM25+关键词搜索结果...")
+				dbSearchStart := time.Now()
 
 				toolSeen := make(map[string]bool)
 				var allTools []*schema.AIYakTool
@@ -178,55 +184,88 @@ func makeSearchCapabilitiesAction(r aicommon.AIInvokeRuntime) reactloops.ReActLo
 					loop.Set("matched_tool_names", existingToolNames+strings.Join(pluginNames, ","))
 				}
 
-				// 2. Search AI Forges via BM25 trigram
-				forgeSeen := make(map[string]bool)
-				var allForges []*schema.AIForge
-
-				forges, err := yakit.SearchAIForgeBM25(db, &yakit.AIForgeSearchFilter{
-					ForgeTypes: schema.RunnableForgeTypes(),
-					Keywords:   keywords,
-				}, 10, 0)
-				if err != nil {
-					log.Warnf("intent loop: BM25 forge AND-search failed: %v", err)
-				}
-				for _, f := range forges {
-					if !forgeSeen[f.ForgeName] {
-						forgeSeen[f.ForgeName] = true
-						allForges = append(allForges, f)
-					}
-				}
-
-				if len(allForges) > 0 {
-					results.WriteString("### Matched AI Forges (Blueprints)\n")
-					for _, forge := range allForges {
-						name := forge.ForgeName
-						if forge.ForgeVerboseName != "" {
-							name = forge.ForgeVerboseName + " (" + forge.ForgeName + ")"
+				// 1.6 Search cached MCP tool metadata via keyword BM25 (same pattern as tools/forges).
+				if reactloops.IsMCPServersAllowed(r) {
+					mcpTools, mcpErr := yakit.SearchMCPServerToolsBM25(db, query, 10)
+					if mcpErr != nil {
+						log.Warnf("intent loop: MCP tool BM25 search failed: %v", mcpErr)
+					} else if len(mcpTools) > 0 {
+						results.WriteString("### Matched MCP Tools\n")
+						results.WriteString("These are MCP (Model Context Protocol) tools. Call them directly via require_tool using their full name (mcp_{server}_{tool}).\n\n")
+						var mcpToolNames []string
+						for _, t := range mcpTools {
+							fullName := fmt.Sprintf("mcp_%s_%s", t.ServerName, t.ToolName)
+							desc := utils.ShrinkString(t.Description, 200)
+							results.WriteString(fmt.Sprintf("- **%s**: %s\n", fullName, desc))
+							appendCapDetail(&capDetails, fullName, "mcp-tool", desc)
+							mcpToolNames = append(mcpToolNames, fullName)
 						}
-						desc := utils.ShrinkString(forge.Description, 200)
-						results.WriteString(fmt.Sprintf("- **%s**: %s\n", name, desc))
-						appendCapDetail(&capDetails, forge.ForgeName, "forge", utils.ShrinkString(forge.Description, 200))
+						results.WriteString("\n")
+						log.Infof("intent loop: found %d MCP tools", len(mcpTools))
+						existingToolNames := loop.Get("matched_tool_names")
+						if existingToolNames != "" {
+							existingToolNames += ","
+						}
+						loop.Set("matched_tool_names", existingToolNames+strings.Join(mcpToolNames, ","))
 					}
-					results.WriteString("\n")
-					log.Infof("intent loop: found %d forges (AND+OR)", len(allForges))
-
-					var forgeNames []string
-					for _, f := range allForges {
-						forgeNames = append(forgeNames, f.ForgeName)
-					}
-					loop.Set("matched_forge_names", strings.Join(forgeNames, ","))
-				} else {
-					results.WriteString("### AI Forges\nNo matching forges found.\n\n")
 				}
+
+				// 2. Search AI Forges via BM25 trigram only when plan/exec is enabled.
+				if reactloops.IsPlanAndExecAllowed(nil, r) {
+					forgeSeen := make(map[string]bool)
+					var allForges []*schema.AIForge
+
+					forges, err := yakit.SearchAIForgeBM25(db, &yakit.AIForgeSearchFilter{
+						ForgeTypes: schema.RunnableForgeTypes(),
+						Keywords:   keywords,
+					}, 10, 0)
+					if err != nil {
+						log.Warnf("intent loop: BM25 forge AND-search failed: %v", err)
+					}
+					for _, f := range forges {
+						if !forgeSeen[f.ForgeName] {
+							forgeSeen[f.ForgeName] = true
+							allForges = append(allForges, f)
+						}
+					}
+
+					if len(allForges) > 0 {
+						results.WriteString("### Matched AI Forges (Blueprints)\n")
+						for _, forge := range allForges {
+							name := forge.ForgeName
+							if forge.ForgeVerboseName != "" {
+								name = forge.ForgeVerboseName + " (" + forge.ForgeName + ")"
+							}
+							desc := utils.ShrinkString(forge.Description, 200)
+							results.WriteString(fmt.Sprintf("- **%s**: %s\n", name, desc))
+							appendCapDetail(&capDetails, forge.ForgeName, "forge", utils.ShrinkString(forge.Description, 200))
+						}
+						results.WriteString("\n")
+						log.Infof("intent loop: found %d forges (AND+OR)", len(allForges))
+
+						var forgeNames []string
+						for _, f := range allForges {
+							forgeNames = append(forgeNames, f.ForgeName)
+						}
+						loop.Set("matched_forge_names", strings.Join(forgeNames, ","))
+					} else {
+						results.WriteString("### AI Forges\nNo matching forges found.\n\n")
+					}
+				}
+				reactloops.SetWorkspaceDebugDuration(loop, reactloops.IntentDebugCapabilityDBDurationKey, time.Since(dbSearchStart))
 			} else {
 				results.WriteString("### Tools & Forges\nDatabase not available.\n\n")
 			}
 
 			// 3. Search Skills via SkillLoader (if available)
+			skillSearchStart := time.Now()
 			searchSkillsFromLoader(r, query, &results, loop, &capDetails)
+			reactloops.SetWorkspaceDebugDuration(loop, reactloops.IntentDebugSkillSearchDurationKey, time.Since(skillSearchStart))
 
 			// 4. Search registered loop metadata
+			focusModeSearchStart := time.Now()
 			matchedLoops := searchLoopMetadata(query)
+			reactloops.SetWorkspaceDebugDuration(loop, reactloops.IntentDebugFocusModeSearchDurationKey, time.Since(focusModeSearchStart))
 			if len(matchedLoops) > 0 {
 				results.WriteString("### Matched Focus Modes\n")
 				for _, meta := range matchedLoops {

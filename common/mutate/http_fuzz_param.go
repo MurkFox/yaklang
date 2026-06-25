@@ -110,9 +110,22 @@ func (p *FuzzHTTPRequestParam) IsCookieParams() bool {
 }
 
 func (p *FuzzHTTPRequestParam) Name() string {
-	//if p.param2nd != nil {
-	//	return ""
-	//}
+	return fmt.Sprintf("%v", p.param)
+}
+
+// JsonFieldName returns the JSON sub-field name for JSON-expanded param positions
+// (e.g. PosGetQueryJson, PosCookieJson). For non-JSON positions it returns the same
+// value as Name(). Use this when you need to distinguish individual JSON fields rather
+// than the outer HTTP parameter name.
+func (p *FuzzHTTPRequestParam) JsonFieldName() string {
+	switch p.position {
+	case lowhttp.PosGetQueryJson, lowhttp.PosGetQueryBase64Json,
+		lowhttp.PosPostQueryJson, lowhttp.PosPostQueryBase64Json,
+		lowhttp.PosCookieJson, lowhttp.PosCookieBase64Json:
+		if s := utils.InterfaceToString(p.param2nd); s != "" {
+			return s
+		}
+	}
 	return fmt.Sprintf("%v", p.param)
 }
 

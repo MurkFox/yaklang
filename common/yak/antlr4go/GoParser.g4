@@ -93,11 +93,18 @@ constDecl
     ;
 
 constSpec
-    : identifierList (type_? ASSIGN expressionList)?
+    : identifierList ws* ASSIGN ws* expressionList
+    | identifierList ws* type_ ws* ASSIGN ws* expressionList
+    | identifierList
+    ;
+
+identifier
+    : IDENTIFIER
+    | NIL_LIT
     ;
 
 identifierList
-    : IDENTIFIER (COMMA IDENTIFIER)*
+    : identifier (COMMA ws* identifier)*
     ;
 
 expressionList
@@ -114,7 +121,7 @@ typeSpec
     ;
 
 aliasDecl
-    : IDENTIFIER ASSIGN type_
+    : IDENTIFIER typeParameters? ws* ASSIGN ws* type_
     ;
 
 typeDef
@@ -122,15 +129,15 @@ typeDef
     ;
 
 typeParameters
-    : L_BRACKET typeParameterDecl (COMMA typeParameterDecl)* R_BRACKET
+    : L_BRACKET ws* typeParameterDecl (COMMA ws* typeParameterDecl)* COMMA? ws* R_BRACKET
     ;
 
 typeParameterDecl
-    : identifierList typeElement
+    : identifierList ws* typeElement
     ;
 
 typeElement
-    : typeTerm (OR typeTerm)*
+    : typeTerm (ws* OR ws* typeTerm)*
     ;
 
 typeTerm
@@ -144,7 +151,7 @@ functionDecl
     ;
 
 methodDecl
-    : FUNC receiver IDENTIFIER signature ws* block?
+    : FUNC receiver IDENTIFIER typeParameters? signature ws* block?
     ;
 
 receiver
@@ -156,7 +163,7 @@ varDecl
     ;
 
 varSpec
-    : identifierList (type_ (ASSIGN expressionList)? | ASSIGN expressionList)
+    : identifierList (type_ ws* (ASSIGN ws* expressionList)? | ASSIGN ws* expressionList)
     ;
 
 block
@@ -497,6 +504,7 @@ keyedElement
 
 key
     : expression
+    | literalValue
     ;
 
 element

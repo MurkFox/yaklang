@@ -2,6 +2,7 @@ package reactloops
 
 import (
 	"strings"
+	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiskillloader"
@@ -16,22 +17,25 @@ type DeepIntentResult struct {
 	RecommendedForges string
 	ContextEnrichment string
 
-	MatchedToolNames  string // comma-separated, e.g. "tool1,tool2"
-	MatchedForgeNames string // comma-separated, e.g. "forge1,forge2"
-	MatchedSkillNames string // comma-separated, e.g. "skill1,skill2"
+	MatchedToolNames          string // comma-separated, e.g. "tool1,tool2"
+	MatchedForgeNames         string // comma-separated, e.g. "forge1,forge2"
+	MatchedSkillNames         string // comma-separated, e.g. "skill1,skill2"
+	MatchedCapabilityMentions *CapabilityNameMatchResult
 }
 
 // ExecuteDeepIntentRecognition invokes the loop_intent sub-loop for deep
 // intent analysis. It creates a sub-task, runs the intent loop, and extracts
 // structured results. Returns nil on any failure (non-fatal).
 func ExecuteDeepIntentRecognition(r aicommon.AIInvokeRuntime, loop *ReActLoop, task aicommon.AIStatefulTask) *DeepIntentResult {
+	totalStart := time.Now()
 	userInput := task.GetUserInput()
 
 	intentTask := aicommon.NewStatefulTaskBase(
 		task.GetId()+"_intent",
 		userInput,
-		r.GetConfig().GetContext(),
-		r.GetConfig().GetEmitter(),
+		loop.GetConfig().GetContext(),
+		loop.GetEmitter(),
+		true,
 	)
 
 	originOptions := r.GetConfig().OriginOptions()
@@ -45,6 +49,7 @@ func ExecuteDeepIntentRecognition(r aicommon.AIInvokeRuntime, loop *ReActLoop, t
 		intentLoop = l
 	}), WithNoEndLoadingStatus(true), WithUseSpeedPriorityAICallback(true))
 
+	executeLoopStart := time.Now()
 	_, err := r.ExecuteLoopTaskIF(schema.AI_REACT_LOOP_NAME_INTENT, intentTask, opts...)
 	if err != nil {
 		log.Warnf("deep intent recognition failed: %v", err)
@@ -54,6 +59,8 @@ func ExecuteDeepIntentRecognition(r aicommon.AIInvokeRuntime, loop *ReActLoop, t
 		log.Warnf("deep intent recognition: intent loop reference is nil")
 		return nil
 	}
+	setWorkspaceDebugDuration(intentLoop, intentDebugExecuteLoopDurationKey, time.Since(executeLoopStart))
+	setWorkspaceDebugDuration(intentLoop, intentDebugTotalDurationKey, time.Since(totalStart))
 
 	result := &DeepIntentResult{
 		IntentAnalysis:    intentLoop.Get("intent_analysis"),
@@ -74,6 +81,8 @@ func ExecuteDeepIntentRecognition(r aicommon.AIInvokeRuntime, loop *ReActLoop, t
 	log.Infof("deep intent recognition completed: analysis=%d bytes, tools=%d bytes, forges=%d bytes, enrichment=%d bytes",
 		len(result.IntentAnalysis), len(result.RecommendedTools),
 		len(result.RecommendedForges), len(result.ContextEnrichment))
+
+	writeIntentRecognitionDebugMarkdown(r, intentLoop, result)
 
 	return result
 }
@@ -113,6 +122,19 @@ func ApplyDeepIntentResult(r aicommon.AIInvokeRuntime, loop *ReActLoop, result *
 			"建议使用 web_search，避免重复知识增强重试。")
 	}
 
+	if emitter := loop.GetEmitter(); emitter != nil {
+		_, _ = emitter.EmitIntentRecognition(
+			"intent-recognition",
+			result.IntentAnalysis,
+			result.RecommendedTools,
+			result.RecommendedForges,
+			result.MatchedToolNames,
+			result.MatchedForgeNames,
+			result.MatchedSkillNames,
+			result.ContextEnrichment,
+		)
+	}
+
 	log.Infof("deep intent results applied to loop context")
 }
 
@@ -141,7 +163,7 @@ func PopulateExtraCapabilitiesFromDeepIntent(r aicommon.AIInvokeRuntime, loop *R
 		}
 	}
 
-	if result.MatchedForgeNames != "" {
+	if result.MatchedForgeNames != "" && IsPlanAndExecAllowed(loop, r) {
 		forgeNames := splitAndTrimNames(result.MatchedForgeNames)
 		type forgeManagerProvider interface {
 			GetAIForgeManager() aicommon.AIForgeFactory
@@ -189,6 +211,9 @@ func PopulateExtraCapabilitiesFromDeepIntent(r aicommon.AIInvokeRuntime, loop *R
 	}
 
 	if ecm.HasCapabilities() {
+		if cfg, ok := r.GetConfig().(*aicommon.Config); ok {
+			aicommon.NotifySessionSnapshotEmit(cfg, true)
+		}
 		log.Infof("extra capabilities populated from deep intent: %d tools, %d forges, %d skills",
 			ecm.ToolCount(), len(ecm.ListForges()), len(ecm.ListSkills()))
 	}

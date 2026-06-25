@@ -50,6 +50,10 @@ var AIHTTPGatewayCommand = &cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
+		if home := c.String("home"); home != "" {
+			os.Setenv("YAKIT_HOME", home)
+		}
+
 		var opts []aihttp.GatewayOption
 
 		opts = append(opts,
@@ -65,10 +69,6 @@ var AIHTTPGatewayCommand = &cli.Command{
 		}
 		if secret := c.String("totp-secret"); secret != "" {
 			opts = append(opts, aihttp.WithTOTP(secret))
-		}
-
-		if home := c.String("home"); home != "" {
-			os.Setenv("YAKIT_HOME", home)
 		}
 
 		gw, err := aihttp.NewAIAgentHTTPGateway(opts...)
@@ -110,6 +110,5 @@ func printStartupInfo(c *cli.Context, gw *aihttp.AIAgentHTTPGateway) {
 		fmt.Printf("  Current:   %s\n", code)
 	}
 
-	fmt.Printf("  Web UI:  http://%s/\n", gw.GetAddr())
 	fmt.Println()
 }

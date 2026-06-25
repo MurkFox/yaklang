@@ -5,16 +5,18 @@ import (
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
-	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools/syntaxflowtools"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools/syntaxflowtools"
 	"github.com/yaklang/yaklang/common/utils"
 )
 
 // loopAction_DirectlyAnswerSyntaxFlow is a custom directly_answer for write_syntaxflow_rule loop.
 // It enforces: verify must be called when sf_has_code_sample; 规则内容由 replace_payload 从文件读取展示。
 var loopAction_DirectlyAnswerSyntaxFlow = &reactloops.LoopAction{
-	ActionType:  "directly_answer",
-	Description: "Directly answer with the 'answer_payload' field",
+	ActionType: "directly_answer",
+	Description: "Directly answer with the 'answer_payload' field. " +
+		"IMPORTANT: directly_answer ONLY delivers the answer; the loop CONTINUES afterwards and this action does NOT end the task. Use the 'finish' action to terminate. " +
+		"OPTIONAL: carry a non-empty 'next_movements' delta alongside the answer to schedule follow-up TODO updates.",
 	Options: []aitool.ToolOption{
 		aitool.WithStringParam(
 			"answer_payload",
@@ -52,7 +54,10 @@ func directlyAnswerSyntaxFlowVerifier(loop *reactloops.ReActLoop, action *aicomm
 		}
 	}
 	if payload == "" {
-		return utils.Error("answer_payload is required for ActionDirectlyAnswer but empty")
+		// 用 WrapDirectlyAnswerError 升级为带 nonce 的 AITAG 提示, 让 AI 重试时能
+		// 用 FINAL_ANSWER tag 自纠正, 避免 5 次重试黑洞 + fatal abort.
+		// 关键词: directly_answer ActionVerifier AITAG hint, 5 次重试黑洞修复
+		return reactloops.WrapDirectlyAnswerError(loop, utils.Error("answer_payload is required for ActionDirectlyAnswer but empty"))
 	}
 
 	// 1. When user provided code sample, verify must have been called and matched=true
@@ -93,5 +98,9 @@ func directlyAnswerSyntaxFlowHandler(loop *reactloops.ReActLoop, action *aicommo
 		utils.PrefixLines(loop.GetCurrentTask().GetUserInput(), "  > "),
 		utils.PrefixLines(payload, "  | "),
 	))
-	operator.Exit()
+
+	// directly_answer 绝不 Exit: emit 完答复后统一交给 DirectlyAnswerContinue
+	// 追加 timeline + 续跑, 终结只能由显式 finish action 完成. 与 buildin 对齐.
+	// 关键词: directly_answer 永不 Exit, syntaxflow_rule 复用单源, finish 唯一终结器
+	reactloops.DirectlyAnswerContinue(loop, action, operator)
 }

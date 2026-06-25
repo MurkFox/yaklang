@@ -19,9 +19,31 @@ import (
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/bizhelper"
+	"github.com/yaklang/yaklang/common/yakgrpc/mitmextractdb"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
+
+func (s *Server) QueryMITMExtractedAggregate(ctx context.Context, req *ypb.QueryMITMExtractedAggregateRequest) (*ypb.QueryMITMExtractedAggregateResponse, error) {
+	db := s.GetProjectDatabase()
+	p, rows, distinctGroups, err := mitmextractdb.QueryMITMExtractedAggregate(db, req)
+	if err != nil {
+		return nil, err
+	}
+	pg := req.GetPagination()
+	if pg == nil {
+		pg = &ypb.Paging{Page: 1, Limit: 30, OrderBy: "hit_count", Order: "desc"}
+	}
+	resp := &ypb.QueryMITMExtractedAggregateResponse{
+		Data:       rows,
+		Total:      int64(p.TotalRecord),
+		Pagination: pg,
+	}
+	if req != nil && req.GetIncludeDistinctRuleGroups() {
+		resp.DistinctRuleGroups = distinctGroups
+	}
+	return resp, nil
+}
 
 func (s *Server) QueryMITMRuleExtractedData(ctx context.Context, req *ypb.QueryMITMRuleExtractedDataRequest) (*ypb.QueryMITMRuleExtractedDataResponse, error) {
 	db := s.GetProjectDatabase()
@@ -71,16 +93,15 @@ func (s *Server) DeleteMITMRuleExtractedData(ctx context.Context, req *ypb.Delet
 	return &ypb.Empty{}, nil
 }
 
-// DeduplicateMITMRuleExtractedData 按 trace_id+规则名+规则数据去重，即对指定包内的提取数据去重，
-// 删除重复项（保留 id 最小的一条）。Filter 为空或 Filter.TraceID 为空时对全表去重。
+// DeduplicateMITMRuleExtractedData 按 trace_id+规则名+规则数据去重，
+// 删除重复项（保留 id 最小的一条）。支持通过 Filter（TraceID/RuleVerbose/Keyword 等）限定作用范围。
 func (s *Server) DeduplicateMITMRuleExtractedData(ctx context.Context, req *ypb.DeduplicateMITMRuleExtractedDataRequest) (*ypb.DeduplicateMITMRuleExtractedDataResponse, error) {
 	db := s.GetProjectDatabase()
-	filter := req.GetFilter()
-	var traceIds []string
-	if filter != nil {
-		traceIds = filter.GetTraceID()
+	var dataFilter *ypb.ExtractedDataFilter
+	if req != nil {
+		dataFilter = req.GetFilter()
 	}
-	deleted, err := yakit.DeduplicateExtractedData(db, traceIds...)
+	deleted, err := yakit.DeduplicateExtractedDataByFilter(db, dataFilter)
 	if err != nil {
 		return nil, err
 	}

@@ -42,20 +42,29 @@ func (g *GatewayClient) Chat(s string, function ...any) (string, error) {
 		aispec.WithChatBase_ReasonStreamHandler(g.config.ReasonStreamHandler),
 		aispec.WithChatBase_ErrHandler(g.config.HTTPErrorHandler),
 		aispec.WithChatBase_ImageRawInstance(g.config.Images...),
-		aispec.WithChatBase_EnableThinkingEx(g.config.EnableThinking, g.config.EnableThinkingField, g.config.EnableThinkingValue),
+		// 视频输入接入关键词: tongyi omni 视频通道
+		aispec.WithChatBase_VideoRawInstance(g.config.Videos...),
+		aispec.ChatBaseThinkingOptions(g.config, g.targetUrl),
+		aispec.WithChatBase_AISamplingFromConfig(g.config),
 		aispec.WithChatBase_Tools(g.config.Tools),
 		aispec.WithChatBase_ToolChoice(g.config.ToolChoice),
 		aispec.WithChatBase_ToolCallCallback(g.config.ToolCallCallback),
+		aispec.WithChatBase_RawHTTPResponseHeaderCallback(g.config.RawHTTPResponseHeaderCallback),
 		aispec.WithChatBase_RawHTTPResponseCallback(g.config.RawHTTPResponseCallback),
 		aispec.WithChatBase_RawHTTPRequestResponseCallback(g.config.RawHTTPRequestResponseCallback),
+		aispec.WithChatBase_UsageCallback(g.config.UsageCallback),
+		aispec.WithChatBase_RawMessages(g.config.RawMessages),
 	)
 }
 
 func (g *GatewayClient) ChatStream(s string) (io.Reader, error) {
 	return aispec.ChatWithStream(g.targetUrl, g.config.Model, s, g.config.HTTPErrorHandler, g.config.StreamHandler, g.BuildHTTPOptions,
-		aispec.WithChatBase_EnableThinkingEx(g.config.EnableThinking, g.config.EnableThinkingField, g.config.EnableThinkingValue),
+		aispec.ChatBaseThinkingOptions(g.config, g.targetUrl),
+		aispec.WithChatBase_AISamplingFromConfig(g.config),
+		aispec.WithChatBase_RawHTTPResponseHeaderCallback(g.config.RawHTTPResponseHeaderCallback),
 		aispec.WithChatBase_RawHTTPResponseCallback(g.config.RawHTTPResponseCallback),
 		aispec.WithChatBase_RawHTTPRequestResponseCallback(g.config.RawHTTPRequestResponseCallback),
+		aispec.WithChatBase_UsageCallback(g.config.UsageCallback),
 	)
 }
 
@@ -103,6 +112,7 @@ func (g *GatewayClient) BuildHTTPOptions() ([]poc.PocConfigOption, error) {
 			"Authorization": "Bearer " + g.config.APIKey,
 		}),
 	}
+	opts = aispec.AppendCustomHeadersToPocOptions(opts, aispec.ExtraHeadersToMap(g.config.Headers))
 	if g.config.Proxy != "" {
 		opts = append(opts, poc.WithProxy(g.config.Proxy))
 	}

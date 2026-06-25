@@ -61,6 +61,7 @@ import (
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/crawler"
 	"github.com/yaklang/yaklang/common/crawlerx"
+	"github.com/yaklang/yaklang/common/utils/webforest"
 	"github.com/yaklang/yaklang/common/cve"
 	"github.com/yaklang/yaklang/common/facades"
 	"github.com/yaklang/yaklang/common/hids"
@@ -170,6 +171,7 @@ func initYaklangLib() {
 	yaklang.Import("mmdb", yaklib.MmdbExports)
 
 	yaklang.Import("crawler", crawler.Exports)
+	yaklang.Import("webforest", webforest.Exports)
 	yaklang.Import("mitm", yaklib.MitmExports)
 	yaklang.Import("tls", yaklib.TlsExports)
 
@@ -230,6 +232,9 @@ func initYaklangLib() {
 
 	// json
 	yaklang.Import("json", yaklib.JsonExports)
+
+	// jsonstream: 流式 JSON 解析（数据流 + 回调，复用 common/jsonextractor）
+	yaklang.Import("jsonstream", yaklib.JsonStreamExports)
 
 	// yaml
 	yaklang.Import("yaml", yaklib.YamlExports)
@@ -713,6 +718,30 @@ func (e *ScriptEngine) exec(ctx context.Context, id string, code string, params 
 						return ai.Chat(msg, opts...)
 					},
 				},
+			})
+		}
+	}
+	if aimLib, ok := engine.GetVar("aim"); ok {
+		if _, ok := aimLib.(map[string]interface{}); ok {
+			aimExports := make(map[string]any, len(aiengine.Exports))
+			for k, v := range aiengine.Exports {
+				aimExports[k] = v
+			}
+			injectAIMSessionID := func(opts []aiengine.AIEngineConfigOption) []aiengine.AIEngineConfigOption {
+				return append([]aiengine.AIEngineConfigOption{
+					aiengine.WithOnSessionID(func(sessionID string) {
+						client.AIAgentSession(sessionID)
+					}),
+				}, opts...)
+			}
+			aimExports["InvokeReAct"] = func(input string, opts ...aiengine.AIEngineConfigOption) error {
+				return aiengine.InvokeReAct(input, injectAIMSessionID(opts)...)
+			}
+			aimExports["InvokeReActAsync"] = func(input string, opts ...aiengine.AIEngineConfigOption) (*aiengine.AIEngine, error) {
+				return aiengine.InvokeReActAsync(input, injectAIMSessionID(opts)...)
+			}
+			engine.SetVars(map[string]any{
+				"aim": aimExports,
 			})
 		}
 	}

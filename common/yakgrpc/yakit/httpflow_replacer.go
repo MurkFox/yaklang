@@ -5,6 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/dlclark/regexp2"
 	"github.com/google/uuid"
 	"github.com/jinzhu/gorm"
@@ -17,16 +25,9 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/lowhttp"
 	"github.com/yaklang/yaklang/common/utils/lowhttp/httpctx"
-	"github.com/yaklang/yaklang/common/utils/regexp-utils"
+	regexp_utils "github.com/yaklang/yaklang/common/utils/regexp-utils"
 	"github.com/yaklang/yaklang/common/yak/yaklib/codec"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
-	"net/http"
-	"net/url"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 )
 
 type Rules []*MITMReplaceRule
@@ -123,6 +124,17 @@ func (r *MITMReplaceRule) Compile() (*regexp2.Regexp, error) {
 		return r.cache, nil
 	}
 
+	// ExactMatch=true: treat Rule as a plain-text literal; skip regex compilation
+	// and escape all special characters so they match literally.
+	if r.GetExactMatch() {
+		_, _, re, err := utils.Regexp2Compile(regexp2.Escape(r.Rule))
+		if err != nil {
+			return nil, err
+		}
+		r.cache = re
+		return re, nil
+	}
+
 	rule, _, re, err := utils.Regexp2Compile(r.Rule)
 	if err != nil {
 		log.Debugf("regexp2 compile %v failed: %s", rule, err)
@@ -146,6 +158,102 @@ func (m *MITMReplaceRule) MatchRawSimple(rawPacket []byte) (bool, error) {
 	return r.MatchString(string(rawPacket))
 }
 
+// runSecondaryStagesFromPrimaryStrings 在 primaryRets 上执行 SecondaryStages；每个最终 MatchResult 嵌入
+// 最后一级阶段产生该输出时的 *regexp2.Match（与 MatchPacket/HookColor 写入 extracted_data 的 Index/Length 一致）。
+func (m *MITMReplaceRule) runSecondaryStagesFromPrimaryStrings(primaryRets []string, isRequest bool) ([]*MatchResult, error) {
+	stages := m.GetSecondaryStages()
+	if len(stages) == 0 || len(primaryRets) == 0 {
+		return nil, nil
+	}
+	type cell struct {
+		s  string
+		mm *regexp2.Match
+	}
+	cells := make([]cell, 0, len(primaryRets))
+	for _, s := range primaryRets {
+		cells = append(cells, cell{s: s, mm: nil})
+	}
+	for _, st := range stages {
+		if st == nil {
+			continue
+		}
+		reStr := strings.TrimSpace(st.GetRegexp())
+		if reStr == "" {
+			continue
+		}
+		joiner := st.GetJoiner()
+		if joiner == "" {
+			joiner = "\n"
+		}
+		parts := make([]string, len(cells))
+		for i := range cells {
+			parts[i] = cells[i].s
+		}
+		joined := strings.Join(parts, joiner)
+		re, err := regexp2.Compile(reStr, regexp2.None)
+		if err != nil {
+			return nil, err
+		}
+		mm, err := re.FindStringMatch(joined)
+		if err != nil {
+			return nil, err
+		}
+		if mm == nil {
+			return nil, nil
+		}
+		tpl := st.GetResultTemplate()
+		var nextCells []cell
+		for ; err == nil && mm != nil; mm, err = re.FindNextMatch(mm) {
+			cur := mm
+			var outStr string
+			if tpl != "" {
+				outStr = FormatRegexpGroups(tpl, func(n int) string {
+					g := cur.GroupByNumber(n)
+					if g != nil {
+						return g.String()
+					}
+					return ""
+				})
+			} else if cur.GroupCount() > 1 {
+				g := cur.GroupByNumber(1)
+				if g != nil {
+					outStr = g.String()
+				} else {
+					outStr = cur.String()
+				}
+			} else {
+				outStr = cur.String()
+			}
+			if outStr == "" {
+				continue
+			}
+			nextCells = append(nextCells, cell{s: outStr, mm: cur})
+		}
+		cells = nextCells
+		if len(cells) == 0 {
+			return nil, nil
+		}
+	}
+	finalParts := make([]string, len(cells))
+	for i := range cells {
+		finalParts[i] = cells[i].s
+	}
+	finalJoined := strings.Join(finalParts, "\n")
+	out := make([]*MatchResult, 0, len(cells))
+	for _, c := range cells {
+		out = append(out, &MatchResult{
+			Match:          c.mm,
+			IsMatchRequest: isRequest,
+			MatchResult:    c.s,
+			MetaInfo: &MatchMetaInfo{
+				Raw:    []byte(finalJoined),
+				Offset: 0,
+			},
+		})
+	}
+	return out, nil
+}
+
 func (m *MITMReplaceRule) MatchByHTTPFlow(rsp string) ([]*MatchResult, error) {
 	r, err := m.Compile()
 	if err != nil {
@@ -159,6 +267,7 @@ func (m *MITMReplaceRule) MatchByHTTPFlow(rsp string) ([]*MatchResult, error) {
 		return nil, nil
 	}
 	var res []*MatchResult
+	var primaryRets []string
 	var ret string
 	for ; err == nil && match != nil; match, err = r.FindNextMatch(match) {
 		if match.GroupCount() > 1 {
@@ -192,6 +301,7 @@ func (m *MITMReplaceRule) MatchByHTTPFlow(rsp string) ([]*MatchResult, error) {
 		if ret == "" {
 			continue
 		}
+		primaryRets = append(primaryRets, ret)
 		res = append(res, &MatchResult{
 			Match:          match,
 			IsMatchRequest: false,
@@ -202,7 +312,18 @@ func (m *MITMReplaceRule) MatchByHTTPFlow(rsp string) ([]*MatchResult, error) {
 			},
 		})
 	}
-	return res, nil
+
+	if len(m.GetSecondaryStages()) == 0 {
+		return res, nil
+	}
+	out, err := m.runSecondaryStagesFromPrimaryStrings(primaryRets, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func (m *MITMReplaceRule) MatchByPacketInfo(info *PacketInfo) ([]*MatchResult, error) {
@@ -258,6 +379,7 @@ func (m *MITMReplaceRule) MatchByPacketInfo(info *PacketInfo) ([]*MatchResult, e
 		})
 	}
 	var res []*MatchResult
+	var primaryRets []string
 	for _, item := range items {
 		match, err := r.FindStringMatch(string(item.Raw))
 		if err != nil {
@@ -300,6 +422,7 @@ func (m *MITMReplaceRule) MatchByPacketInfo(info *PacketInfo) ([]*MatchResult, e
 			if ret == "" {
 				continue
 			}
+			primaryRets = append(primaryRets, ret)
 			res = append(res, &MatchResult{
 				Match:          match,
 				IsMatchRequest: info.IsRequest,
@@ -308,7 +431,18 @@ func (m *MITMReplaceRule) MatchByPacketInfo(info *PacketInfo) ([]*MatchResult, e
 			})
 		}
 	}
-	return res, nil
+
+	if len(m.GetSecondaryStages()) == 0 {
+		return res, nil
+	}
+	out, err := m.runSecondaryStagesFromPrimaryStrings(primaryRets, info.IsRequest)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func (m *MITMReplaceRule) SplitPacket(packet []byte) (*PacketInfo, error) {
@@ -346,7 +480,7 @@ func (m *MITMReplaceRule) SplitPacket(packet []byte) (*PacketInfo, error) {
 		ungzip, err := utils.GzipDeCompress(bodyRaw)
 		if err == nil {
 			bodyRaw = ungzip
-			headerRaw = string(lowhttp.DeleteHTTPPacketHeader([]byte(headerRaw), info.ChunkedHeader))
+			headerRaw = string(lowhttp.DeleteHTTPPacketHeader([]byte(headerRaw), info.GzipHeader))
 		}
 	}
 
@@ -568,6 +702,20 @@ func (m *MitmReplacer) GetRule(r *ypb.MITMContentReplacer) *regexp2.Regexp {
 		return raw.(*regexp2.Regexp)
 	}
 
+	// ExactMatch=true: treat Rule as a plain-text literal; skip regex compilation
+	// and escape all special characters so they match literally.
+	if r.GetExactMatch() {
+		_, _, re, err := utils.Regexp2Compile(regexp2.Escape(r.Rule))
+		if err != nil {
+			log.Debugf("regexp2 compile escaped rule %v failed: %s", r.Rule, err)
+			m._ruleRegexpCache.Store(r, nil)
+			return nil
+		}
+		log.Debugf("regexp cache store (exact-match): %v", r.GetVerboseName())
+		m._ruleRegexpCache.Store(r, re)
+		return re
+	}
+
 	rule, _, re, err := utils.Regexp2Compile(r.Rule)
 	if err != nil {
 		log.Debugf("regexp2 compile %v failed: %s", rule, err)
@@ -728,7 +876,82 @@ func StringForSettingColor(s []string, flow ColorFlow) {
 			flow.Grey()
 		}
 	}
-	return
+}
+
+// appendHookColorExtractions 对 rules 中每条规则做 MatchPacket，将命中写入 extracted。
+// applyColorAndTag 为 true 时同步累积颜色与 Tag（用于「仅匹配」镜像规则）；为 false 时只写库数据，
+// 避免与劫持路径 / GetMatchedRule 已处理的着色、标记重复。
+// ph 用于将 MatchResult 中的 MITM 提取占位符（MITMExtractPlaceholder*）展开为当前流上下文（与 grpc HTTPFlow 分析路径一致）。
+func (m *MitmReplacer) appendHookColorExtractions(
+	request, response []byte,
+	req *http.Request,
+	hiddenIndex string,
+	skipResponseRuleMatch bool,
+	rules Rules,
+	applyColorAndTag bool,
+	extracted []*schema.ExtractedData,
+	colorName []string,
+	tagNames []string,
+	ph MITMExtractPlaceholders,
+) ([]*schema.ExtractedData, []string, []string) {
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+		matchResults := make([]*MatchResult, 0)
+		var newMatchResults []*MatchResult
+		var err error
+		if !rule.EnableForRequest && !rule.EnableForResponse {
+			continue
+		}
+
+		if rule.EffectiveURL != "" {
+			yakRegexp := regexp_utils.DefaultYakRegexpManager.GetYakRegexp(rule.EffectiveURL)
+			matchString, err := yakRegexp.MatchString(httpctx.GetRequestURL(req))
+			if err == nil && !matchString {
+				continue
+			}
+		}
+		if ruleShouldSkipBySuffix(rule.MITMContentReplacer, httpctx.GetRequestURL(req)) {
+			continue
+		}
+
+		if rule.EnableForRequest {
+			_, newMatchResults, err = rule.MatchPacket(request, true)
+			if err != nil && !IsMatchTimeout(err) {
+				log.Errorf("match package failed: %v", err)
+				continue
+			}
+			matchResults = append(matchResults, newMatchResults...)
+		}
+		if rule.EnableForResponse && !skipResponseRuleMatch {
+			_, newMatchResults, err = rule.MatchPacket(response, false)
+			if err != nil && !IsMatchTimeout(err) {
+				log.Errorf("match package failed: %v", err)
+				continue
+			}
+			matchResults = append(matchResults, newMatchResults...)
+		}
+
+		if len(matchResults) <= 0 {
+			continue
+		}
+		if applyColorAndTag {
+			if rule.Color != "" {
+				colorName = append(colorName, rule.Color)
+			}
+			tagNames = append(tagNames, rule.ExtraTag...)
+		}
+		for _, match := range matchResults {
+			extracted = append(extracted, ExtractedDataFromHTTPFlow(
+				hiddenIndex,
+				rule.VerboseName,
+				CloneMatchResultWithMITMPlaceholders(match, ph),
+				rule.String(),
+			))
+		}
+	}
+	return extracted, colorName, tagNames
 }
 
 func (m *MitmReplacer) HookColorWs(rawPacket []byte, flow *schema.WebsocketFlow) {
@@ -794,7 +1017,6 @@ func (m *MitmReplacer) HookColor(request, response []byte, req *http.Request, fl
 		colorName []string
 		tagNames  []string
 		extracted []*schema.ExtractedData
-		err       error
 	)
 
 	defer func() {
@@ -802,58 +1024,12 @@ func (m *MitmReplacer) HookColor(request, response []byte, req *http.Request, fl
 		flow.AddTag(tagNames...)
 	}()
 
-	for _, rule := range m._mirrorRules {
-		matchResults := make([]*MatchResult, 0)
-		newMatchResults := make([]*MatchResult, 0)
-		if !rule.EnableForRequest && !rule.EnableForResponse {
-			continue
-		}
+	ph := BuildMITMExtractPlaceholders(req, flow)
 
-		if rule.EffectiveURL != "" {
-			yakRegexp := regexp_utils.DefaultYakRegexpManager.GetYakRegexp(rule.EffectiveURL)
-			matchString, err := yakRegexp.MatchString(httpctx.GetRequestURL(req))
-			if err == nil && !matchString {
-				continue
-			}
-		}
-		if ruleShouldSkipBySuffix(rule.MITMContentReplacer, httpctx.GetRequestURL(req)) {
-			continue
-		}
-
-		if rule.EnableForRequest {
-			_, newMatchResults, err = rule.MatchPacket(request, true)
-			if err != nil && !IsMatchTimeout(err) {
-				log.Errorf("match package failed: %v", err)
-				continue
-			}
-			matchResults = append(matchResults, newMatchResults...)
-		}
-		if rule.EnableForResponse && !skipResponseRuleMatch {
-			_, newMatchResults, err = rule.MatchPacket(response, false)
-			if err != nil && !IsMatchTimeout(err) {
-				log.Errorf("match package failed: %v", err)
-				continue
-			}
-			matchResults = append(matchResults, newMatchResults...)
-		}
-
-		if len(matchResults) <= 0 {
-			continue
-		}
-		if rule.Color != "" {
-			colorName = append(colorName, rule.Color)
-		}
-		tagNames = append(tagNames, rule.ExtraTag...) // merge tag name
-
-		for _, match := range matchResults {
-			extracted = append(extracted, ExtractedDataFromHTTPFlow(
-				flow.HiddenIndex,
-				rule.VerboseName,
-				match,
-				rule.String(),
-			))
-		}
-	}
+	extracted, colorName, tagNames = m.appendHookColorExtractions(
+		request, response, req, flow.HiddenIndex, skipResponseRuleMatch, m._mirrorRules, true, extracted, colorName, tagNames, ph)
+	extracted, colorName, tagNames = m.appendHookColorExtractions(
+		request, response, req, flow.HiddenIndex, skipResponseRuleMatch, m._hijackingRules, false, extracted, colorName, tagNames, ph)
 	// 将替换的规则提前，因为一般来说比较重要
 	if ret := httpctx.GetMatchedRule(req); len(ret) > 0 {
 		lastRule := ret[len(ret)-1]
@@ -1160,10 +1336,10 @@ func (m *MitmReplacer) Hook(isRequest, isResponse bool, url string, origin []byt
 				lowhttp.WithRedirectTimes(0),
 			}
 			for _, tag := range matchedRule.ExtraTag {
-				opts = append(opts, lowhttp.WithAppendHTTPFlowTag("[重发]"+tag))
+				opts = append(opts, lowhttp.WithAppendHTTPFlowTag(HTTPFlowTagResend+tag))
 			}
 			if len(matchedRule.ExtraTag) == 0 {
-				opts = append(opts, lowhttp.WithAppendHTTPFlowTag("[重发]"))
+				opts = append(opts, lowhttp.WithAppendHTTPFlowTag(HTTPFlowTagResend))
 			}
 			if matchedRule.Color != "" {
 				opts = append(opts, lowhttp.WithAppendHTTPFlowTag(schema.COLORPREFIX+matchedRule.Color))
@@ -1206,7 +1382,6 @@ func (m *MitmReplacer) HookColorLowhttp(flow *lowhttp.LowhttpResponse) []*schema
 		colorName []string
 		tagNames  []string
 		extracted []*schema.ExtractedData
-		err       error
 	)
 
 	defer func() {
@@ -1214,58 +1389,12 @@ func (m *MitmReplacer) HookColorLowhttp(flow *lowhttp.LowhttpResponse) []*schema
 		flow.AddTags(tagNames...)
 	}()
 
-	for _, rule := range m._mirrorRules {
-		matchResults := make([]*MatchResult, 0)
-		newMatchResults := make([]*MatchResult, 0)
-		if !rule.EnableForRequest && !rule.EnableForResponse {
-			continue
-		}
+	ph := BuildMITMExtractPlaceholdersLowhttp(req, flow.Url)
 
-		if rule.EffectiveURL != "" {
-			yakRegexp := regexp_utils.DefaultYakRegexpManager.GetYakRegexp(rule.EffectiveURL)
-			matchString, err := yakRegexp.MatchString(httpctx.GetRequestURL(req))
-			if err == nil && !matchString {
-				continue
-			}
-		}
-		if ruleShouldSkipBySuffix(rule.MITMContentReplacer, httpctx.GetRequestURL(req)) {
-			continue
-		}
-
-		if rule.EnableForRequest {
-			_, newMatchResults, err = rule.MatchPacket(request, true)
-			if err != nil && !IsMatchTimeout(err) {
-				log.Errorf("match package failed: %v", err)
-				continue
-			}
-			matchResults = append(matchResults, newMatchResults...)
-		}
-		if rule.EnableForResponse && !skipResponseRuleMatch {
-			_, newMatchResults, err = rule.MatchPacket(response, false)
-			if err != nil && !IsMatchTimeout(err) {
-				log.Errorf("match package failed: %v", err)
-				continue
-			}
-			matchResults = append(matchResults, newMatchResults...)
-		}
-
-		if len(matchResults) <= 0 {
-			continue
-		}
-		if rule.Color != "" {
-			colorName = append(colorName, rule.Color)
-		}
-		tagNames = append(tagNames, rule.ExtraTag...) // merge tag name
-
-		for _, match := range matchResults {
-			extracted = append(extracted, ExtractedDataFromHTTPFlow(
-				flow.HiddenIndex,
-				rule.VerboseName,
-				match,
-				rule.String(),
-			))
-		}
-	}
+	extracted, colorName, tagNames = m.appendHookColorExtractions(
+		request, response, req, flow.HiddenIndex, skipResponseRuleMatch, m._mirrorRules, true, extracted, colorName, tagNames, ph)
+	extracted, colorName, tagNames = m.appendHookColorExtractions(
+		request, response, req, flow.HiddenIndex, skipResponseRuleMatch, m._hijackingRules, false, extracted, colorName, tagNames, ph)
 	// 将替换的规则提前，因为一般来说比较重要
 	if ret := httpctx.GetMatchedRule(req); len(ret) > 0 {
 		lastRule := ret[len(ret)-1]

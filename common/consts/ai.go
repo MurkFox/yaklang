@@ -197,8 +197,44 @@ func thirdPartyConfigToModelConfig(cfg *ypb.ThirdPartyApplicationConfig) *ypb.AI
 		UserSecret:     cfg.GetUserSecret(),
 		Namespace:      cfg.GetNamespace(),
 		Domain:         cfg.GetDomain(),
+		BaseURL:        cfg.GetBaseURL(),
+		Endpoint:       cfg.GetEndpoint(),
+		EnableEndpoint: cfg.GetEnableEndpoint(),
+		EnableThinking: cfg.GetEnableThinking(),
 		WebhookURL:     cfg.GetWebhookURL(),
 		Disabled:       cfg.GetDisabled(),
+		Proxy:          cfg.GetProxy(),
+		NoHttps:        cfg.GetNoHttps(),
+		APIType:        cfg.GetAPIType(),
+		Headers:        cloneHTTPHeadersForAIConfig(cfg.GetHeaders()),
+	}
+	if cfg.MaxTokens != nil {
+		v := *cfg.MaxTokens
+		provider.MaxTokens = &v
+	}
+	if cfg.Temperature != nil {
+		v := *cfg.Temperature
+		provider.Temperature = &v
+	}
+	if cfg.TopP != nil {
+		v := *cfg.TopP
+		provider.TopP = &v
+	}
+	if cfg.TopK != nil {
+		v := *cfg.TopK
+		provider.TopK = &v
+	}
+	if cfg.FrequencyPenalty != nil {
+		v := *cfg.FrequencyPenalty
+		provider.FrequencyPenalty = &v
+	}
+	if cfg.ReasoningEffort != nil {
+		s := *cfg.ReasoningEffort
+		provider.ReasoningEffort = &s
+	}
+	if cfg.EnableThinkingOpt != nil {
+		v := *cfg.EnableThinkingOpt
+		provider.EnableThinkingOpt = &v
 	}
 
 	return &ypb.AIModelConfig{
@@ -208,6 +244,23 @@ func thirdPartyConfigToModelConfig(cfg *ypb.ThirdPartyApplicationConfig) *ypb.AI
 	}
 }
 
+func cloneHTTPHeadersForAIConfig(headers []*ypb.KVPair) []*ypb.KVPair {
+	if len(headers) == 0 {
+		return nil
+	}
+	cloned := make([]*ypb.KVPair, 0, len(headers))
+	for _, header := range headers {
+		if header == nil {
+			continue
+		}
+		cloned = append(cloned, &ypb.KVPair{
+			Key:   header.GetKey(),
+			Value: header.GetValue(),
+		})
+	}
+	return cloned
+}
+
 const (
 	RoutingPolicyAuto        = string(PolicyAuto)
 	RoutingPolicyPerformance = string(PolicyPerformance)
@@ -215,4 +268,5 @@ const (
 	RoutingPolicyBalance     = string(PolicyBalance)
 	DefaultRoutingPolicy     = RoutingPolicyBalance
 	ModelExtraParamKey       = "model"
+	BuildinModelExtraParamKey       = "isBuildin"
 )

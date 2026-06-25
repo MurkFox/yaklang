@@ -136,7 +136,14 @@ func (t ToolInputSchema) MarshalJSON() ([]byte, error) {
 
 	if t.Properties != nil {
 		t.Properties.ForEach(func(k string, v any) bool {
-			temp.Properties[k] = normalizeSchemaValue(v)
+			normalized := normalizeSchemaValue(v)
+			if m, ok := normalized.(map[string]any); ok {
+				if _, isBool := m["required"].(bool); isBool {
+					delete(m, "required")
+				}
+				normalized = m
+			}
+			temp.Properties[k] = normalized
 			return true
 		})
 	}
@@ -256,6 +263,20 @@ func Enum(values ...any) PropertyOption {
 func EnumString(values ...string) PropertyOption {
 	return func(schema map[string]any) {
 		schema["enum"] = lo.Map(values, func(item string, _ int) any { return item })
+	}
+}
+
+// ItemsEnum sets the enum constraint on the items schema of an array property.
+// Use this instead of Enum for array-typed fields to comply with strict JSON Schema
+// validators (e.g. Gemini) that only allow enum on string-typed fields.
+func ItemsEnum(values ...string) PropertyOption {
+	return func(schema map[string]any) {
+		items, ok := schema["items"].(map[string]any)
+		if !ok {
+			items = map[string]any{"type": "string"}
+			schema["items"] = items
+		}
+		items["enum"] = lo.Map(values, func(item string, _ int) any { return item })
 	}
 }
 
@@ -388,7 +409,9 @@ func WithStructArray(name string, opts []PropertyOption, itemsOpt ...ToolOption)
 			return true
 		})
 	}
-	items["required"] = temp.InputSchema.Required
+	if len(temp.InputSchema.Required) > 0 {
+		items["required"] = append([]string(nil), temp.InputSchema.Required...)
+	}
 	return WithRaw(name, schema, opts...)
 }
 
@@ -398,7 +421,9 @@ func WithStruct(name string, opts []PropertyOption, itemsOpt ...ToolOption) Tool
 	}
 	temp := NewTool("", itemsOpt...)
 	schema["properties"] = temp.InputSchema.Properties
-	schema["required"] = temp.InputSchema.Required
+	if len(temp.InputSchema.Required) > 0 {
+		schema["required"] = append([]string(nil), temp.InputSchema.Required...)
+	}
 	return WithRaw(name, schema, opts...)
 }
 
@@ -412,7 +437,9 @@ func WithOneOfStruct(name string, opts []PropertyOption, itemsOpt ...[]ToolOptio
 		temp := NewTool("", itemOpt...)
 		m := map[string]any{
 			"properties": temp.InputSchema.Properties,
-			"required":   temp.InputSchema.Required,
+		}
+		if len(temp.InputSchema.Required) > 0 {
+			m["required"] = append([]string(nil), temp.InputSchema.Required...)
 		}
 		oneOfArray = append(oneOfArray, m)
 	}
@@ -430,7 +457,9 @@ func WithAnyOfStruct(name string, opts []PropertyOption, itemsOpt ...[]ToolOptio
 		temp := NewTool("", itemOpt...)
 		m := map[string]any{
 			"properties": temp.InputSchema.Properties,
-			"required":   temp.InputSchema.Required,
+		}
+		if len(temp.InputSchema.Required) > 0 {
+			m["required"] = append([]string(nil), temp.InputSchema.Required...)
 		}
 		anyOfArray = append(anyOfArray, m)
 	}
@@ -439,6 +468,12 @@ func WithAnyOfStruct(name string, opts []PropertyOption, itemsOpt ...[]ToolOptio
 }
 
 func WithPaging(name string, fieldNames []string, opts ...PropertyOption) ToolOption {
+	orderBySchema := map[string]any{
+		"type": "string",
+	}
+	if len(fieldNames) > 0 {
+		orderBySchema["enum"] = fieldNames
+	}
 	schema := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -450,11 +485,9 @@ func WithPaging(name string, fieldNames []string, opts ...PropertyOption) ToolOp
 			},
 			"order": map[string]any{
 				"type": "string",
-				"enum": fieldNames,
+				"enum": []string{"asc", "desc"},
 			},
-			"orderby": map[string]any{
-				"type": "string",
-			},
+			"orderby": orderBySchema,
 		},
 	}
 	return WithRaw(name, schema, opts...)
@@ -486,13 +519,15 @@ func WithRaw(name string, object map[string]any, opts ...PropertyOption) ToolOpt
 			opt(object)
 		}
 
-		// Remove required from property schema and add to InputSchema.required
-		if required, ok := object["required"].(bool); ok && required {
+		// Bool required is internal metadata; promote true to InputSchema.required and never export false.
+		if required, ok := object["required"].(bool); ok {
 			delete(object, "required")
-			if t.InputSchema.Required == nil {
-				t.InputSchema.Required = []string{name}
-			} else {
-				t.InputSchema.Required = append(t.InputSchema.Required, name)
+			if required {
+				if t.InputSchema.Required == nil {
+					t.InputSchema.Required = []string{name}
+				} else {
+					t.InputSchema.Required = append(t.InputSchema.Required, name)
+				}
 			}
 		}
 

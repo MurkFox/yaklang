@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"runtime"
@@ -253,14 +252,32 @@ func (e *Entrypoints) PeekProvider(model string) *Provider {
 // PeekOrderedProviders returns providers for the given model in random order
 // Only returns providers with latency < 10s, randomly shuffled
 // If no low-latency providers are available but providers exist, triggers immediate health check
+//
+// 关键词: aibalance, PeekOrderedProviders, 随机洗牌
+// 等价于 PeekOrderedProvidersWithAffinity(model, "")，保留向后兼容
 func (e *Entrypoints) PeekOrderedProviders(model string) []*Provider {
+	return e.PeekOrderedProvidersWithAffinity(model, "")
+}
+
+// PeekOrderedProvidersWithAffinity returns providers for the given model with optional affinity routing.
+//
+// affinityKey 不为空时，启用"亲和性路由"：
+//   - 在健康 provider 集合中根据 hash(affinityKey) mod len(healthy) 选出"主 provider"，置于第一位
+//   - 其余 provider 仍然随机洗牌后跟随，保留失败重试时的负载均衡能力
+//   - 同一 affinityKey 在健康集合不变时稳定路由到同一 provider，让上游隐式缓存有机会被复用
+//
+// affinityKey 为空时，行为与原 PeekOrderedProviders 一致（完全随机洗牌）。
+//
+// 关键词: aibalance, 亲和性路由, 隐式缓存, sticky routing
+func (e *Entrypoints) PeekOrderedProvidersWithAffinity(model string, affinityKey string) []*Provider {
 	providers, ok := e.providers[model]
 	if !ok || len(providers) == 0 {
 		log.Debugf("No providers found for model: %s", model)
 		return nil
 	}
 
-	log.Infof("PeekOrderedProviders for model %s: found %d providers", model, len(providers))
+	log.Infof("PeekOrderedProviders for model %s: found %d providers (affinity=%v)",
+		model, len(providers), affinityKey != "")
 
 	// 如果只有一个提供者，无论其健康状况如何，都直接返回
 	if len(providers) == 1 {
@@ -322,6 +339,27 @@ func (e *Entrypoints) PeekOrderedProviders(model string) []*Provider {
 
 	log.Debugf("Found %d valid providers (latency < 10s) for model %s", len(validProviders), model)
 
+	// 选取主 provider 的索引：亲和性路由时由 affinityKey 决定，否则随机
+	// 关键词: 隐式缓存, 亲和性路由, 主 provider 选择
+	primaryIdx := -1
+	if affinityKey != "" && len(validProviders) >= 2 {
+		// 为了在健康集合内稳定选取，对集合做一次确定性排序后再 hash mod
+		// 排序键 = TypeName + DomainOrURL + APIKey 的 sha1，跨进程稳定
+		// 关键词: 亲和性路由, 健康集合稳定排序
+		stableSorted := make([]*Provider, len(validProviders))
+		copy(stableSorted, validProviders)
+		sortProvidersStably(stableSorted)
+		// 把 sorted 后的索引映射回 validProviders 的位置
+		picked := stableSorted[hashAffinityKey(affinityKey)%uint32(len(stableSorted))]
+		for i, p := range validProviders {
+			if p == picked {
+				primaryIdx = i
+				break
+			}
+		}
+		log.Debugf("Affinity routing: affinityKey=%s primary=%s", affinityKey, picked.TypeName)
+	}
+
 	// 使用 Fisher-Yates 洗牌算法完全随机打乱
 	shuffledProviders := make([]*Provider, len(validProviders))
 	copy(shuffledProviders, validProviders)
@@ -331,14 +369,100 @@ func (e *Entrypoints) PeekOrderedProviders(model string) []*Provider {
 		shuffledProviders[i], shuffledProviders[j] = shuffledProviders[j], shuffledProviders[i]
 	}
 
-	// 输出随机排序结果
-	log.Debugf("Randomly shuffled providers for model %s:", model)
+	// 亲和性路由：把"主 provider"提到第一位，其余顺序保持洗牌后的随机
+	// 这样既保证缓存命中（首选确定），又保留了失败重试时的负载分散
+	// 关键词: 亲和性路由, 主 provider 置顶
+	if primaryIdx >= 0 {
+		// 在 shuffled 中找到 validProviders[primaryIdx] 对应的实例
+		target := validProviders[primaryIdx]
+		for i, p := range shuffledProviders {
+			if p == target {
+				if i != 0 {
+					shuffledProviders[0], shuffledProviders[i] = shuffledProviders[i], shuffledProviders[0]
+				}
+				break
+			}
+		}
+	}
+
+	// 输出排序结果
+	log.Debugf("Ordered providers for model %s (affinity=%v):", model, affinityKey != "")
 	for i, p := range shuffledProviders {
 		log.Debugf("  %d. %s (latency: %dms, healthy: %v)",
 			i+1, p.TypeName, p.DbProvider.LastLatency, p.DbProvider.IsHealthy)
 	}
 
 	return shuffledProviders
+}
+
+// sortProvidersStably 按 TypeName+DomainOrURL+APIKey 字典序排序，跨进程稳定
+// 关键词: 亲和性路由, 稳定排序
+func sortProvidersStably(in []*Provider) {
+	sort.Slice(in, func(i, j int) bool {
+		ki := in[i].TypeName + "|" + in[i].DomainOrURL + "|" + in[i].APIKey
+		kj := in[j].TypeName + "|" + in[j].DomainOrURL + "|" + in[j].APIKey
+		return ki < kj
+	})
+}
+
+// hashAffinityKey 将 affinityKey 哈希为 uint32，用于稳定的 mod 选择
+// 使用 FNV-1a 64-bit 后截断，速度快、分布均匀
+// 关键词: 亲和性路由, FNV hash
+func hashAffinityKey(key string) uint32 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	return uint32(h)
+}
+
+// BuildPromptAffinityKey 把 prompt 前缀 + apiKey + model 拼成稳定的 affinityKey
+// prompt 取前 prefixLen 字节足以代表"逻辑请求"的稳定特征：
+//   - 隐式缓存依赖前缀字节匹配，prompt 后段差异不影响 provider 选择
+//   - apiKey 不同 → 上游账号级隔离，必须分桶
+//   - model 不同 → 上游模型级隔离，必须分桶
+//
+// 关键词: 亲和性路由, prompt 前缀, BuildPromptAffinityKey
+func BuildPromptAffinityKey(prompt, apiKey, model string, prefixLen int) string {
+	if prefixLen <= 0 {
+		prefixLen = 2048
+	}
+	end := prefixLen
+	if end > len(prompt) {
+		end = len(prompt)
+	}
+	// 使用 sha1 16 位，足够抗碰撞且短
+	return utils.CalcSha1(prompt[:end], apiKey, model)
+}
+
+// serializeMessagesForAffinity 把 messages 数组按稳定 JSON 字节序列化，
+// 用于 affinity key 计算与统计。json.Marshal 在结构体 tag 顺序固定的情况下
+// 会输出确定字节序（map[string]any 有运行时排序保证），满足"逻辑相同 ->
+// 字节相同 -> 路由相同"的稳定性需求。
+//
+// 关键词: serializeMessagesForAffinity, messages 稳定序列化
+func serializeMessagesForAffinity(msgs []aispec.ChatDetail) string {
+	if len(msgs) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(msgs)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// BuildMessagesAffinityKey 基于 messages 数组前缀 + apiKey + model 计算稳定 affinityKey。
+// 与 BuildPromptAffinityKey 不同的是，它不再依赖被拍平的 prompt 字符串，
+// 而是用 messages 数组的 JSON 序列化前缀作为"逻辑请求指纹"。这样更贴近
+// 上游 LLM 实际看到的请求体字节序，有利于：
+//   - aibalance 把同一 messages 路由到同一上游 provider（亲和性）
+//   - 上游隐式缓存按 messages JSON 字节前缀做 LCP 匹配 -> 命中率提升
+//
+// 关键词: 亲和性路由, BuildMessagesAffinityKey, messages 前缀
+func BuildMessagesAffinityKey(msgs []aispec.ChatDetail, apiKey, model string, prefixLen int) string {
+	return BuildPromptAffinityKey(serializeMessagesForAffinity(msgs), apiKey, model, prefixLen)
 }
 
 // GetAllProviders returns all providers for the given model
@@ -389,7 +513,19 @@ func (c *ServerConfig) LoadAPIKeysFromDB() error {
 	c.Keys.keys = make(map[string]*Key) // 同时清空 Keys 结构
 
 	// 加载到内存配置
+	// 关键词: LoadAPIKeysFromDB 跳过禁用 key, Active=false 不入内存, 禁用即时生效
+	// 请求时通过 c.Keys.Get(apiKey) 判定 key 是否有效（见 gateChatAPIKeyAndLimits /
+	// gateEmbeddingAPIKeyAndLimits）。因此被禁用(Active=false)的 key 不应进入内存生效集合，
+	// 否则禁用动作对实际请求无效。管理员 deactivate / OPS update active=false 落库后调用
+	// 本函数即可让禁用即时生效。注意：schema 中 active 默认 true，迁移时存量行已被置为 true，
+	// 因此不会误伤历史 key。
+	skippedInactive := 0
 	for _, key := range apiKeys {
+		if !key.Active {
+			skippedInactive++
+			log.Infof("Skip inactive API key (not loaded into memory): %s", utils.ShrinkString(key.APIKey, 8))
+			continue
+		}
 		// 解析允许的模型列表
 		modelNames := strings.Split(key.AllowedModels, ",")
 		modelMap := make(map[string]bool)
@@ -420,7 +556,7 @@ func (c *ServerConfig) LoadAPIKeysFromDB() error {
 		log.Infof("Loaded API key: %s with allowed models: %v", utils.ShrinkString(key.APIKey, 8), modelMap)
 	}
 
-	log.Infof("Successfully loaded %d API keys from database", len(apiKeys))
+	log.Infof("Successfully loaded %d active API keys from database (skipped %d inactive)", len(apiKeys)-skippedInactive, skippedInactive)
 	return nil
 }
 
@@ -449,7 +585,46 @@ type ServerConfig struct {
 	// Rate limiter for free amap proxy users (Trace-ID based, sleep/wait mode)
 	amapRateLimiter       *AmapRateLimiter
 	amapHealthCheckStopCh chan struct{}
-	closeOnce             sync.Once
+
+	// RPM rate limiter for chat completions (per API key, with per-model overrides)
+	chatRateLimiter *ChatRateLimiter
+	// 免费用户调用前延迟区间（秒）。
+	//   - freeUserDelayMaxSec <= 0 时按老语义 N~2N（其中 N = freeUserDelayMinSec）。
+	//   - freeUserDelayMinSec == 0 且 freeUserDelayMaxSec > 0 时为 [0, max]。
+	// 关键词: ServerConfig freeUserDelayMinSec freeUserDelayMaxSec, N~M 区间延迟
+	freeUserDelayMinSec int64
+	freeUserDelayMaxSec int64
+
+	// 输出 Token Per Second 限速（免费用户）。0 = 不限速。
+	// 关键词: ServerConfig freeUserOutputTPS, 全局输出 TPS 上限
+	freeUserOutputTPS int64
+
+	// 全局共享池软限额配置
+	// 关键词: ServerConfig freeUserTokenSoftLimitM, freeUserSoftLimitTPS
+	freeUserTokenSoftLimitM int64
+	freeUserSoftLimitTPS    int64
+
+	// inFlightTokens 维护"在途请求预扣 token 总量"，按 daily token 桶分组。
+	// 与 DB 的 bucket_db_used 加和后参与 daily check，硬卡死并发过冲。
+	// 服务重启自动归零 (重启意味着 in-flight 流都被切断)。
+	// 关键词: ServerConfig.inFlightTokens 过冲防御, daily check 并发预扣
+	inFlightTokens *InFlightTokenTracker
+
+	// MirrorManager 负责把成功的 chat 请求快照异步分发给用户配置的
+	// 镜像规则 (yak 回调脚本). 设计为完全异步、绝不阻塞主请求链路.
+	// 关键词: ServerConfig.MirrorManager, mirror traffic hook, callback yak
+	MirrorManager *MirrorManager
+
+	// 自定义 429/错误文案 + 模型降级规则缓存（由 applyRateLimitConfig 从 DB 配置刷新），
+	// 避免在限流拒绝 / 降级判定路径上反复读 DB。受 limitPolicyMu 保护。
+	// 关键词: ServerConfig custom429 缓存, resolveLimit429, modelDowngradeRules 缓存, resolveModelDowngrade
+	limitPolicyMu          sync.RWMutex
+	custom429Enabled       bool
+	custom429Notice        string
+	custom429KindOverrides map[string]string
+	modelDowngradeRules    []ModelDowngradeRule
+
+	closeOnce sync.Once
 }
 
 // NewServerConfig creates a new server configuration
@@ -476,6 +651,26 @@ func NewServerConfig() *ServerConfig {
 	// Initialize amap rate limiter and health check stop channel
 	config.amapRateLimiter = NewAmapRateLimiter()
 	config.amapHealthCheckStopCh = make(chan struct{})
+	// Initialize chat RPM rate limiter
+	config.chatRateLimiter = NewChatRateLimiter()
+	config.freeUserDelayMinSec = 3
+	config.freeUserDelayMaxSec = 0 // 0 触发老语义 N~2N 兜底（即 3~6 秒）
+	// Initialize in-flight token tracker (overflow defense for daily token check)
+	// 关键词: NewServerConfig inFlightTokens 初始化
+	config.inFlightTokens = NewInFlightTokenTracker()
+
+	// Initialize mirror manager and load enabled rules from DB.
+	// Schema migration is best-effort (skipped if DB not yet initialized).
+	// 关键词: NewServerConfig MirrorManager 初始化, mirror rule 启动加载
+	config.MirrorManager = NewMirrorManager()
+	if db := GetDB(); db != nil {
+		if err := EnsureMirrorRuleTable(); err != nil {
+			log.Warnf("ensure mirror rule table failed: %v", err)
+		}
+		if err := config.MirrorManager.LoadRules(); err != nil {
+			log.Warnf("load mirror rules failed: %v", err)
+		}
+	}
 	return config
 }
 
@@ -493,6 +688,12 @@ func (c *ServerConfig) Close() {
 		}
 		if c.amapHealthCheckStopCh != nil {
 			close(c.amapHealthCheckStopCh)
+		}
+		if c.chatRateLimiter != nil {
+			c.chatRateLimiter.Stop()
+		}
+		if c.MirrorManager != nil {
+			c.MirrorManager.Close()
 		}
 	})
 }
@@ -537,7 +738,14 @@ func (c *ServerConfig) getKeyFromRawRequest(req []byte) *Key {
 
 func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 	atomic.AddInt64(&c.concurrentChatRequests, 1)
-	defer atomic.AddInt64(&c.concurrentChatRequests, -1)
+	concurrentReleased := false
+	releaseConcurrent := func() {
+		if !concurrentReleased {
+			concurrentReleased = true
+			atomic.AddInt64(&c.concurrentChatRequests, -1)
+		}
+	}
+	defer releaseConcurrent()
 	c.logInfo("Starting to handle new chat completion request")
 	// handle ai request
 	auth := ""
@@ -568,116 +776,98 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 		return
 	}
 
+	// debug trace 抓包会话: env AIBALANCE_DEBUG_TRACE / AIBALANCE_TRACE_DIR
+	// 任一打开时启用. 同时 wrap conn 把所有下行字节 tee 到 04 文件,
+	// 把客户端原始请求体写入 01 文件; aispec 上游 raw HTTP request/response
+	// 字节会在 GetAIClientWithRawMessagesAndTrace 中接到 trace.
+	// 关键词: serveChatCompletions trace session 创建, wrap conn, client body 落盘
+	traceSession := NewDebugTraceSession("")
+	if traceSession != nil {
+		defer traceSession.Close()
+		traceSession.WriteClientRequest(body)
+		conn = WrapConnForTrace(conn, traceSession)
+	}
+
 	stream := bodyIns.Stream
 	log.Infof("user require stream flag: %v", stream)
 
 	modelName := bodyIns.Model
 	c.logInfo("Requested model: %s", modelName)
+	// 模型用途类型降级（保护用量）：按 X-Yak-AI-Model-Usage-Type + 配置规则可能改写 modelName。
+	// 须在 isFreeModel 判定 / memfit gate / provider 查找 / 计费之前完成，使全链路沿用降级后模型。
+	// 关键词: serveChatCompletions gateLightweightDowngrade, 轻量降级保护用量
+	modelName = c.gateLightweightDowngrade(rawPacket, modelName)
 	isFreeModel := strings.HasSuffix(modelName, "-free")
 	if isFreeModel {
 		c.logInfo("Request is for a free model, skipping key verification.")
 	}
 
-	// Check if this is a memfit model that requires TOTP authentication
-	if IsMemfitModel(modelName) {
-		c.logInfo("Memfit model detected, checking TOTP authentication...")
-		totpHeader := lowhttp.GetHTTPPacketHeader(rawPacket, "X-Memfit-OTP-Auth")
-		if totpHeader == "" {
-			c.logError("Memfit model requires TOTP authentication, but X-Memfit-OTP-Auth header is missing")
-			c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]interface{}{
-				"error": map[string]string{
-					"message": "Memfit TOTP authentication required. Please provide X-Memfit-OTP-Auth header with base64 encoded TOTP code.",
-					"type":    "memfit_totp_auth_required",
-				},
-			})
-			return
-		}
-
-		verified, err := VerifyMemfitTOTP(totpHeader)
-		if err != nil || !verified {
-			c.logError("Memfit TOTP authentication failed: %v", err)
-			c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]interface{}{
-				"error": map[string]string{
-					"message": "Memfit TOTP authentication failed. Please refresh your TOTP secret and try again.",
-					"type":    "memfit_totp_auth_failed",
-				},
-			})
-			return
-		}
-		c.logInfo("Memfit TOTP authentication successful for model: %s", modelName)
+	// memfit 模型 TOTP 鉴权 + 客户端版本控流（gate 内部已写好 4xx/429 响应）
+	// 关键词: serveChatCompletions gate 抽离, gateChatMemfitAuthAndVersion
+	if c.gateChatMemfitAuthAndVersion(conn, rawPacket, modelName) {
+		return
 	}
 
-	var key *Key
-	var apiKeyForStat string
+	// API key 解析 + 流量/Token 限额 + 允许模型校验（gate 内部已写好 4xx/429 响应）
+	// 关键词: serveChatCompletions gate 抽离, gateChatAPIKeyAndLimits
+	key, apiKeyForStat, blocked := c.gateChatAPIKeyAndLimits(conn, auth, modelName, isFreeModel)
+	if blocked {
+		return
+	}
 
-	if isFreeModel {
-		apiKeyForStat = "free-user"
-	} else {
-		value := strings.TrimPrefix(auth, "Bearer ")
-		c.logInfo("Extracted key from authentication info: %s", value)
-		if value == "" {
-			c.logError("No valid authentication info provided")
-			conn.Write([]byte("HTTP/1.1 401 Unauthorized\r\n\r\n"))
-			return
-		}
-
-		var ok bool
-		key, ok = c.Keys.Get(value)
-		if !ok {
-			c.logError("No matching key configuration found: %s", value)
-			conn.Write([]byte("HTTP/1.1 401 Unauthorized\r\n\r\n"))
-			return
-		}
-		apiKeyForStat = key.Key
-		c.logInfo("Successfully verified key: %s", key.Key)
-
-		// Check traffic limit before processing request
-		trafficAllowed, err := CheckAiApiKeyTrafficLimit(key.Key)
-		if err != nil {
-			c.logError("Failed to check traffic limit for key %s: %v", utils.ShrinkString(key.Key, 8), err)
-		} else if !trafficAllowed {
-			c.logError("API key %s has exceeded traffic limit", utils.ShrinkString(key.Key, 8))
-			c.writeJSONResponse(conn, http.StatusTooManyRequests, map[string]interface{}{
-				"error": map[string]string{
-					"message": "API key has exceeded traffic limit. Please contact administrator to increase limit or reset usage.",
-					"type":    "traffic_limit_exceeded",
-				},
-			})
-			return
-		}
-
-		// Authorization check with glob pattern support
-		allowedModels, ok := c.KeyAllowedModels.Get(key.Key)
-		if !ok {
-			c.logError("Key[%v] has no allowed models configured", key.Key)
-			conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-			return
-		}
-
-		// Use IsModelAllowed which supports glob patterns
-		if !c.KeyAllowedModels.IsModelAllowed(key.Key, modelName) {
-			allowedModelKeys := make([]string, 0, len(allowedModels))
-			for k := range allowedModels {
-				allowedModelKeys = append(allowedModelKeys, k)
+	// 日活记录：在 apiKeyForStat 已经定型、且本次请求确认会进入下游处理（限流前）后，
+	// 把客户端身份指纹去重落到 ai_daily_user_seen。
+	// 任何失败都仅 logWarn，绝不阻塞用户请求。
+	// 关键词: aibalance DAU, RecordDailyUserSeen, hot path 不阻塞
+	{
+		sourceKind, userHash := extractUserIdentity(rawPacket, conn, key, isFreeModel)
+		// 部署在 nginx / Cloudflare 反代后, free_ip 桶必须依赖 X-Forwarded-For /
+		// CF-Connecting-IP / X-Real-IP 等头才能拿到真实客户端 IP, 否则所有 free
+		// 用户被收敛成 1 个 nginx 内网 IP, free_ip DAU 永远 = 1。这里把识别出的
+		// 真实 IP 与 conn.RemoteAddr 一起 logInfo, 部署后能立即在日志里核对反代
+		// 头是否生效, 比 portal 上看 DAU 数字反馈更快。
+		// 关键词: free_ip 真实 IP 可观测性, nginx 反代 IP 修复 部署验证
+		if sourceKind == SourceKindFreeIP {
+			realIP := extractClientIP(rawPacket, conn)
+			rawAddr := ""
+			if conn != nil && conn.RemoteAddr() != nil {
+				rawAddr = conn.RemoteAddr().String()
 			}
-			c.logError("Key[%v] requested model %s is not in allowed list (including glob patterns), allowed models/patterns: %v", key.Key, modelName, allowedModelKeys)
-			conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-			return
+			c.logInfo("DAU free_ip identity: real_ip=%q conn_remote=%q user_hash=%s",
+				realIP, rawAddr, userHash)
+		}
+		if err := RecordDailyUserSeen(time.Now().Format("2006-01-02"), sourceKind, userHash); err != nil {
+			c.logWarn("RecordDailyUserSeen failed (source_kind=%s): %v", sourceKind, err)
 		}
 	}
 
+	// 真实客户端 IP：用于「单 IP 免费模型每日用量限额」(gate + Token 计费)。
+	// 在此函数作用域内解析一次，供后续 gate 与 onUsageForward / fallback 计费闭包复用。
+	// 关键词: serveChatCompletions clientIP 复用, 单 IP 免费限额
+	clientIP := extractClientIP(rawPacket, conn)
+
+	// 免费用户限流三件套（daily check + RPM check + free user delay）整体搬
+	// 到 prompt 构造之后，目的是让 daily check 能用 prompt.String() + image
+	// 数立刻做 in-flight 预扣并参与本次判决，硬卡死并发过冲；同时维持
+	// "daily check 在 RPM check 之前"的契约，被 daily 挡的请求不污染 RPM 桶。
+	// 关键词: 免费用户限流三件套, 移到 prompt 构造之后, in-flight 预扣
+
+	// messages 处理：唯一路径——完整尊重 bodyIns.Messages 的顺序与 role/content 结构，
+	// 交给 GetAIClientWithRawMessages 透传给上游 LLM，用以最大化隐式缓存
+	// 前缀命中率。下面的 prompt buffer 仅用于 emptiness 校验、日志展示与
+	// 输入字节统计；image_url 单独提取也仅用于上面这两个目的（实际请求由
+	// messages 自带 content 数组承载）。
+	// 关键词: aibalance messages 透传, RawMessages, 不再拍平
 	var prompt bytes.Buffer
 	var imageContent []*aispec.ChatContent
 	for _, message := range bodyIns.Messages {
 		switch ret := message.Content.(type) {
 		case string:
-			log.Infof("Received text content: %s", utils.ShrinkString(ret, 200))
+			// log.Infof("Received text block content role[%s]: %s", message.Role, utils.ShrinkString(ret, 200))
 			prompt.Write([]byte(ret))
-			//contents = append(contents, aispec.NewUserChatContentText(ret))
 		default:
 			handleItem := func(element any) {
 				if utils.IsMap(element) {
-					// handle images
 					generalMap := utils.InterfaceToGeneralMap(element)
 					typeName := utils.MapGetString(generalMap, `type`)
 					switch typeName {
@@ -708,13 +898,88 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 		}
 	}
 
-	if len(imageContent) == 0 && prompt.Len() <= 0 {
+	if len(imageContent) == 0 && prompt.Len() <= 0 && len(bodyIns.Messages) == 0 {
 		c.logError("Prompt is empty")
 		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nX-Reason: empty prompt\r\n\r\n"))
 		return
 	}
 
-	c.logInfo("Built prompt length: %d with image content: %d", prompt.Len(), len(imageContent))
+	c.logInfo("Built prompt length: %d with image content: %d (messages=%d)",
+		prompt.Len(), len(imageContent), len(bodyIns.Messages))
+
+	// 免费用户日 Token 限额检查 — 放在 prompt 构造之后，为了能与 in-flight
+	// 预扣紧挨着、无窗口地一起做：
+	//   1. checkFreeUserDailyTokenLimitWithInFlight: bucket_db_used + 其他
+	//      在跑请求的预扣加进 used 一起判 limit；拒掉就 429 + 计入 portal
+	//      "Daily token limit exceeded"，不污染 RPM 桶。
+	//   2. 通过则立即 Add 本次估算预扣（ytoken + image 4K + 8K completion）
+	//      到 inFlightTokens，下一个并发请求看到本次预扣即被卡。
+	//   3. defer Remove 在 stream 真正结束（或 return 任意路径）时释放。
+	//      同时正路的 onUsageForward 或 ytoken fallback 会把"真实 weighted"
+	//      累加到 DB bucket，预扣和真实扣费同体系不重复。
+	// DB 异常回放为允许，避免限额逻辑的可用性反噬业务。
+	// 关键词: 免费用户日 Token 限额前置, in-flight 预扣 Add defer Remove,
+	//          过冲防御, daily check 紧挨 add, RPM 桶不脱 +1
+	// 免费用户日 Token 限额检查（gate 内部已写好 429）。in-flight 预扣紧随其后内联，
+	// 其 defer Remove 必须保留在本函数栈上，故不并入 gate。
+	// 关键词: serveChatCompletions gate 抽离, gateChatFreeUserDailyToken
+	if isFreeModel {
+		if c.gateChatFreeUserDailyToken(conn, modelName) {
+			return
+		}
+	}
+
+	// 单 IP 免费模型每日用量限额：防止单个客户端 IP 高频盗刷公共免费接口，
+	// 保证免费额度对所有用户公平。仅对计费免费模型生效；检查通过即累加请求计数。
+	// 关键词: serveChatCompletions gateChatFreeUserIPLimit, 单 IP 每日限额, 防盗刷
+	if isFreeModel {
+		if c.gateChatFreeUserIPLimit(conn, clientIP, modelName) {
+			return
+		}
+	}
+
+	// in-flight 预扣：daily check 通过后立即把本次估算 weighted token 加进
+	// inFlightTokens，下一个并发请求做 daily check 时会看到本次的份额。
+	// 估算偏严（completion 默认 8192），避免边缘穿透；stream 结束后释放。
+	// 关键词: in-flight Add 紧挨 daily check 通过, 过冲防御
+	if isFreeModel && c.inFlightTokens != nil {
+		inFlightBucketKey, inFlightExempt := resolveInFlightBucketKey(modelName)
+		if !inFlightExempt {
+			inFlightEstimate := computeInFlightTokenEstimate(modelName, prompt.String(), len(imageContent))
+			if inFlightEstimate > 0 {
+				c.inFlightTokens.Add(inFlightBucketKey, inFlightEstimate)
+				defer c.inFlightTokens.Remove(inFlightBucketKey, inFlightEstimate)
+				c.logInfo("in-flight token reserved: model=%s bucket=%q estimate=%d",
+					modelName, inFlightBucketKey, inFlightEstimate)
+			}
+		}
+	}
+
+	// 一键限流 IP：按 IP 维度的 RPM 限流（独立于下面按 apiKey|model 的 RPM），
+	// 对被管理员一键限流的滥用 IP 生效，免费/付费请求都受限。
+	// 关键词: serveChatCompletions gateChatThrottledIPRPM, 一键限流 IP
+	if c.gateChatThrottledIPRPM(conn, clientIP, modelName) {
+		return
+	}
+
+	// RPM rate limit check (per API key, with per-model overrides)
+	// 仍然放在 daily check 之后：被 daily token 挡的请求不会污染 RPM 桶。
+	// 关键词: serveChatCompletions gate 抽离, gateRPM
+	if c.gateRPM(conn, apiKeyForStat, modelName) {
+		return
+	}
+
+	// Free user pre-call delay: applied BEFORE forwarding to providers so
+	// the client perceives the throttle (post-call sleep was ineffective
+	// because the response had already been delivered). Per-model delay
+	// overrides (Min, Max) win over the global free-user delay range.
+	//
+	// 调用 computeJitterDelaySec 在 [Min, Max] 区间内均匀采样实际延迟秒数；
+	// 当模型/全局只填了 Min（Max=0），自动回退老 N~2N 行为，保证存量配置
+	// 不被破坏。
+	// 关键词: 免费用户调用前延迟, N~M 随机, 兼容老 N~2N
+	// 关键词: serveChatCompletions gate 抽离, applyFreeUserPreCallDelay
+	c.applyFreeUserPreCallDelay(isFreeModel, modelName)
 
 	// Log at WARN level for production visibility when processing large requests
 	if len(imageContent) > 0 || prompt.Len() > 10000 {
@@ -724,18 +989,14 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 			modelName, len(imageContent), prompt.Len(), runtime.NumGoroutine(), ms.HeapAlloc/1024/1024)
 	}
 
-	// model, ok := c.Models.Get(modelName)
-	// if !ok {
-	// 	c.logError("No model configuration found: %s", modelName)
-	// 	conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-	// 	return
-	// }
+	// 亲和性路由：把同一逻辑请求路由到同一 provider，让上游隐式缓存有机会被复用。
+	// 用 messages 数组的 JSON 序列化前缀作为指纹，与上游 LLM 实际看到的
+	// 请求体字节序对齐。
+	// 关键词: 亲和性路由, 隐式缓存, BuildMessagesAffinityKey
+	affinityKey := BuildMessagesAffinityKey(bodyIns.Messages, apiKeyForStat, modelName, 2048)
 
-	// c.logInfo("Key[%v] requesting model %s, starting to forward request", apiKeyForStat, modelName)
-	// _ = model
-
-	// 使用 PeekOrderedProviders 获取按优先级排序的提供者列表
-	providers := c.Entrypoints.PeekOrderedProviders(modelName)
+	// 使用 PeekOrderedProvidersWithAffinity 获取按亲和性 + 负载均衡排序的提供者列表
+	providers := c.Entrypoints.PeekOrderedProvidersWithAffinity(modelName, affinityKey)
 	if len(providers) == 0 {
 		// 如果找不到，尝试从数据库重新加载
 		c.logWarn("No valid providers found for model %s, trying to reload from database...", modelName)
@@ -743,7 +1004,7 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 			c.logError("Failed to reload providers from database: %v", err)
 		} else {
 			c.logInfo("Successfully reloaded providers from database, retrying to find providers.")
-			providers = c.Entrypoints.PeekOrderedProviders(modelName)
+			providers = c.Entrypoints.PeekOrderedProvidersWithAffinity(modelName, affinityKey)
 		}
 	}
 
@@ -760,9 +1021,29 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 	var lastError error
 	for i, provider := range providers {
 		c.logInfo("Trying provider %d/%d for model %s: %s", i+1, len(providers), modelName, provider.TypeName)
+		// selected provider 详细身份日志：在调用 GetAIClientWithRawMessages 之前打印
+		// type/model/domain/key shrink + affinityKey shrink，便于跨多轮请求肉眼判断
+		// affinity 路由是否稳定到同一 dashscope key（dashscope implicit cache 是
+		// per-API-key 的，路由跳变会显著拉低 cached_tokens 命中率）。
+		// 关键词: aibalance selected provider 日志, affinity 路由稳定性, dashscope per-key cache
+		c.logInfo("selected provider %d/%d: type=%s model=%s domain=%s key=%s (affinityKey=%s)",
+			i+1, len(providers),
+			provider.TypeName, provider.ModelName, provider.DomainOrURL,
+			utils.ShrinkString(provider.APIKey, 8),
+			utils.ShrinkString(affinityKey, 8))
 
 		sendHeaderOnce := sync.Once{}
 		sendHeader := func() {
+			// 非流式模式不再立刻把 SSE header 推给客户端，否则会产生
+			// 「Content-Type: text/event-stream + 后续 application/json body」
+			// 的混合响应，并让 OpenAI SDK 在 stream=false 路径下解析失败。
+			// 真实 application/json 头在 non-stream 收尾分支中由 server.go
+			// 主流程统一发送。
+			// 关键词: 非流式模式不发 SSE header, application/json 收尾统一发头
+			if !stream {
+				c.logInfo("Non-stream mode: defer header until non-stream body assembly completes")
+				return
+			}
 			c.logInfo("Successfully obtained AI client, starting to send response header")
 			var header = "HTTP/1.1 200 OK\r\n" +
 				"Content-Type: text/event-stream; charset=utf-8\r\n" +
@@ -780,7 +1061,29 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 		pr, pw := utils.NewBufPipe(nil)
 		rr, rw := utils.NewBufPipe(nil)
 
-		writer := NewChatJSONChunkWriter(conn, apiKeyForStat, modelName)
+		// notStream 显式传给 writer，让 writerWrapper.Write / WriteToolCalls
+		// 在客户端 stream=false 时只累积到内部缓冲，不再向客户端管道吐 SSE 帧。
+		// 关键词: writer notStream 显式传递, 非流式 writer 行为
+		writer := NewChatJSONChunkWriterEx(conn, apiKeyForStat, modelName, !stream)
+
+		// 输出 TPS 限速（仅流式 stream=true 生效）：
+		//   - 免费模型走 ResolveEffectiveOutputTPS（模型级 / 全局 / 软限额三档取最严）；
+		//   - 一键限流 IP 额外叠加该 IP 的 TPS，与上面结果取最严（非零最小值），
+		//     使被限流 IP 即便走付费模型也会被压低输出速率。
+		// 关键词: writer SetOutputTPSLimit, 免费模型 + 流式 TPS 限速, 一键限流 IP TPS
+		if stream {
+			effectiveTPS := int64(0)
+			if isFreeModel {
+				effectiveTPS = c.ResolveEffectiveOutputTPS(modelName, true)
+			}
+			if _, ipTPS, throttled := lookupThrottledIP(clientIP); throttled && ipTPS > 0 {
+				effectiveTPS = pickStricterTPS(effectiveTPS, ipTPS)
+			}
+			if effectiveTPS > 0 {
+				writer.SetOutputTPSLimit(effectiveTPS)
+				c.logInfo("output TPS limited: model=%s ip=%s tps=%d", modelName, clientIP, effectiveTPS)
+			}
+		}
 
 		// cleanupResources is a helper function to properly close all resources
 		// to prevent memory leaks when switching to next provider or on failure
@@ -798,37 +1101,252 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 				provider.TypeName, runtime.NumGoroutine(), ms.HeapAlloc/1024/1024, ms.HeapObjects)
 		}
 
-		client, err := provider.GetAIClientWithImagesAndTools(
-			imageContent,
-			bodyIns.Tools,      // Forward tools from client request
-			bodyIns.ToolChoice, // Forward tool_choice from client request
-			bodyIns.EnableThinking,
-			func(reader io.Reader) {
-				defer func() {
-					pw.Close()
-					c.logInfo("Finished handling AI response stream(output)")
-				}()
-				c.logInfo("Start to handle AI response stream")
-				sendHeaderOnce.Do(sendHeader)
-				io.Copy(pw, reader)
-			}, func(reader io.Reader) {
-				defer func() {
-					rw.Close()
-					c.logInfo("Finished handling AI response stream(reason)")
-				}()
-				c.logInfo("Start to handle AI response stream(reason)")
-				sendHeaderOnce.Do(sendHeader)
-				io.Copy(rw, reader)
-				utils.FlushWriter(writer.writerClose)
-			},
-			// Tool call callback: forward tool_calls from AI provider to client
-			func(toolCalls []*aispec.ToolCall) {
-				c.logInfo("Received %d tool calls from AI provider, forwarding to client", len(toolCalls))
-				sendHeaderOnce.Do(sendHeader)
-				if err := writer.WriteToolCalls(toolCalls); err != nil {
-					c.logError("Failed to write tool calls to client: %v", err)
+		// fallback 计费镜像：把上游 LLM 实际返回的"纯文本 output / reason 流"
+		// 镜像到 buffer，便于在 SSE 末帧 usage 缺失 (provider 不支持 / 网络中断)
+		// 时用 ytoken (Qwen BPE) 估算 completion_tokens 兜底扣费。
+		// 注意：onOutputStream / onReasonStream 各自只会被回调一次、且写入由
+		// 单一 goroutine 串行执行 (io.Copy)，buffer 不需要互斥。
+		// 读侧 (后面的 fallback 块) 严格在 wg.Wait() 之后才访问，
+		// 与写侧有 happens-before 关系。
+		// 关键词: aibalance usage missing fallback buffer, ytoken 镜像, output/reason 文本
+		var outputTextBuf bytes.Buffer
+		var reasonTextBuf bytes.Buffer
+		var usageBilled atomic.Bool
+		// ipModelUsageRecorded 保证「单 IP 按模型用量」每个请求只记一次：
+		// 正路(onUsageForward 真实 usage) 与 兜底(fallback 估算) 二选一，避免重复累加。
+		// 关键词: ipModelUsageRecorded, per-IP 按模型用量 幂等
+		var ipModelUsageRecorded atomic.Bool
+
+		// client 构造统一走 GetAIClientWithRawMessages：把 bodyIns.Messages
+		// 完整透传给上游 LLM，image_url 已经在 messages 内的 content 数组里
+		// 携带，imageContent 仅用于日志统计；不再有 legacy 拍平回滚通道。
+		// 关键词: aibalance client 构造, GetAIClientWithRawMessages, RawMessages 透传
+		onOutputStream := func(reader io.Reader) {
+			defer func() {
+				pw.Close()
+				c.logInfo("Finished handling AI response stream(output)")
+			}()
+			c.logInfo("Start to handle AI response stream")
+			sendHeaderOnce.Do(sendHeader)
+			io.Copy(io.MultiWriter(pw, &outputTextBuf), reader)
+		}
+		onReasonStream := func(reader io.Reader) {
+			defer func() {
+				rw.Close()
+				c.logInfo("Finished handling AI response stream(reason)")
+			}()
+			c.logInfo("Start to handle AI response stream(reason)")
+			sendHeaderOnce.Do(sendHeader)
+			io.Copy(io.MultiWriter(rw, &reasonTextBuf), reader)
+			utils.FlushWriter(writer.writerClose)
+		}
+
+		// merge toolcalls to output to log
+		onToolCallForward := func(toolCalls []*aispec.ToolCall) {
+			// c.logInfo("Received %d tool calls from AI provider, forwarding to client", len(toolCalls))
+			sendHeaderOnce.Do(sendHeader)
+			if err := writer.WriteToolCalls(toolCalls); err != nil {
+				c.logError("Failed to write tool calls to client: %v", err)
+			}
+		}
+
+		// onUsageForward 把上游 LLM 在 SSE 末帧返回的 token 用量
+		// （含 prompt_tokens_details.cached_tokens 隐式缓存命中）传给 writer，
+		// writer.Close 会按 OpenAI include_usage 规范在 [DONE] 之前发一帧给客户端。
+		//
+		// 日志策略：把 provider 身份（type/model/domain/key shrink）和上游 raw usage JSON
+		// 一起 log 出来，方便定位 cached_tokens=0 的真因：
+		//   - usage=nil  -> 上游根本没返 usage 帧（可能 stream_options 注入失败或上游不支持）
+		//   - cached=0 且 raw 中无 prompt_tokens_details.cached_tokens 字段 -> 上游账号未触发 implicit cache
+		//   - cached>0 -> 命中，writer.WriteUsage 会透传给客户端
+		//
+		// 关键词: aibalance onUsageForward, cached_tokens 透传, 上游 provider 身份, raw usage JSON
+		onUsageForward := func(usage *aispec.ChatUsage) {
+			if usage == nil {
+				c.logInfo("upstream usage: <nil> (provider=%s model=%s domain=%s key=%s)",
+					provider.TypeName, provider.ModelName, provider.DomainOrURL,
+					utils.ShrinkString(provider.APIKey, 8))
+				return
+			}
+			cached := 0
+			if usage.PromptTokensDetails != nil {
+				cached = usage.PromptTokensDetails.CachedTokens
+			}
+			rawUsage, _ := json.Marshal(usage)
+			c.logInfo("upstream usage: provider=%s model=%s domain=%s key=%s prompt=%d completion=%d total=%d cached=%d raw=%s",
+				provider.TypeName, provider.ModelName, provider.DomainOrURL,
+				utils.ShrinkString(provider.APIKey, 8),
+				usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, cached,
+				string(rawUsage))
+
+			// 把上游真实返回的 usage 同时落到「细粒度日 cache stats」与「日聚合快照」，
+			// 用以驱动 portal 的"日活与缓存" tab。任何失败仅 logWarn，绝不阻塞响应。
+			// 关键词: RecordDailyCacheStats, RecordDailySummaryDelta, onUsageForward 落库
+			if err := RecordDailyCacheStats(provider, modelName, usage); err != nil {
+				c.logWarn("RecordDailyCacheStats failed (model=%s provider=%s): %v",
+					modelName, provider.TypeName, err)
+			}
+			RecordDailySummaryDelta(usage)
+
+			// Token 维度计费：按「实际模型(内部转发名 provider.ModelName)」分层解析四维倍率后
+			// 对上游 usage 加权。计费以实际模型为唯一标识，与对外 wrapper(modelName) 无关，
+			// 保证同一实际模型单价一致（APIKEY 付费系统计费准确的基础）。
+			// 免费用户累加到日 Token 桶（全局/模型独立），付费 key 累加到 AiApiKeys.TokenUsed。
+			// 与既有「字节维度」计费并行，互不干扰。
+			// 关键词: onUsageForward Token 计费分流, ComputeModelWeightedTokens, 实际模型计费, AddFreeUserDailyTokenUsage
+			weighted := ComputeModelWeightedTokens(provider.ModelName, usage)
+			if weighted > 0 {
+				// 标记本次请求已通过上游真实 usage 完成扣费，禁止 fallback 再扣一次。
+				// 仅在 weighted>0 时置位：上游返了空 usage (prompt=completion=0) 时仍走 fallback。
+				// 关键词: usageBilled 真实扣费幂等标志, 禁止 fallback 双扣
+				usageBilled.Store(true)
+				if isFreeModel {
+					overrides := parseFreeUserTokenModelOverridesFromConfig()
+					if ov, ok := overrides[modelName]; ok && ov.Exempt {
+						c.logInfo("Token billing skipped (exempt) for free model %s, weighted=%d", modelName, weighted)
+					} else {
+						modelHasOwnBucket := ok && ov.LimitM > 0
+						if err := AddFreeUserDailyTokenUsage(modelName, weighted, modelHasOwnBucket); err != nil {
+							c.logWarn("AddFreeUserDailyTokenUsage failed (model=%s weighted=%d): %v",
+								modelName, weighted, err)
+						} else {
+							c.logInfo("Free user token usage updated: model=%s weighted=%d bucket_kind=%s",
+								modelName, weighted, ternaryStr(modelHasOwnBucket, "model", "global"))
+						}
+						// 单 IP 维度累加加权 Token（与全局/模型桶并行，用于单 IP 每日限额）。
+						// 关键词: onUsageForward AddFreeUserIPDailyTokens, 单 IP Token 计费
+						if ipErr := AddFreeUserIPDailyTokens(clientIP, weighted); ipErr != nil {
+							c.logWarn("AddFreeUserIPDailyTokens failed (ip=%s model=%s weighted=%d): %v",
+								clientIP, modelName, weighted, ipErr)
+						}
+					}
+				} else if key != nil {
+					if err := UpdateAiApiKeyTokenUsed(key.Key, weighted); err != nil {
+						c.logWarn("UpdateAiApiKeyTokenUsed failed (key=%s weighted=%d): %v",
+							utils.ShrinkString(key.Key, 8), weighted, err)
+					} else {
+						c.logInfo("API key token usage updated: key=%s model=%s weighted=%d",
+							utils.ShrinkString(key.Key, 8), modelName, weighted)
+					}
+					// 付费用户全局日 Token 总额度（第二道硬门）累加：聚合所有付费 key 当天用量。
+					// 关键词: onUsageForward AddPaidUserDailyTokenUsage, 付费全局额度累加
+					if err := AddPaidUserDailyTokenUsage(weighted); err != nil {
+						c.logWarn("AddPaidUserDailyTokenUsage failed (key=%s weighted=%d): %v",
+							utils.ShrinkString(key.Key, 8), weighted, err)
+					}
 				}
-			},
+			}
+
+			// 单 IP 按模型用量（仅展示，不参与限额）：对所有免费(对客户端免费)模型累加原始 Token 数量；
+			// 计费模型额外累加加权 Token 供 RMB 折算。不计费/豁免模型加权记 0 -> 金额 ¥0（计数量、不算钱）。
+			// 用 ipModelUsageRecorded 幂等，避免与 fallback 估算路径重复累加。
+			// 此处 usage 必非 nil（onUsageForward 入口已对 nil 提前返回）。
+			// 关键词: onUsageForward per-IP 按模型 原始Token+加权Token, 不计费也计数量
+			if isFreeModel && !ipModelUsageRecorded.Load() {
+				rawTokens := int64(usage.TotalTokens)
+				if rawTokens <= 0 {
+					rawTokens = int64(usage.PromptTokens) + int64(usage.CompletionTokens)
+				}
+				billedWeighted := int64(0)
+				if weighted > 0 && !isFreeModelBillingExempt(modelName) {
+					billedWeighted = weighted
+				}
+				if rawTokens > 0 || billedWeighted > 0 {
+					ipModelUsageRecorded.Store(true)
+					if ipErr := AddFreeUserIPModelDailyUsageTokens(clientIP, modelName, rawTokens, billedWeighted); ipErr != nil {
+						c.logWarn("AddFreeUserIPModelDailyUsageTokens failed (ip=%s model=%s raw=%d weighted=%d): %v",
+							clientIP, modelName, rawTokens, billedWeighted, ipErr)
+					}
+				}
+			}
+
+			writer.WriteUsage(usage)
+		}
+
+		// provider-aware cache_control 处理 (RewriteMessagesForProviderInstance):
+		//
+		// v2 路径在 v1 (RewriteMessagesForProvider) 之上多加一层 Provider 实例级
+		// 的 ActiveCacheControl Flag 优先判定, 让运维通过 portal.html 一键给任意
+		// provider 打开「主动 cache_control 注入」, 而不再绑死 tongyi+dashscope
+		// 白名单 model。
+		//
+		//   - **provider.ActiveCacheControl == true** (Flag-on): 任意 type/model
+		//     都按「客户端自带 cc -> pass-through; 客户端无 cc -> 给最末 system
+		//     注入 baseline ephemeral cc」处理, 跳过 dashscope 白名单 gate。
+		//     适合 anthropic / 自建 dashscope 中转 / tongyi 没在白名单的新 model。
+		//
+		//   - **provider.ActiveCacheControl == false** (Flag-off): 退化到老路径:
+		//     - tongyi + dashscope 白名单 model -> 注入 baseline 单 cc (legacy)
+		//     - tongyi 非白名单 model -> pass-through (零副作用)
+		//     - 其它所有 provider -> StripCacheControlFromMessages 强制移除 cc
+		//       (跨 provider 安全硬约束: 兼容部分 OpenAI 兼容层 400 / 避免
+		//       dashscope 风格 cc 透传到其他 provider 引发意料外计费)
+		//
+		// 这个分发让 aicache hijacker 可以"无脑给 system+user1 打双 cc",
+		// 跨 provider 安全由 aibalance 兜底剥离, 不需要 hijacker 知道下游
+		// 是不是 tongyi。
+		//
+		// 关键词: aibalance provider-aware cc 路由 v2, RewriteMessagesForProviderInstance,
+		//        ActiveCacheControl Flag, tongyi/anthropic 通用化, §7.7.7 职责重排
+		messagesForUpstream := RewriteMessagesForProviderInstance(bodyIns.Messages, provider)
+		if len(messagesForUpstream) > 0 && len(messagesForUpstream) == len(bodyIns.Messages) {
+			switch {
+			case provider.ActiveCacheControl:
+				c.logInfo("active cache_control baseline injected (flag=on): provider=%s model=%s msgs=%d",
+					provider.TypeName, provider.ModelName, len(messagesForUpstream))
+			case IsTongyiExplicitCacheModel(provider.TypeName, provider.ModelName):
+				c.logInfo("explicit cache_control baseline injected (legacy tongyi whitelist): provider=%s model=%s msgs=%d",
+					provider.TypeName, provider.ModelName, len(messagesForUpstream))
+			case !IsCacheControlAwareProvider(provider.TypeName) && messagesAlreadyHaveCacheControl(bodyIns.Messages):
+				c.logInfo("cache_control stripped (non-tongyi provider): provider=%s model=%s msgs=%d",
+					provider.TypeName, provider.ModelName, len(messagesForUpstream))
+			}
+		}
+
+		// 工具调用一律走 native OpenAI tool_calls 透传：
+		//   - tools / tool_choice 原样转发给上游
+		//   - 上游若按 OpenAI 协议返回 delta.tool_calls，会由 onToolCallForward
+		//     -> writer.WriteToolCalls -> accumulatedToolCalls 累积，最终联动
+		//     finish_reason="tool_calls" 并按 OpenAI 规范 delta 帧形式下发。
+		// 历史的 ReAct 降级 / safety-net content 反解析链路已经全部移除，
+		// aibalance 不再在 content 流上做任何 tool_call 文本识别，避免上游漂移
+		// 输出（[tool_call ...] / [调用 ...] / [TOOL_CALLS] 等）被错误"翻译"成
+		// 客户端可见的乱码或被吞掉的 partial buffer。
+		// 关键词: aibalance tool_calls native passthrough, 透明转发, 移除 ReAct 降级
+		toolsForUpstream := bodyIns.Tools
+		toolChoiceForUpstream := bodyIns.ToolChoice
+
+		// debug trace 元信息: provider 身份 + 请求关键字段. 仅在 trace
+		// 开启时执行 (debugTraceLazyMeta 内部判 nil).
+		// 关键词: trace meta 元信息落盘, provider 身份 + 透传字段
+		debugTraceLazyMeta(traceSession, func() any {
+			return map[string]any{
+				"req_id":                           traceSession.ReqID(),
+				"model":                            modelName,
+				"api_key":                          utils.ShrinkString(apiKeyForStat, 8),
+				"affinity_key":                     utils.ShrinkString(affinityKey, 8),
+				"provider_type":                    provider.TypeName,
+				"provider_model":                   provider.ModelName,
+				"provider_wrapper":                 provider.WrapperName,
+				"provider_domain":                  provider.DomainOrURL,
+				"provider_no_https":                provider.NoHTTPS,
+				"tools_count":                      len(bodyIns.Tools),
+				"messages_count":                   len(messagesForUpstream),
+				"stream":                           stream,
+				"client_requested_enable_thinking": bodyIns.EnableThinking,
+			}
+		})
+
+		client, err := provider.GetAIClientWithRawMessagesAndTrace(
+			traceSession,
+			messagesForUpstream,
+			toolsForUpstream,
+			toolChoiceForUpstream,
+			bodyIns.EnableThinking,
+			onOutputStream,
+			onReasonStream,
+			onToolCallForward,
+			onUsageForward,
 		)
 		if err != nil {
 			c.logError("Failed to get AI client from provider %s: %v", provider.TypeName, err)
@@ -837,11 +1355,15 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 			continue           // 尝试下一个提供者
 		}
 
-		// 启动 AI 聊天请求
+		// 启动 AI 聊天请求：messages 已通过 RawMessages 携带，
+		// 底层 chatBaseChatCompletions 直接使用，client.Chat 的 prompt
+		// string 参数仅用于占位（被忽略）。
+		// 关键词: aibalance Chat, RawMessages 透传
 		chatCompleted := make(chan error, 1)
 		go func() {
-			c.logInfo("start to call ai chat interface with prompt len: %d", prompt.Len())
-			finalMsg, err := client.Chat(prompt.String())
+			c.logInfo("start to call ai chat interface (prompt_len=%d, messages=%d)",
+				prompt.Len(), len(bodyIns.Messages))
+			finalMsg, err := client.Chat("")
 			if err != nil {
 				c.logError("AI chat interface call failed: %v", err)
 				chatCompleted <- err
@@ -928,18 +1450,112 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 		wg.Wait()
 		utils.FlushWriter(writer.writerClose)
 
+		// 提前判断本轮 chat 是否成功 (与下方 1454 行同口径)，
+		// 用于决定是否在 writer.Close / GetNotStreamBody 之前触发
+		// 兜底 usage 估算 + 透传。
+		// 关键词: aibalance fallback usage 前移, 估算前 success 判定
+		preTotal := atomic.LoadInt64(totalBytes)
+		preSucceeded := chatErr == nil && (preTotal > 0 || writer.HasToolCalls())
+
+		// 兜底 usage 估算 + 客户端下发：上游 LLM 不返 SSE usage 帧时
+		// （DeepSeek 早期 endpoint / 第三方 wrapper / 网络中断），用 ytoken
+		// (Qwen BPE) 估算 prompt + completion token，并通过
+		// writer.WriteUsageEstimated 把估算结果写进响应 usage 字段
+		// （带 "estimated": true 标记），确保 opencode / Vercel AI SDK /
+		// OpenAI npm 等强依赖 usage 的客户端不会拿到 usage=null。
+		// 注意：扣费仍受 usageBilled 幂等保护，真实 usage 已扣费时不再二次扣。
+		// 此处必须在流式 Close / 非流式 GetNotStreamBody 之前调用，否则
+		// 写入的 WriteUsageEstimated 不会被发送出去。
+		// 关键词: aibalance fallback usage 下发前置, opencode usage 非 null,
+		// Vercel AI SDK usage 兼容, OpenAI include_usage 兼容
+		if preSucceeded && !usageBilled.Load() {
+			fbResult := c.applyUsageFallbackEstimate(
+				modelName, provider.ModelName, isFreeModel, key, provider.TypeName,
+				prompt.String(), len(imageContent),
+				outputTextBuf.String(), reasonTextBuf.String(),
+			)
+			if fbResult.EstimatedUsage != nil {
+				writer.WriteUsageEstimated(fbResult.EstimatedUsage)
+			}
+			// 单 IP 维度累加 fallback 估算的加权 Token（仅免费模型且确实扣费、非 apikey 桶）。
+			// 与 onUsageForward 正路口径一致：exempt / 未扣费不累加。
+			// 关键词: fallback AddFreeUserIPDailyTokens, 单 IP Token 兜底计费
+			if isFreeModel && fbResult.Billed && fbResult.Bucket != "apikey" && fbResult.Weighted > 0 {
+				if ipErr := AddFreeUserIPDailyTokens(clientIP, fbResult.Weighted); ipErr != nil {
+					c.logWarn("fallback AddFreeUserIPDailyTokens failed (ip=%s model=%s weighted=%d): %v",
+						clientIP, modelName, fbResult.Weighted, ipErr)
+				}
+			}
+			// 单 IP 按模型用量（仅展示，不参与限额）：所有免费模型都记原始 Token 数量；
+			// 仅真正计费的模型记加权 Token。不计费/豁免模型加权 0 -> ¥0（计数量、不算钱）。
+			// 用 ipModelUsageRecorded 幂等，避免与 onUsageForward 正路重复累加。
+			// 关键词: fallback per-IP 按模型 原始Token+加权Token, 不计费也计数量
+			if isFreeModel && !ipModelUsageRecorded.Load() {
+				rawTokens := int64(0)
+				if fbResult.EstimatedUsage != nil {
+					rawTokens = int64(fbResult.EstimatedUsage.TotalTokens)
+					if rawTokens <= 0 {
+						rawTokens = int64(fbResult.EstimatedUsage.PromptTokens) + int64(fbResult.EstimatedUsage.CompletionTokens)
+					}
+				}
+				billedWeighted := int64(0)
+				if fbResult.Billed && fbResult.Bucket != "apikey" && fbResult.Weighted > 0 {
+					billedWeighted = fbResult.Weighted
+				}
+				if rawTokens > 0 || billedWeighted > 0 {
+					ipModelUsageRecorded.Store(true)
+					if ipErr := AddFreeUserIPModelDailyUsageTokens(clientIP, modelName, rawTokens, billedWeighted); ipErr != nil {
+						c.logWarn("fallback AddFreeUserIPModelDailyUsageTokens failed (ip=%s model=%s raw=%d weighted=%d): %v",
+							clientIP, modelName, rawTokens, billedWeighted, ipErr)
+					}
+				}
+			}
+			usageBilled.Store(true) // 防止 1499 段二次执行 (估算口径已记账)
+		}
+
 		if !stream {
+			// 关键修复: 非流式响应必须由 server.go 主流程统一发送
+			// HTTP/1.1 200 OK + Content-Type: application/json + Content-Length,
+			// 然后一次性写出完整 body。
+			//
+			// 不使用 chunked transfer encoding 的原因:
+			//   - 上游 nginx 反代到 HTTP/2 时, chunked 末尾 "0\r\n\r\n" 与
+			//     HTTP/2 帧的结束语义不完全等价, 实测 curl 报
+			//     "HTTP/2 stream was not closed cleanly: INTERNAL_ERROR (err 2)",
+			//     导致 OpenAI Python SDK / urllib3 在 stream=false 路径上
+			//     抛 APIConnectionError, 看似完整的 JSON 被丢弃。
+			//   - 非流式 body 已经一次性拼好(GetNotStreamBody), 完全有 length,
+			//     直接 Content-Length 即可避免任何 chunked 转换风险。
+			//
+			// 关键词: 非流式 Content-Length 替换 chunked, HTTP/2 INTERNAL_ERROR 修复,
+			// nginx 反代非流式响应稳定性
 			body = writer.GetNotStreamBody()
-			cwr := httputil.NewChunkedWriter(conn)
-			cwr.Write(body)
-			cwr.Close()
-			utils.FlushWriter(cwr)
+			var header = "HTTP/1.1 200 OK\r\n" +
+				"Content-Type: application/json; charset=utf-8\r\n" +
+				"Cache-Control: no-cache\r\n" +
+				"Connection: keep-alive\r\n" +
+				fmt.Sprintf("Content-Length: %d\r\n", len(body)) +
+				"\r\n"
+			if _, err := conn.Write([]byte(header)); err != nil {
+				c.logError("Failed to send non-stream response header: %v", err)
+			}
+			if _, err := conn.Write(body); err != nil {
+				c.logError("Failed to write non-stream response body: %v", err)
+			}
 			utils.FlushWriter(conn)
 		}
 
 		endDuration := time.Since(start)
 		total := atomic.LoadInt64(totalBytes)
-		requestSucceeded := total > 0 // Determine actual request success based on data received
+		// Tool-call-only responses legitimately have zero content/reasoning bytes:
+		// the provider reports success through the tool_calls callback instead of
+		// the text pipes. Treat those as successful so OpenAI-compatible clients
+		// like opencode can complete the first tool round.
+		// 关键词: tool_call-only response success, opencode tool_calls first round
+		requestSucceeded := total > 0 || writer.HasToolCalls()
+		if requestSucceeded && firstByteDuration == 0 {
+			firstByteDuration = endDuration
+		}
 
 		// Check if chat request succeeded
 		if chatErr != nil {
@@ -975,6 +1591,11 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 		successfulProvider = provider
 		c.logInfo("Provider %s successfully handled the request for model %s", provider.TypeName, modelName)
 
+		// 兜底 usage 估算 + 扣费的实际触发点已上移到 wg.Wait() 之后、writer 输出之前
+		// （见上方 preSucceeded 块），目的是让估算 usage 也能透传给客户端 (opencode /
+		// Vercel AI SDK / OpenAI npm)。此处不再重复触发，避免与上方逻辑双扣。
+		// 关键词: aibalance fallback usage 上移说明, 不双扣, 透传客户端
+
 		// Update successful provider status
 		latencyMs := firstByteDuration.Milliseconds()
 		providerHealthy := firstByteDuration > 0 && firstByteDuration <= 10*time.Second
@@ -987,8 +1608,14 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 			}
 		}()
 
-		// Update API Key statistics using actual success
-		inputBytes := int64(prompt.Len())
+		// Update API Key statistics using actual success.
+		// 输入字节统计：用 messages 序列化字节数，与上游 LLM 实际收到的请求体
+		// 字节量对齐；当 messages 为空（极少数纯 prompt 入口）回落到 prompt 字节。
+		// 关键词: aibalance inputBytes 统计源, RawMessages 字节统计
+		inputBytes := int64(len(serializeMessagesForAffinity(bodyIns.Messages)))
+		if inputBytes <= 0 {
+			inputBytes = int64(prompt.Len())
+		}
 		outputBytes := total
 		if isFreeModel {
 			// 免费模型使用特殊的 free-user 统计
@@ -1001,7 +1628,7 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 				}
 			}()
 		} else {
-			// Update API key statistics
+			// Update API key statistics (InputBytes/OutputBytes 仅用于展示统计，保留)
 			go func() {
 				if err := UpdateAiApiKeyStats(key.Key, inputBytes, outputBytes, requestSucceeded); err != nil {
 					c.logError("Failed to update API key statistics: %v", err)
@@ -1011,20 +1638,9 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 				}
 			}()
 
-			// Update traffic usage with model multiplier
-			go func() {
-				// Get the traffic multiplier for this model
-				multiplier := GetModelTrafficMultiplier(modelName)
-				totalTraffic := inputBytes + outputBytes
-				adjustedTraffic := int64(float64(totalTraffic) * multiplier)
-
-				if err := UpdateAiApiKeyTrafficUsed(key.Key, adjustedTraffic); err != nil {
-					c.logError("Failed to update traffic usage for key %s: %v", utils.ShrinkString(key.Key, 8), err)
-				} else {
-					c.logInfo("Traffic usage updated: key=%s, raw=%d bytes, multiplier=%.2f, adjusted=%d bytes",
-						utils.ShrinkString(key.Key, 8), totalTraffic, multiplier, adjustedTraffic)
-				}
-			}()
+			// 字节流量计费已停用：统一改用 Token 计费体系（ComputeModelWeightedTokens
+			// + AiApiKeys.TokenUsed），不再按字节 * TrafficMultiplier 累加 TrafficUsed。
+			// 关键词: 字节流量计费停用, Token 体系统一计费
 		}
 
 		bandwidth := float64(0)
@@ -1038,11 +1654,69 @@ func (c *ServerConfig) serveChatCompletions(conn net.Conn, rawPacket []byte) {
 		utils.FlushWriter(conn)
 		writer.Wait()
 
+		// 流量镜像异步分发：构造完整快照, 解析响应主输出中的 @action,
+		// 把快照投递给所有命中条件的镜像规则的 worker pool. 非阻塞,
+		// 队列满时丢弃并记账, 主流程不感知任何镜像层的状态.
+		// 关键词: aibalance mirror trigger 接入, MirrorSnapshot 构造, 异步分发
+		// 关键词: aibalance mirror trigger 短路, HasActiveRules 节能,
+		//        NeedsActionParsing 跳过 ParseAction, MirrorSnapshot 构造延迟
+		//
+		// 三档短路:
+		//   1. MirrorManager 不存在或没有任何在跑规则 -> 整段跳过 (零开销)
+		//   2. 有规则但全是 always / any_toolcall -> 构造 snapshot 但不解析 @action
+		//      (避免对大文本响应做 jsonextractor 全文扫描)
+		//   3. 有规则需要 @action -> 走完整路径
+		//
+		// always 规则保证: 即使 @action 解析失败, Action="" / ActionPayload=nil
+		// 的 snapshot 仍会被分发 (MirrorRuleMatch 在 always 分支直接 return true).
+		if c.MirrorManager != nil && c.MirrorManager.HasActiveRules() {
+			respText := outputTextBuf.String()
+			reasonText := reasonTextBuf.String()
+
+			var action string
+			var actionPayload map[string]interface{}
+			if c.MirrorManager.NeedsActionParsing() {
+				action, actionPayload = ParseActionFromText(respText)
+			}
+
+			// 关键词: aibalance mirror APIKeyFP 计算, 不可逆指纹, 防止 key 泄漏
+			// free-user 场景没有 key, 用字面量 "free-user" 让脚本能直接判别;
+			// 其他场景用 SHA256[:16] 不可逆指纹, 不再暴露 shrink 后的 key 头尾.
+			apiKeyFP := ""
+			if isFreeModel {
+				apiKeyFP = "free-user"
+			} else if key != nil {
+				apiKeyFP = APIKeyFingerprint(key.Key)
+			}
+			snap := &MirrorSnapshot{
+				ReqID:           writer.uid,
+				TimestampMs:     start.UnixMilli(),
+				Model:           modelName,
+				TypeName:        successfulProvider.TypeName,
+				Domain:          successfulProvider.DomainOrURL,
+				APIKeyFP:        apiKeyFP,
+				IsFreeModel:     isFreeModel,
+				Stream:          stream,
+				RequestMessages: bodyIns.Messages,
+				ResponseText:    respText,
+				ResponseReason:  reasonText,
+				ToolCalls:       writer.SnapshotToolCalls(),
+				Action:          action,
+				ActionPayload:   actionPayload,
+				DurationMs:      endDuration.Milliseconds(),
+				InputBytes:      inputBytes,
+				OutputBytes:     outputBytes,
+				Usage:           writer.SnapshotUsage(),
+			}
+			go c.MirrorManager.Trigger(snap)
+		}
+
 		// Log at WARN level for production visibility
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
-		log.Warnf("[REQUEST_SUCCESS] model=%s provider=%s bytes=%d duration=%v goroutines=%d heap_mb=%d",
+		log.Debugf("[REQUEST_SUCCESS] model=%s provider=%s bytes=%d duration=%v goroutines=%d heap_mb=%d",
 			modelName, successfulProvider.TypeName, total, endDuration, runtime.NumGoroutine(), ms.HeapAlloc/1024/1024)
+
 		break // 成功处理，退出循环
 	}
 
@@ -1109,6 +1783,10 @@ func (c *ServerConfig) serveEmbeddings(conn net.Conn, rawPacket []byte) {
 	inputText := reqBody.Input
 	c.logInfo("Requested embedding model: %s, input length: %d", modelName, len(inputText))
 
+	// 模型用途类型降级（保护用量）：与 chat 入口对齐，在 isFreeModel/memfit gate/计费之前改写 modelName。
+	// 关键词: serveEmbeddings gateLightweightDowngrade, 轻量降级保护用量
+	modelName = c.gateLightweightDowngrade(rawPacket, modelName)
+
 	if inputText == "" {
 		c.logError("Input text is empty")
 		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nX-Reason: empty input\r\n\r\n"))
@@ -1121,86 +1799,26 @@ func (c *ServerConfig) serveEmbeddings(conn net.Conn, rawPacket []byte) {
 		c.logInfo("Request is for a free embedding model, skipping key verification.")
 	}
 
-	// Check if this is a memfit model that requires TOTP authentication
-	if IsMemfitModel(modelName) {
-		c.logInfo("Memfit embedding model detected, checking TOTP authentication...")
-		totpHeader := lowhttp.GetHTTPPacketHeader(rawPacket, "X-Memfit-OTP-Auth")
-		if totpHeader == "" {
-			c.logError("Memfit model requires TOTP authentication, but X-Memfit-OTP-Auth header is missing")
-			c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]interface{}{
-				"error": map[string]string{
-					"message": "Memfit TOTP authentication required. Please provide X-Memfit-OTP-Auth header with base64 encoded TOTP code.",
-					"type":    "memfit_totp_auth_required",
-				},
-			})
-			return
-		}
-
-		verified, err := VerifyMemfitTOTP(totpHeader)
-		if err != nil || !verified {
-			c.logError("Memfit TOTP authentication failed: %v", err)
-			c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]interface{}{
-				"error": map[string]string{
-					"message": "Memfit TOTP authentication failed. Please refresh your TOTP secret and try again.",
-					"type":    "memfit_totp_auth_failed",
-				},
-			})
-			return
-		}
-		c.logInfo("Memfit TOTP authentication successful for embedding model: %s", modelName)
+	// memfit 模型 TOTP 鉴权（embedding 入口无版本控流，gate 内部已写好 4xx 响应）
+	// 关键词: serveEmbeddings gate 抽离, gateEmbeddingMemfitTOTP
+	if c.gateEmbeddingMemfitTOTP(conn, rawPacket, modelName) {
+		return
 	}
 
-	var key *Key
+	// API key 解析 + 流量/Token 限额 + 允许模型校验（gate 内部已写好 4xx/429 响应）。
+	// key 在后续上游成功后用于统计（免费模型为 nil）。
+	// 关键词: serveEmbeddings gate 抽离, gateEmbeddingAPIKeyAndLimits
+	key, blocked := c.gateEmbeddingAPIKeyAndLimits(conn, auth, modelName, isFreeModel)
+	if blocked {
+		return
+	}
 
-	if !isFreeModel {
-		value := strings.TrimPrefix(auth, "Bearer ")
-		c.logInfo("Extracted key from authentication info: %s", value)
-		if value == "" {
-			c.logError("No valid authentication info provided")
-			conn.Write([]byte("HTTP/1.1 401 Unauthorized\r\n\r\n"))
-			return
-		}
-
-		var ok bool
-		key, ok = c.Keys.Get(value)
-		if !ok {
-			c.logError("No matching key configuration found: %s", value)
-			conn.Write([]byte("HTTP/1.1 401 Unauthorized\r\n\r\n"))
-			return
-		}
-		c.logInfo("Successfully verified key: %s", key.Key)
-
-		// Check traffic limit before processing request
-		trafficAllowed, err := CheckAiApiKeyTrafficLimit(key.Key)
-		if err != nil {
-			c.logError("Failed to check traffic limit for key %s: %v", utils.ShrinkString(key.Key, 8), err)
-		} else if !trafficAllowed {
-			c.logError("API key %s has exceeded traffic limit", utils.ShrinkString(key.Key, 8))
-			c.writeJSONResponse(conn, http.StatusTooManyRequests, map[string]interface{}{
-				"error": map[string]string{
-					"message": "API key has exceeded traffic limit. Please contact administrator to increase limit or reset usage.",
-					"type":    "traffic_limit_exceeded",
-				},
-			})
-			return
-		}
-
-		// Authorization check with glob pattern support
-		allowedModels, ok := c.KeyAllowedModels.Get(key.Key)
-		if !ok {
-			c.logError("Key[%v] has no allowed models configured", key.Key)
-			conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-			return
-		}
-
-		// Use IsModelAllowed which supports glob patterns
-		if !c.KeyAllowedModels.IsModelAllowed(key.Key, modelName) {
-			allowedModelKeys := make([]string, 0, len(allowedModels))
-			for k := range allowedModels {
-				allowedModelKeys = append(allowedModelKeys, k)
-			}
-			c.logError("Key[%v] requested model %s is not in allowed list (including glob patterns), allowed models/patterns: %v", key.Key, modelName, allowedModelKeys)
-			conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+	// 免费 embedding 模型同样受日 Token 限额保护（与 chat 入口对齐，gate 内部已写好 429）。
+	// embedding 上游不返 ChatUsage，因此只做前置「是否已经超额」的检查，
+	// 真正扣费仍走老的 UpdateFreeUserStats 字节统计（embedding 体量极小可接受）。
+	// 关键词: serveEmbeddings gate 抽离, gateEmbeddingFreeUserDailyToken
+	if isFreeModel {
+		if c.gateEmbeddingFreeUserDailyToken(conn, modelName) {
 			return
 		}
 	}
@@ -1288,7 +1906,7 @@ func (c *ServerConfig) serveEmbeddings(conn net.Conn, rawPacket []byte) {
 				}
 			}()
 		} else {
-			// Update API key statistics
+			// Update API key statistics (InputBytes/OutputBytes 仅用于展示统计，保留)
 			go func() {
 				if err := UpdateAiApiKeyStats(key.Key, inputBytesEmbed, outputBytesEmbed, true); err != nil {
 					c.logError("Failed to update API key statistics: %v", err)
@@ -1298,19 +1916,8 @@ func (c *ServerConfig) serveEmbeddings(conn net.Conn, rawPacket []byte) {
 				}
 			}()
 
-			// Update traffic usage with model multiplier
-			go func() {
-				multiplier := GetModelTrafficMultiplier(modelName)
-				totalTraffic := inputBytesEmbed + outputBytesEmbed
-				adjustedTraffic := int64(float64(totalTraffic) * multiplier)
-
-				if err := UpdateAiApiKeyTrafficUsed(key.Key, adjustedTraffic); err != nil {
-					c.logError("Failed to update traffic usage for key %s: %v", utils.ShrinkString(key.Key, 8), err)
-				} else {
-					c.logInfo("Traffic usage updated: key=%s, raw=%d bytes, multiplier=%.2f, adjusted=%d bytes",
-						utils.ShrinkString(key.Key, 8), totalTraffic, multiplier, adjustedTraffic)
-				}
-			}()
+			// 字节流量计费已停用：embedding 同样统一改用 Token 计费体系，不再累加 TrafficUsed。
+			// 关键词: embedding 字节流量计费停用, Token 体系统一计费
 		}
 
 		break // Success, exit loop
@@ -1363,7 +1970,7 @@ func (c *ServerConfig) serveEmbeddings(conn net.Conn, rawPacket []byte) {
 		return
 	}
 
-	// Send response
+	// Send response in OpenAI format
 	header := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
 		"Content-Type: application/json; charset=utf-8\r\n"+
 		"Content-Length: %d\r\n"+
@@ -1372,6 +1979,21 @@ func (c *ServerConfig) serveEmbeddings(conn net.Conn, rawPacket []byte) {
 	conn.Write([]byte(header))
 	conn.Write(responseJSON)
 	c.logInfo("Embedding response sent successfully, %d bytes", len(responseJSON))
+}
+
+// isEmbeddingWrapper reports whether a wrapper should be excluded from GET /v1/models
+// (chat-oriented listing). True when the wrapper name suggests embedding or any provider
+// row is in embedding mode.
+func isEmbeddingWrapper(wrapperName string, providers []*Provider) bool {
+	if strings.Contains(strings.ToLower(wrapperName), "embedding") {
+		return true
+	}
+	for _, p := range providers {
+		if p != nil && strings.EqualFold(strings.TrimSpace(p.ProviderMode), "embedding") {
+			return true
+		}
+	}
+	return false
 }
 
 // 新增函数: 处理 /v1/models 请求，返回所有可用的 model 列表
@@ -1392,48 +2014,64 @@ func (c *ServerConfig) serveModels(key *Key, conn net.Conn) {
 		Data   []*ModelMeta `json:"data"`   // 使用指针切片与 ListChatModels 兼容
 	}
 
-	// 从 Entrypoints 中获取所有可用的模型
-	modelNames := make([]string, 0, len(c.Entrypoints.providers))
-	for modelName := range c.Entrypoints.providers {
+	totalWrappers := len(c.Entrypoints.providers)
+	modelNames := make([]string, 0, totalWrappers)
+	for modelName, plist := range c.Entrypoints.providers {
+		if isEmbeddingWrapper(modelName, plist) {
+			continue
+		}
 		modelNames = append(modelNames, modelName)
 	}
+	afterEmbedding := len(modelNames)
 
-	// 如果没有模型，返回空列表
-	if len(modelNames) == 0 {
-		c.logWarn("No models available for listing")
-	} else {
-		c.logInfo("Found %d available models", len(modelNames))
-	}
-
-	// 构建响应对象
-	response := ModelsResponse{
-		Object: "list",
-		Data:   make([]*ModelMeta, 0, len(modelNames)), // 使用指针切片
-	}
-
-	// 创建当前时间，用于 created 字段
-	now := time.Now().Unix()
-
-	// 为每个模型创建 ModelMeta
+	filtered := make([]string, 0, len(modelNames))
 	for _, name := range modelNames {
-		// 免费模型始终对所有用户可见
-		// 对于非免费模型，如果提供了 key，则检查权限
 		isFreeModel := strings.HasSuffix(name, "-free")
-		if key != nil {
-			if _, ok := key.AllowedModels[name]; !ok && !isFreeModel {
+		if key == nil {
+			if !isFreeModel {
+				continue
+			}
+		} else {
+			if !isFreeModel && !c.KeyAllowedModels.IsModelAllowed(key.Key, name) {
 				continue
 			}
 		}
+		filtered = append(filtered, name)
+	}
+	afterAuth := len(filtered)
 
-		response.Data = append(response.Data, &ModelMeta{ // 使用指针
+	sort.Slice(filtered, func(i, j int) bool {
+		fi := strings.HasSuffix(filtered[i], "-free")
+		fj := strings.HasSuffix(filtered[j], "-free")
+		if fi != fj {
+			// non-free wrappers first
+			return !fi && fj
+		}
+		return filtered[i] < filtered[j]
+	})
+
+	if totalWrappers == 0 {
+		c.logWarn("No models available for listing")
+	} else {
+		c.logInfo("Models list: total_wrappers=%d after_embedding_exclusion=%d after_auth=%d",
+			totalWrappers, afterEmbedding, afterAuth)
+	}
+
+	response := ModelsResponse{
+		Object: "list",
+		Data:   make([]*ModelMeta, 0, len(filtered)),
+	}
+
+	now := time.Now().Unix()
+	for _, name := range filtered {
+		response.Data = append(response.Data, &ModelMeta{
 			ID:      name,
 			Object:  "model",
 			Created: now,
-			OwnedBy: "library", // 改为 "library" 以匹配示例中的值
+			OwnedBy: "library",
 		})
 	}
 
-	// 序列化为 JSON
 	responseJSON, err := json.Marshal(response)
 	if err != nil {
 		c.logError("Failed to marshal models response: %v", err)
@@ -1442,16 +2080,14 @@ func (c *ServerConfig) serveModels(key *Key, conn net.Conn) {
 		return
 	}
 
-	// 构建 HTTP 响应
 	header := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
 		"Content-Type: application/json; charset=utf-8\r\n"+
 		"Content-Length: %d\r\n"+
 		"\r\n", len(responseJSON))
 
-	// 发送响应
 	conn.Write([]byte(header))
 	conn.Write(responseJSON)
-	c.logInfo("Models list response sent, %d bytes, models: %v", len(responseJSON), modelNames)
+	c.logInfo("Models list response sent, %d bytes, models: %v", len(responseJSON), filtered)
 }
 
 // serveModelMeta serves model metadata
@@ -1858,6 +2494,203 @@ func (c *ServerConfig) serveRequest(conn net.Conn, request *http.Request, should
 		c.writeResponse(conn, "HTTP/1.1 404 Not Found\r\n\r\n", shouldClose)
 		return
 	}
+}
+
+// writeRateLimitResponse sends a 429 response with X-AIBalance-Info header containing the queue length.
+//
+// 兼容包装：保留老签名以避免破坏现有调用点 / 测试，内部直接转发到新的
+// writeRPMRateLimitResponse。日 Token 限额场景请改用 writeDailyTokenLimitResponse。
+// 关键词: writeRateLimitResponse 兼容包装, RPM 限流 429
+func (c *ServerConfig) writeRateLimitResponse(conn net.Conn, queueLength int64) {
+	c.writeRPMRateLimitResponse(conn, queueLength)
+}
+
+// writeRPMRateLimitResponse sends a 429 response for the RPM-based rate limiter
+// (per API key sliding window). Header includes X-AIBalance-Info (queue length)
+// and X-AIBalance-Limit-Kind: rpm so clients can branch behavior.
+//
+// 关键词: writeRPMRateLimitResponse, RPM 限流 429, X-AIBalance-Limit-Kind
+func (c *ServerConfig) writeRPMRateLimitResponse(conn net.Conn, queueLength int64) {
+	// 默认文案集中在 custom_429.go（Default429MessageRPM），运行时追加排队位置，保证与编辑界面默认文案一致；
+	// 启用自定义 429 时按 kind=rpm 覆盖 message 并注入 notice。
+	// 关键词: writeRPMRateLimitResponse resolveLimit429, kind rpm, Default429MessageRPM, notice 注入
+	defaultMessage := fmt.Sprintf("%s（当前排队位置 %d / queue position %d）", Default429MessageRPM, queueLength, queueLength)
+	message, notice := c.resolveLimit429("rpm", defaultMessage)
+	errMap := map[string]interface{}{
+		"message":       message,
+		"type":          "rate_limit_exceeded",
+		"limit_kind":    "rpm",
+		"limit_kind_zh": "请求频率限流",
+		"queue_length":  queueLength,
+	}
+	if notice != "" {
+		errMap["notice"] = notice
+	}
+	body, err := json.Marshal(map[string]interface{}{"error": errMap})
+	if err != nil {
+		c.logError("writeRPMRateLimitResponse marshal failed: %v", err)
+		body = []byte(`{"error":{"type":"rate_limit_exceeded","limit_kind":"rpm","message":"Rate limit exceeded."}}`)
+	}
+	header := fmt.Sprintf(
+		"HTTP/1.1 429 Too Many Requests\r\n"+
+			"Content-Type: application/json; charset=utf-8\r\n"+
+			"X-AIBalance-Info: %d\r\n"+
+			"X-AIBalance-Limit-Kind: rpm\r\n"+
+			"Retry-After: 10\r\n"+
+			"Content-Length: %d\r\n"+
+			"\r\n",
+		queueLength, len(body))
+	conn.Write([]byte(header))
+	conn.Write(body)
+}
+
+// writeDailyTokenLimitResponse sends a 429 response when a free user has exceeded
+// the daily Token quota. Body includes both the absolute Token counts and the
+// M-unit shortcuts used by portal display.
+//
+// 字段对应：
+//   - type           "daily_token_limit_exceeded"
+//   - limit_kind     "daily_token_quota"
+//   - limit_kind_zh  "日限额已满"
+//   - tokens_used    int64 raw token
+//   - tokens_limit   int64 raw token
+//   - tokens_used_m  float (= tokens_used / 1_000_000)
+//   - tokens_limit_m int64 (= tokens_limit / 1_000_000)
+//   - bucket         "global" | "model"
+//   - model          实际触发限额的对外模型名
+//
+// HTTP header: X-AIBalance-Limit-Kind: daily_token + Retry-After: 3600
+// （建议客户端等到下一日北京时间 06:00 附近重试）
+//
+// 关键词: writeDailyTokenLimitResponse, 日 Token 限额 429, 日限额已满, 北京时间 6 点刷新
+func (c *ServerConfig) writeDailyTokenLimitResponse(conn net.Conn, modelName, bucket string, tokensUsed, tokensLimit int64) {
+	usedM := float64(tokensUsed) / float64(FreeUserTokenMUnit)
+	limitM := tokensLimit / FreeUserTokenMUnit
+	// 关键词: 日 Token 限额提示词, 亿词元单位, 北京时间 06:00 刷新
+	// 1 亿 = 1e8 token；同时拼接英文便于运维日志检索。
+	const yiUnit = 100_000_000
+	limitYi := float64(tokensLimit) / float64(yiUnit)
+	// 默认文案集中在 custom_429.go（Default429MessageDailyToken），运行时追加具体用量数值，
+	// 保证与编辑界面默认文案一致；启用自定义 429 时按 kind=daily_token 覆盖 message 并注入 notice。
+	// 关键词: writeDailyTokenLimitResponse resolveLimit429, kind daily_token, Default429MessageDailyToken, notice 注入
+	defaultFriendlyMessage := fmt.Sprintf(
+		"%s（已用 %d / 上限 %d，约 %.2f 亿 / used=%d limit=%d）",
+		Default429MessageDailyToken, tokensUsed, tokensLimit, limitYi, tokensUsed, tokensLimit)
+	friendlyMessage, notice := c.resolveLimit429("daily_token", defaultFriendlyMessage)
+	type errBody struct {
+		Type         string  `json:"type"`
+		Message      string  `json:"message"`
+		Notice       string  `json:"notice,omitempty"`
+		LimitKind    string  `json:"limit_kind"`
+		LimitKindZh  string  `json:"limit_kind_zh"`
+		Bucket       string  `json:"bucket"`
+		Model        string  `json:"model"`
+		TokensUsed   int64   `json:"tokens_used"`
+		TokensLimit  int64   `json:"tokens_limit"`
+		TokensUsedM  float64 `json:"tokens_used_m"`
+		TokensLimitM int64   `json:"tokens_limit_m"`
+	}
+	type wrap struct {
+		Error errBody `json:"error"`
+	}
+	payload := wrap{Error: errBody{
+		Type:         "daily_token_limit_exceeded",
+		Message:      friendlyMessage,
+		Notice:       notice,
+		LimitKind:    "daily_token_quota",
+		LimitKindZh:  "日限额已满",
+		Bucket:       bucket,
+		Model:        modelName,
+		TokensUsed:   tokensUsed,
+		TokensLimit:  tokensLimit,
+		TokensUsedM:  usedM,
+		TokensLimitM: limitM,
+	}}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		c.logError("writeDailyTokenLimitResponse marshal failed: %v", err)
+		body = []byte(`{"error":{"type":"daily_token_limit_exceeded","limit_kind":"daily_token_quota","message":"Daily token limit exceeded."}}`)
+	}
+	header := fmt.Sprintf(
+		"HTTP/1.1 429 Too Many Requests\r\n"+
+			"Content-Type: application/json; charset=utf-8\r\n"+
+			"X-AIBalance-Limit-Kind: daily_token\r\n"+
+			"X-AIBalance-Token-Used: %d\r\n"+
+			"X-AIBalance-Token-Limit: %d\r\n"+
+			"Retry-After: 3600\r\n"+
+			"Content-Length: %d\r\n"+
+			"\r\n",
+		tokensUsed, tokensLimit, len(body))
+	conn.Write([]byte(header))
+	conn.Write(body)
+}
+
+// writeFreeIPLimitResponse sends a 429 response when a single client IP has exceeded
+// its daily free-model quota (request count or weighted token). Body carries the固定
+// 友好提示与 used/limit 明细，供客户端展示与运维核对。
+//
+// 字段对应：
+//   - type            "free_ip_limit_exceeded"
+//   - limit_kind      "free_ip_quota"
+//   - limit_kind_zh   "免费用量已用尽"
+//   - exceeded_kind   "request" | "token"
+//   - request_used / request_limit  当天请求数与上限
+//   - tokens_used / tokens_limit    当天加权 token 与上限
+//
+// HTTP header: X-AIBalance-Limit-Kind: free_ip + Retry-After: 3600
+// （建议客户端等到次日北京时间 06:00 附近重试）
+//
+// 关键词: writeFreeIPLimitResponse, 单 IP 免费用量 429, 当前环境免费用量已用尽, resolveLimit429 free_ip
+func (c *ServerConfig) writeFreeIPLimitResponse(conn net.Conn, decision *FreeUserIPLimitDecision) {
+	if decision == nil {
+		decision = &FreeUserIPLimitDecision{}
+	}
+	// 默认文案集中在 custom_429.go（Default429MessageFreeIP），保证与编辑界面默认文案一致；
+	// 启用自定义 429 时按 kind=free_ip 覆盖 message 并注入 notice。
+	// 关键词: 免费 IP 限额提示词, Default429MessageFreeIP, 当前环境免费用量已用尽
+	friendlyMessage, notice := c.resolveLimit429("free_ip", Default429MessageFreeIP)
+	type errBody struct {
+		Type         string `json:"type"`
+		Message      string `json:"message"`
+		Notice       string `json:"notice,omitempty"`
+		LimitKind    string `json:"limit_kind"`
+		LimitKindZh  string `json:"limit_kind_zh"`
+		ExceededKind string `json:"exceeded_kind"`
+		RequestUsed  int64  `json:"request_used"`
+		RequestLimit int64  `json:"request_limit"`
+		TokensUsed   int64  `json:"tokens_used"`
+		TokensLimit  int64  `json:"tokens_limit"`
+	}
+	type wrap struct {
+		Error errBody `json:"error"`
+	}
+	payload := wrap{Error: errBody{
+		Type:         "free_ip_limit_exceeded",
+		Message:      friendlyMessage,
+		Notice:       notice,
+		LimitKind:    "free_ip_quota",
+		LimitKindZh:  "免费用量已用尽",
+		ExceededKind: decision.ExceededKind,
+		RequestUsed:  decision.RequestUsed,
+		RequestLimit: decision.RequestLimit,
+		TokensUsed:   decision.TokensUsed,
+		TokensLimit:  decision.TokensLimit,
+	}}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		c.logError("writeFreeIPLimitResponse marshal failed: %v", err)
+		body = []byte(`{"error":{"type":"free_ip_limit_exceeded","limit_kind":"free_ip_quota","message":"Free quota for this environment has been used up, please configure your own AI backend."}}`)
+	}
+	header := fmt.Sprintf(
+		"HTTP/1.1 429 Too Many Requests\r\n"+
+			"Content-Type: application/json; charset=utf-8\r\n"+
+			"X-AIBalance-Limit-Kind: free_ip\r\n"+
+			"Retry-After: 3600\r\n"+
+			"Content-Length: %d\r\n"+
+			"\r\n",
+		len(body))
+	conn.Write([]byte(header))
+	conn.Write(body)
 }
 
 // writeResponse writes a response with appropriate Connection header for keep-alive support

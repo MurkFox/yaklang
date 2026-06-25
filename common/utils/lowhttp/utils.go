@@ -26,6 +26,8 @@ const (
 	DoubleCRLF = "\r\n\r\n"
 )
 
+var validPathSuffixRegexp = regexp.MustCompile(`^\.[A-Za-z0-9]+$`)
+
 // pathExtModifierChars 是 CDN/图片服务在 path 扩展名后常加的修饰符字符。
 // 例如 a.png!cc_218x300 中的 !、.jpg@100w 中的 @。提取“真实扩展名”时需在此类字符处截断，
 // 只保留如 .png、.jpg 这样的后缀。
@@ -53,10 +55,22 @@ func GetPathSuffix(pathStr string) string {
 	if !strings.HasPrefix(ret, ".") {
 		ret = "." + ret
 	}
+	if !validPathSuffixRegexp.MatchString(ret) {
+		return ""
+	}
 	return ret
 }
 
 // ExtractURLFromHTTPRequestRaw 从原始 HTTP 请求报文中提取 URL，返回URL结构体与错误
+//
+// 参数:
+//   - req: 原始 HTTP 请求报文字节
+//   - isHttps: 是否为 https 协议
+//
+// 返回值:
+//   - 解析出的 URL 实例
+//   - 错误信息
+//
 // Example:
 // ```
 // url, err := str.ExtractURLFromHTTPRequestRaw(b"GET / HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n", false)
@@ -195,6 +209,15 @@ func TrimSpaceHTTPPacket(raw []byte) []byte {
 }
 
 // ExtractURLFromHTTPRequest 从 HTTP 请求结构体中提取 URL，返回URL结构体与错误
+//
+// 参数:
+//   - r: HTTP 请求结构体
+//   - https: 是否为 https 协议
+//
+// 返回值:
+//   - 解析出的 URL 实例
+//   - 错误信息
+//
 // Example:
 // ```
 // v, err = http.Raw("GET / HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n")
@@ -297,6 +320,14 @@ func ExtractURLFromHTTPRequest(r *http.Request, https bool) (*url.URL, error) {
 }
 
 // ExtractBodyFromHTTPResponseRaw 从原始 HTTP 响应报文中提取 body
+//
+// 参数:
+//   - res: 原始 HTTP 响应报文字节
+//
+// 返回值:
+//   - 提取出的响应体字节
+//   - 错误信息
+//
 // Example:
 // ```
 // body, err = str.ExtractBodyFromHTTPResponseRaw(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") // body = b"ok"
@@ -307,6 +338,14 @@ func ExtractBodyFromHTTPResponseRaw(res []byte) ([]byte, error) {
 }
 
 // ParseStringToHTTPResponse 将字符串解析为 HTTP 响应
+//
+// 参数:
+//   - res: HTTP 响应报文字符串
+//
+// 返回值:
+//   - 解析出的 HTTP 响应结构体
+//   - 错误信息
+//
 // Example:
 // ```
 // res, err := str.ParseStringToHTTPResponse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -316,6 +355,15 @@ func ParseStringToHTTPResponse(res string) (*http.Response, error) {
 }
 
 // MergeUrlFromHTTPRequest 将传入的 target 与 原始 HTTP 请求报文中的 URL 进行合并，并返回合并后的 URL
+//
+// 参数:
+//   - rawRequest: 原始 HTTP 请求报文字节
+//   - target: 待合并的目标路径或 URL
+//   - isHttps: 是否为 https 协议
+//
+// 返回值:
+//   - 合并后的 URL 字符串
+//
 // Example:
 // ```
 // url = str.MergeUrlFromHTTPRequest(b"GET /z HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n", "/a/b", true) // url = "https://www.yaklang.com/z/a/b"
@@ -352,7 +400,7 @@ func SplitHTTPHeader(i string) (string, string) {
 	if ret := strings.Index(i, ":"); ret < 0 {
 		return i, ""
 	} else {
-		key := i[:ret]
+		key := strings.TrimSpace(i[:ret])
 		value := strings.TrimSpace(i[ret+1:])
 		return key, value
 	}
@@ -626,6 +674,15 @@ func SplitHTTPPacketEx(
 }
 
 // SplitHTTPHeadersAndBodyFromPacket 将传入的 HTTP 报文分割为 headers 和 body，如果传入了hook，则会在每次读取到一行 header 时调用 hook
+//
+// 参数:
+//   - raw: 原始 HTTP 报文字节
+//   - hook: 可选的逐行 header 回调函数
+//
+// 返回值:
+//   - headers: 报文头部字符串
+//   - body: 报文体字节
+//
 // Example:
 // ```
 // headers, body = str.SplitHTTPHeadersAndBodyFromPacket(b"GET / HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n")
@@ -815,10 +872,23 @@ func normalizeHostOnly(host string) string {
 }
 
 // IsResp 判断传入的数据是否为 HTTP 响应报文
-// Example:
+// 参数:
+//   - raw: 待判断的数据，可为字节数组或字符串
+//
+// 返回值:
+//   - 是否为 HTTP 响应报文
+//
+// <|EXAMPLE_START|> 示例：判断一段数据是否为 HTTP 响应报文
 // ```
-// poc.IsResp(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") // true
+// // 关键词: poc.IsResponse, 判断响应报文
+// // 注意: 在 yak 中该函数导出名为 poc.IsResponse
+// isResp = poc.IsResponse(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+// println("is response =", isResp)              // 预期输出: is response = true
+// assert isResp, "should be recognized as response"
+// isReq = poc.IsResponse(b"GET / HTTP/1.1\r\nHost: a.com\r\n\r\n")
+// assert !isReq, "request packet should not be a response"
 // ```
+// <|EXAMPLE_END|>
 func IsResp(raw any) (isHTTPResponse bool) {
 	switch data := raw.(type) {
 	case []byte:

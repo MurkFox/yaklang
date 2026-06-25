@@ -449,6 +449,7 @@ func (m *HTTPFlowAnalyzeManger) ExecReplacerRule(db *gorm.DB, flow *schema.HTTPF
 
 		var extractedData []schema.ExtractedData
 		filter := filter.NewFilter()
+		ph := yakit.BuildMITMExtractPlaceholders(nil, flow)
 		for _, matched := range matcheds {
 			// 如果开启了去重，检查是否已经存在相同的数据
 			if m.dedup {
@@ -460,7 +461,7 @@ func (m *HTTPFlowAnalyzeManger) ExecReplacerRule(db *gorm.DB, flow *schema.HTTPF
 			e := yakit.ExtractedDataFromHTTPFlow(
 				flow.HiddenIndex,
 				rule.VerboseName,
-				matched,
+				yakit.CloneMatchResultWithMITMPlaceholders(matched, ph),
 				pattern,
 			)
 			// save extracted data
@@ -609,15 +610,15 @@ func (m *HTTPFlowAnalyzeManger) executeMatchers(flow *schema.HTTPFlow) (discard 
 	}
 	reqRaw := flow.GetRequest()
 
-	matched, hitColors, discard := MatchColor(m.matchers, &httptpl.RespForMatch{RawPacket: []byte(rspRaw), RequestPacket: []byte(reqRaw)}, nil)
+	matchResult := ProcessYakMatch(m.matchers, &httptpl.RespForMatch{RawPacket: []byte(rspRaw), RequestPacket: []byte(reqRaw)}, nil)
 
-	if matched && len(hitColors) > 0 {
-		flow.AddTag(hitColors...)
+	if matchResult.Matched && len(matchResult.HitColor) > 0 {
+		flow.AddTag(matchResult.HitColor...)
 		err := yakit.UpdateHTTPFlowTags(consts.GetGormProjectDatabase(), flow)
 		if err != nil {
 			log.Errorf("update http flow tags failed: %s", err)
 		}
 	}
 
-	return discard
+	return matchResult.Discard
 }

@@ -86,7 +86,7 @@ func init() {
 			),
 			mcp.WithStringArray("proto",
 				mcp.Description("Protocols to scan: tcp, udp"),
-				mcp.Enum("tcp", "udp"),
+				mcp.ItemsEnum("tcp", "udp"),
 				mcp.Default([]string{"tcp"}),
 				mcp.Required(),
 			),
@@ -216,8 +216,11 @@ func handlePortScan(s *MCPServer) server.ToolHandlerFunc {
 			content = handleExecMessage(content)
 			msgContent := gjson.GetBytes(exec.Message, "content")
 
-			isResult := gjson.GetBytes(exec.Message, "isOpen").Exists()
-			if isResult {
+			isOpenField := gjson.GetBytes(exec.Message, "isOpen")
+			if isOpenField.Exists() {
+				if !isOpenField.Bool() {
+					continue
+				}
 				content = "[Result] " + content
 			}
 
@@ -227,15 +230,19 @@ func handlePortScan(s *MCPServer) server.ToolHandlerFunc {
 			typ := gjson.GetBytes(exec.Message, "type").String()
 
 			if typ == "progress" {
-				s.notificationServer(ctx).SendNotificationToClient("port_scan/progress", map[string]any{
-					"progressToken": progressToken,
-					"title":         msgContent.Get("id").String(),
-					"progress":      msgContent.Get("progress").Float(),
-				})
+				// Only send progress notification when the client provided a progressToken.
+				// Sending notifications/progress with a null token violates the MCP spec and
+				// causes strict SDK validators (e.g. Python MCP SDK) to drop the connection.
+				if progressToken != nil {
+					s.notificationServer(ctx).SendNotificationToClient("notifications/progress", map[string]any{
+						"progressToken": progressToken,
+						"progress":      msgContent.Get("progress").Float(),
+					})
+				}
 			} else {
-				s.notificationServer(ctx).SendNotificationToClient("port_scan/info", map[string]any{
-					"progressToken": progressToken,
-					"content":       content,
+				s.notificationServer(ctx).SendNotificationToClient("notifications/message", map[string]any{
+					"level": "info",
+					"data":  content,
 				})
 			}
 

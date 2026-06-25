@@ -28,15 +28,18 @@ func TestHotPatchTemplate(t *testing.T) {
 	names := make([]string, 0, times)
 	contents := make([]string, 0, times)
 	types := make([]string, 0, times)
+	tagsList := make([][]string, 0, times)
 	for i := 0; i < times; i++ {
 		names = append(names, uuid.NewString())
 		contents = append(contents, "prefix"+uuid.NewString())
 		types = append(types, typ)
+		tagsList = append(tagsList, []string{"tag-" + uuid.NewString(), "shared-" + typ})
 	}
 	checkYpbHotPatchTemplate := func(t *testing.T, index int, got *ypb.HotPatchTemplate) {
 		require.Equal(t, names[index], got.Name)
 		require.Equal(t, contents[index], got.Content)
 		require.Equal(t, types[index], got.Type)
+		require.ElementsMatch(t, tagsList[index], got.Tags)
 	}
 
 	// create
@@ -46,6 +49,7 @@ func TestHotPatchTemplate(t *testing.T) {
 			Name:    names[i],
 			Content: contents[i],
 			Type:    types[i],
+			Tags:    tagsList[i],
 		})
 		require.NoError(t, err)
 	}
@@ -55,7 +59,7 @@ func TestHotPatchTemplate(t *testing.T) {
 		// one
 		deleteResp, err := local.DeleteHotPatchTemplate(ctx, &ypb.DeleteHotPatchTemplateRequest{
 			Condition: &ypb.HotPatchTemplateRequest{
-				Name: []string{names[0]},
+				Tags: []string{tagsList[0][0]},
 			},
 		})
 		require.NoError(t, err)
@@ -64,7 +68,7 @@ func TestHotPatchTemplate(t *testing.T) {
 		// all names
 		deleteResp, err = local.DeleteHotPatchTemplate(ctx, &ypb.DeleteHotPatchTemplateRequest{
 			Condition: &ypb.HotPatchTemplateRequest{
-				Name: names,
+				Name: names[1:],
 			},
 		})
 		require.NoError(t, err)
@@ -87,6 +91,16 @@ func TestHotPatchTemplate(t *testing.T) {
 	// content keyword
 	queryResp, err = local.QueryHotPatchTemplate(ctx, &ypb.HotPatchTemplateRequest{
 		ContentKeyword: []string{contents[0]},
+	})
+	require.NoError(t, err)
+
+	gots = queryResp.GetData()
+	require.Len(t, gots, 1)
+	checkYpbHotPatchTemplate(t, 0, gots[0])
+
+	// tags
+	queryResp, err = local.QueryHotPatchTemplate(ctx, &ypb.HotPatchTemplateRequest{
+		Tags: []string{tagsList[0][0]},
 	})
 	require.NoError(t, err)
 
@@ -127,17 +141,20 @@ func TestHotPatchTemplate(t *testing.T) {
 	// update
 	// content
 	newContent := "new" + contents[0]
+	updatedTags := []string{"updated-" + uuid.NewString(), tagsList[0][1]}
 	updateResp, err := local.UpdateHotPatchTemplate(ctx, &ypb.UpdateHotPatchTemplateRequest{
 		Condition: &ypb.HotPatchTemplateRequest{
 			Name: []string{names[0]},
 		},
 		Data: &ypb.HotPatchTemplate{
 			Content: newContent,
+			Tags:    updatedTags,
 		},
 	})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), updateResp.GetMessage().EffectRows)
 	contents[0] = newContent
+	tagsList[0] = updatedTags
 
 	// query new content
 	queryResp, err = local.QueryHotPatchTemplate(ctx, &ypb.HotPatchTemplateRequest{
@@ -146,6 +163,16 @@ func TestHotPatchTemplate(t *testing.T) {
 	require.NoError(t, err)
 
 	gots = queryResp.GetData()
+	checkYpbHotPatchTemplate(t, 0, gots[0])
+
+	// query new tags
+	queryResp, err = local.QueryHotPatchTemplate(ctx, &ypb.HotPatchTemplateRequest{
+		Tags: []string{tagsList[0][0]},
+	})
+	require.NoError(t, err)
+
+	gots = queryResp.GetData()
+	require.Len(t, gots, 1)
 	checkYpbHotPatchTemplate(t, 0, gots[0])
 
 }
@@ -188,6 +215,51 @@ func TestQueryHotPatchTemplateList_GlobalSortedByNewestCreatedFirst(t *testing.T
 	require.Equal(t, []string{names[2], names[1], names[0]}, listResp.GetName())
 }
 
+func TestGetHotPatchTemplateTags(t *testing.T) {
+	client, _, err := NewLocalClientAndServerWithTempDatabase(t)
+	require.NoError(t, err)
+
+	ctx := utils.TimeoutContextSeconds(8)
+	templates := []*ypb.HotPatchTemplate{
+		{
+			Name:    "template-a",
+			Content: "content-a",
+			Type:    "test",
+			Tags:    []string{"shared", "alpha", "shared", ""},
+		},
+		{
+			Name:    "template-b",
+			Content: "content-b",
+			Type:    "test",
+			Tags:    []string{"shared", "beta"},
+		},
+		{
+			Name:    "template-c",
+			Content: "content-c",
+			Type:    "test",
+			Tags:    []string{"beta"},
+		},
+		{
+			Name:    "template-d",
+			Content: "content-d",
+			Type:    "test",
+		},
+	}
+	for _, template := range templates {
+		_, err = client.CreateHotPatchTemplate(ctx, template)
+		require.NoError(t, err)
+	}
+
+	resp, err := client.GetHotPatchTemplateTags(ctx, &ypb.Empty{})
+	require.NoError(t, err)
+
+	require.Equal(t, []*ypb.Tags{
+		{Value: "beta", Total: 2},
+		{Value: "shared", Total: 2},
+		{Value: "alpha", Total: 1},
+	}, resp.GetTags())
+}
+
 type TestServerWrapper struct {
 	*Server
 	onlineClient yaklib.OnlineClient
@@ -200,6 +272,7 @@ func TestUploadHotPatchTemplateToOnline(t *testing.T) {
 			Name:    "test-template",
 			Content: "test-content",
 			Type:    "test-type",
+			Tags:    schema.StringSlice{"test-tag", "yak"},
 		}
 
 		mockey.Mock(yakit.GetHotPatchTemplate).To(func(database *gorm.DB, req *ypb.UploadHotPatchTemplateToOnlineRequest) (*schema.HotPatchTemplate, error) {
@@ -218,6 +291,7 @@ func TestUploadHotPatchTemplateToOnline(t *testing.T) {
 			assert.Equal(t, reqBody.Name, "test-template")
 			assert.Equal(t, reqBody.Content, "test-content")
 			assert.Equal(t, reqBody.Type, "test-type")
+			assert.ElementsMatch(t, []string{"test-tag", "yak"}, []string(reqBody.Tags))
 
 			log.Infof("reqBody: %+v", reqBody)
 
@@ -250,6 +324,7 @@ func TestDownloadHotPatchTemplate(t *testing.T) {
 			Name:         name,
 			Content:      "test-content",
 			TemplateType: templateType,
+			Tags:         []string{"test-tag", "yak"},
 		}
 
 		mockey.Mock((*yaklib.OnlineClient).DownloadHotPatchTemplate).To(func(clientToken, clientName, clientTemplateType string) (*yaklib.HotPatchTemplate, error) {
@@ -259,10 +334,11 @@ func TestDownloadHotPatchTemplate(t *testing.T) {
 			return template, nil
 		}).Build()
 
-		mockey.Mock(yakit.CreateOrUpdateHotPatchTemplate).To(func(db *gorm.DB, name, templateType, content string) error {
+		mockey.Mock(yakit.CreateOrUpdateHotPatchTemplate).To(func(db *gorm.DB, name, templateType, content string, tags []string) error {
 			assert.Equal(t, name, "test-template")
 			assert.Equal(t, templateType, "test-type")
 			assert.Equal(t, content, "test-content")
+			assert.ElementsMatch(t, []string{"test-tag", "yak"}, tags)
 			return nil
 		}).Build()
 

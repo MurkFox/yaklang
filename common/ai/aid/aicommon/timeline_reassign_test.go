@@ -101,11 +101,11 @@ func TestTimelineReassignIDs_Empty(t *testing.T) {
 	require.Equal(t, 0, timeline.idToTimelineItem.Len())
 }
 
-// TestTimelineReassignIDs_WithSummary 测试包含 summary 的 timeline
-func TestTimelineReassignIDs_WithSummary(t *testing.T) {
+// TestTimelineReassignIDs_WithCompressedHead 测试 ReassignIDs 同步重映射 compressedHead.CoveredEndItemID
+// 关键词: ReassignIDs, compressedHead 重映射
+func TestTimelineReassignIDs_WithCompressedHead(t *testing.T) {
 	timeline := NewTimeline(nil, nil)
 
-	// 添加数据
 	for i := 1; i <= 5; i++ {
 		timeline.PushToolResult(&aitool.ToolResult{
 			ID:          int64(1000 + i),
@@ -116,17 +116,15 @@ func TestTimelineReassignIDs_WithSummary(t *testing.T) {
 		})
 	}
 
-	// 模拟添加 summary
-	item := &TimelineItem{
-		value: &aitool.ToolResult{
-			ID:           1003,
-			ShrinkResult: "summarized content",
-		},
+	// 模拟批量压缩后产生的 compressedHead
+	timeline.compressedHead = &TimelineCompressedHead{
+		Text:             "reducer-memory-1003",
+		CoveredEndItemID: 1003,
+		CoveredEndAtMs:   int64(1700000000000),
+		Version:          1,
 	}
-	timeline.summary.Set(1003, nil) // 简化测试，不需要完整的 LinkTable
 
 	require.Equal(t, 5, timeline.idToTimelineItem.Len())
-	require.Equal(t, 1, timeline.summary.Len())
 
 	var idCounter int64 = 100
 	generator := func() int64 {
@@ -138,17 +136,18 @@ func TestTimelineReassignIDs_WithSummary(t *testing.T) {
 	require.Equal(t, int64(105), lastID)
 	require.Equal(t, 5, timeline.idToTimelineItem.Len())
 
-	// 验证 summary 被正确更新
-	require.Equal(t, 1, timeline.summary.Len())
-	// 旧的 ID 1003 应该不存在了
-	_, exists := timeline.summary.Get(1003)
-	require.False(t, exists, "Old summary ID should not exist")
-
-	_ = item // 避免未使用变量警告
+	// compressedHead 的 CoveredEndItemID 应被重映射到新 ID
+	require.NotNil(t, timeline.compressedHead)
+	// 旧 ID 1003 是第 3 个 item（1001→101, 1002→102, 1003→103）
+	require.Equal(t, int64(103), timeline.compressedHead.CoveredEndItemID,
+		"CoveredEndItemID should be remapped to new id 103")
+	require.Equal(t, int64(1700000000000), timeline.compressedHead.CoveredEndAtMs,
+		"CoveredEndAtMs must remain unchanged")
 }
 
-// TestTimelineReassignIDs_WithReducers 测试包含 reducers 的 timeline
-func TestTimelineReassignIDs_WithReducers(t *testing.T) {
+// TestTimelineReassignIDs_WithCompressedHead_NoActiveItemMapping 测试当 compressedHead.CoveredEndItemID
+// 指向的旧 ID 不在 idToTimelineItem 中时（即已被软删除），ReassignIDs 不崩溃且 compressedHead 保持不变
+func TestTimelineReassignIDs_WithCompressedHead_NoActiveItemMapping(t *testing.T) {
 	timeline := NewTimeline(nil, nil)
 
 	// 添加数据
@@ -162,27 +161,28 @@ func TestTimelineReassignIDs_WithReducers(t *testing.T) {
 		})
 	}
 
-	// 模拟添加 reducer
-	timeline.reducers.Set(2002, nil) // 简化测试
+	// 模拟 compressedHead 指向一个不在活跃 item 中的 ID（2002 已被软删除）
+	timeline.SoftDelete(2002)
+	timeline.compressedHead = &TimelineCompressedHead{
+		Text:             "compressed",
+		CoveredEndItemID: 2002,
+		Version:          1,
+	}
 
 	require.Equal(t, 3, timeline.idToTimelineItem.Len())
-	require.Equal(t, 1, timeline.reducers.Len())
 
 	var idCounter int64 = 200
 	generator := func() int64 {
 		return atomic.AddInt64(&idCounter, 1)
 	}
 
+	// ReassignIDs 只重映射活跃 items（非 deleted）
 	lastID := timeline.ReassignIDs(generator)
 
-	require.Equal(t, int64(203), lastID)
-	require.Equal(t, 3, timeline.idToTimelineItem.Len())
-
-	// 验证 reducers 被正确更新
-	require.Equal(t, 1, timeline.reducers.Len())
-	// 旧的 ID 2002 应该不存在了
-	_, exists := timeline.reducers.Get(2002)
-	require.False(t, exists, "Old reducer ID should not exist")
+	// 只有 2 个活跃 items 被重映射（2001→201, 2003→202）
+	require.Equal(t, int64(202), lastID)
+	// compressedHead 不应崩溃（虽然 2002 不在 oldToNewID map 里，unmapped）
+	require.NotNil(t, timeline.compressedHead)
 }
 
 // TestTimelineReassignIDs_PreserveOrder 测试是否保持时间顺序

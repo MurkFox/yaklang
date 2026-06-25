@@ -4,11 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"github.com/davecgh/go-spew/spew"
-	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/utils"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/hpack"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +11,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/davecgh/go-spew/spew"
+	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/utils"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 const transportDefaultConnFlow = 1 << 30
@@ -399,10 +400,11 @@ type windowSizeControl struct {
 }
 
 func newControl(size int64) *windowSizeControl {
+	mu := new(sync.Mutex)
 	return &windowSizeControl{
-		windowMutex:   new(sync.Mutex),
+		windowMutex:   mu,
 		windowSize:    size,
-		windowChanged: new(sync.Cond),
+		windowChanged: sync.NewCond(mu),
 	}
 }
 
@@ -422,10 +424,20 @@ func (wc *windowSizeControl) increaseWindowSize(i int64) {
 
 func (wc *windowSizeControl) decreaseWindowSize(i int64) {
 	wc.windowMutex.Lock()
-	wc.windowSize -= i
 	defer wc.windowMutex.Unlock()
-	if wc.windowSize <= 0 {
-		log.Infof("window size is %v, waiting for window size changed", wc.windowSize)
+	wc.windowSize -= i
+	for wc.windowSize <= 0 {
 		wc.windowChanged.Wait()
+	}
+}
+
+// adjustWindowSize applies a delta from SETTINGS_INITIAL_WINDOW_SIZE change (RFC 7540 Section 6.9.2)
+func (wc *windowSizeControl) adjustWindowSize(delta int64) {
+	wc.windowMutex.Lock()
+	defer wc.windowMutex.Unlock()
+	wasNonPositive := wc.windowSize <= 0
+	wc.windowSize += delta
+	if wasNonPositive && wc.windowSize > 0 {
+		wc.windowChanged.Broadcast()
 	}
 }

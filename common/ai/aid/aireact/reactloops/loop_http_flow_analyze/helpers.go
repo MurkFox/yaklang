@@ -1,15 +1,61 @@
 package loop_http_flow_analyze
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
+	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
+const maxHTTPFlowSummaryBytes = 1024 * 5
+
+func buildSearchParamSummary(action *aicommon.Action) string {
+	var parts []string
+	if v := action.GetString("keyword"); v != "" {
+		parts = append(parts, fmt.Sprintf("keyword=%q", v))
+	}
+	if v := action.GetString("keyword_type"); v != "" {
+		parts = append(parts, fmt.Sprintf("keyword_type=%s", v))
+	}
+	if v := action.GetString("methods"); v != "" {
+		parts = append(parts, fmt.Sprintf("methods=%s", v))
+	}
+	if v := action.GetString("status_code"); v != "" {
+		parts = append(parts, fmt.Sprintf("status=%s", v))
+	}
+	if v := action.GetString("url_contains"); v != "" {
+		parts = append(parts, fmt.Sprintf("url=%q", v))
+	}
+	if v := action.GetString("tags"); v != "" {
+		parts = append(parts, fmt.Sprintf("tags=%s", v))
+	}
+	if v := action.GetString("exclude_keywords"); v != "" {
+		parts = append(parts, fmt.Sprintf("exclude=%q", v))
+	}
+	if v := action.GetString("source_type"); v != "" {
+		parts = append(parts, fmt.Sprintf("source=%s", v))
+	}
+	if v := action.GetString("runtime_id"); v != "" {
+		parts = append(parts, fmt.Sprintf("runtime=%s", v))
+	}
+	if v := action.GetInt("limit"); v > 0 {
+		parts = append(parts, fmt.Sprintf("limit=%d", v))
+	}
+	if len(parts) == 0 {
+		return "(no filters)"
+	}
+	return strings.Join(parts, ", ")
+}
+
 func buildQueryRequestFromAction(action *aicommon.Action, defaultLimit int) *ypb.QueryHTTPFlowRequest {
+	return buildQueryRequestFromActionWithLoop(action, defaultLimit, nil)
+}
+
+func buildQueryRequestFromActionWithLoop(action *aicommon.Action, defaultLimit int, loop *reactloops.ReActLoop) *ypb.QueryHTTPFlowRequest {
 	limit := action.GetInt("limit", defaultLimit)
 	if limit <= 0 {
 		limit = defaultLimit
@@ -44,6 +90,17 @@ func buildQueryRequestFromAction(action *aicommon.Action, defaultLimit int) *ypb
 
 	if req.SearchURL == "" {
 		req.SearchURL = action.GetString("url_contains")
+	}
+
+	// Check if we should limit to attached flows
+	searchBeyondSelected := action.GetBool("search_beyond_selected", false)
+	if !searchBeyondSelected && loop != nil {
+		// Try to get attached flow IDs from loop state
+		if attachedIDsRaw := loop.GetVariable(attachedHTTPFlowIDsKey); attachedIDsRaw != nil {
+			if attachedIDs, ok := attachedIDsRaw.([]int64); ok && len(attachedIDs) > 0 {
+				req.IncludeId = attachedIDs
+			}
+		}
 	}
 
 	return req

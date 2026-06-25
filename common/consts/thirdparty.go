@@ -2,6 +2,7 @@ package consts
 
 import (
 	"errors"
+	"reflect"
 	"sync"
 
 	"github.com/yaklang/yaklang/common/log"
@@ -20,7 +21,15 @@ type thirdPartyApplicationConfig struct {
 	UserSecret     string `app:"name:user_secret"`
 	Namespace      string `app:"name:namespace"`
 	Domain         string `app:"name:domain"`
+	BaseURL        string `app:"name:base_url"`
+	Endpoint       string `app:"name:endpoint"`
+	EnableEndpoint bool   `app:"name:enable_endpoint"`
+	EnableThinking bool   `app:"name:enable_thinking"`
 	WebhookURL     string `app:"name:webhook_url"`
+	Proxy          string `app:"name:proxy"`
+	NoHttps        bool   `app:"name:no_https"`
+	APIType        string `app:"name:api_type"`
+	Headers        []*ypb.KVPair
 	ExtraParams    map[string]string
 }
 
@@ -32,7 +41,15 @@ func ConvertCompatibleConfig(config *ypb.ThirdPartyApplicationConfig) {
 		UserSecret:     config.UserSecret,
 		Namespace:      config.Namespace,
 		Domain:         config.Domain,
+		BaseURL:        config.BaseURL,
+		Endpoint:       config.Endpoint,
+		EnableEndpoint: config.EnableEndpoint,
+		EnableThinking: config.EnableThinking,
 		WebhookURL:     config.WebhookURL,
+		Proxy:          config.Proxy,
+		NoHttps:        config.NoHttps,
+		APIType:        config.APIType,
+		Headers:        cloneHTTPHeaders(config.Headers),
 		ExtraParams:    make(map[string]string, len(config.ExtraParams)),
 	}
 	for _, kv := range config.ExtraParams {
@@ -59,7 +76,15 @@ func ConvertCompatibleConfig(config *ypb.ThirdPartyApplicationConfig) {
 	config.UserSecret = c.UserSecret
 	config.Namespace = c.Namespace
 	config.Domain = c.Domain
+	config.BaseURL = c.BaseURL
+	config.Endpoint = c.Endpoint
+	config.EnableEndpoint = c.EnableEndpoint
+	config.EnableThinking = c.EnableThinking
 	config.WebhookURL = c.WebhookURL
+	config.Proxy = c.Proxy
+	config.NoHttps = c.NoHttps
+	config.APIType = c.APIType
+	config.Headers = cloneHTTPHeaders(c.Headers)
 	config.ExtraParams = nil
 	for k, v := range c.ExtraParams { // ExtraParams will be disordered
 		config.ExtraParams = append(config.ExtraParams, &ypb.KVPair{
@@ -97,7 +122,15 @@ func GetCommonThirdPartyApplicationConfig(t string) (*ypb.ThirdPartyApplicationC
 		config.UserSecret = rawCfg.UserSecret
 		config.Namespace = rawCfg.Namespace
 		config.Domain = rawCfg.Domain
+		config.BaseURL = rawCfg.BaseURL
+		config.Endpoint = rawCfg.Endpoint
+		config.EnableEndpoint = rawCfg.EnableEndpoint
+		config.EnableThinking = rawCfg.EnableThinking
 		config.WebhookURL = rawCfg.WebhookURL
+		config.Proxy = rawCfg.Proxy
+		config.NoHttps = rawCfg.NoHttps
+		config.APIType = rawCfg.APIType
+		config.Headers = cloneHTTPHeaders(rawCfg.Headers)
 		config.Type = t
 		return config, nil
 	}
@@ -111,7 +144,10 @@ func GetThirdPartyApplicationConfig(t string, cfg any) error {
 	if v, ok := thirdPartyConfig.Load(t); ok {
 		rawCfg := v.(*thirdPartyApplicationConfig)
 		params := rawCfg.ToMap()
-		return utils.ImportAppConfigToStruct(cfg, params)
+		if err := utils.ImportAppConfigToStruct(cfg, params); err != nil {
+			return err
+		}
+		return applyThirdPartyNonAppFields(cfg, rawCfg)
 	}
 	return errors.New("third party application config not found")
 }
@@ -136,7 +172,15 @@ func AllThirdPartyApplicationConfig() []*ypb.ThirdPartyApplicationConfig {
 			UserSecret:     rawConfig.UserSecret,
 			Namespace:      rawConfig.Namespace,
 			Domain:         rawConfig.Domain,
+			BaseURL:        rawConfig.BaseURL,
+			Endpoint:       rawConfig.Endpoint,
+			EnableEndpoint: rawConfig.EnableEndpoint,
+			EnableThinking: rawConfig.EnableThinking,
 			WebhookURL:     rawConfig.WebhookURL,
+			Proxy:          rawConfig.Proxy,
+			NoHttps:        rawConfig.NoHttps,
+			APIType:        rawConfig.APIType,
+			Headers:        cloneHTTPHeaders(rawConfig.Headers),
 			ExtraParams:    make([]*ypb.KVPair, 0, len(rawConfig.ExtraParams)),
 		}
 		for k, v := range rawConfig.ExtraParams {
@@ -168,7 +212,15 @@ func UpdateThirdPartyApplicationConfig(config *ypb.ThirdPartyApplicationConfig) 
 		UserSecret:     config.UserSecret,
 		Namespace:      config.Namespace,
 		Domain:         config.Domain,
+		BaseURL:        config.BaseURL,
+		Endpoint:       config.Endpoint,
+		EnableEndpoint: config.EnableEndpoint,
+		EnableThinking: config.EnableThinking,
 		WebhookURL:     config.WebhookURL,
+		Proxy:          config.Proxy,
+		NoHttps:        config.NoHttps,
+		APIType:        config.APIType,
+		Headers:        cloneHTTPHeaders(config.Headers),
 		ExtraParams:    make(map[string]string, len(config.ExtraParams)),
 	}
 	for _, kv := range config.ExtraParams {
@@ -176,4 +228,53 @@ func UpdateThirdPartyApplicationConfig(config *ypb.ThirdPartyApplicationConfig) 
 	}
 
 	thirdPartyConfig.Store(config.Type, c)
+}
+
+func cloneHTTPHeaders(headers []*ypb.KVPair) []*ypb.KVPair {
+	if len(headers) == 0 {
+		return nil
+	}
+	cloned := make([]*ypb.KVPair, 0, len(headers))
+	for _, header := range headers {
+		if header == nil {
+			continue
+		}
+		cloned = append(cloned, &ypb.KVPair{
+			Key:   header.GetKey(),
+			Value: header.GetValue(),
+		})
+	}
+	return cloned
+}
+
+func applyThirdPartyNonAppFields(target any, source *thirdPartyApplicationConfig) error {
+	if target == nil || source == nil {
+		return nil
+	}
+	v := reflect.ValueOf(target)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return nil
+	}
+	elem := v.Elem()
+	if elem.Kind() != reflect.Struct {
+		return nil
+	}
+	field := elem.FieldByName("Headers")
+	if field.IsValid() && field.CanSet() && field.Type() == reflect.TypeOf([]*ypb.KVPair(nil)) {
+		field.Set(reflect.ValueOf(cloneHTTPHeaders(source.Headers)))
+	}
+	field = elem.FieldByName("EnableThinking")
+	if !field.IsValid() || !field.CanSet() {
+		return nil
+	}
+	switch field.Kind() {
+	case reflect.Bool:
+		field.SetBool(source.EnableThinking)
+	case reflect.Ptr:
+		if field.Type() == reflect.TypeOf((*bool)(nil)) {
+			v := source.EnableThinking
+			field.Set(reflect.ValueOf(&v))
+		}
+	}
+	return nil
 }

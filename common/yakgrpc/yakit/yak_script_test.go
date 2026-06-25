@@ -5,8 +5,10 @@ import (
 
 	"github.com/jinzhu/gorm"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/segmentio/ksuid"
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
 func newYakScriptTestDB(t *testing.T) *gorm.DB {
@@ -20,16 +22,22 @@ func newYakScriptTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+func newYakScriptTestName(prefix string) string {
+	return prefix + "-" + ksuid.New().String()
+}
+
 func TestCreateOrUpdateYakScriptByName_CreatesAndUpdatesSingleRecord(t *testing.T) {
 	db := newYakScriptTestDB(t)
 
-	const scriptName = "create-or-update-by-name"
-	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, &schema.YakScript{
+	scriptName := newYakScriptTestName("create-or-update-by-name")
+	script := &schema.YakScript{
 		ScriptName: scriptName,
 		Type:       "yak",
 		Content:    "print('v1')",
 		Help:       "first version",
-	}))
+	}
+	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, script))
+	require.NotZero(t, script.ID)
 
 	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, &schema.YakScript{
 		ScriptName: scriptName,
@@ -48,10 +56,35 @@ func TestCreateOrUpdateYakScriptByName_CreatesAndUpdatesSingleRecord(t *testing.
 	require.Equal(t, 1, count)
 }
 
+func TestCreateOrUpdateYakScriptByName_CreatePreservesProtectedFields(t *testing.T) {
+	db := newYakScriptTestDB(t)
+
+	scriptName := newYakScriptTestName("create-preserves-protected-fields")
+	scriptUUID := ksuid.New().String()
+	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, &schema.YakScript{
+		ScriptName:       scriptName,
+		Type:             "yak",
+		Content:          "print('created')",
+		Author:           "alice",
+		OnlineId:         123,
+		Uuid:             scriptUUID,
+		SkipUpdate:       true,
+		ForceInteractive: true,
+	}))
+
+	got, err := GetYakScriptByName(db, scriptName)
+	require.NoError(t, err)
+	require.Equal(t, "alice", got.Author)
+	require.EqualValues(t, 123, got.OnlineId)
+	require.Equal(t, scriptUUID, got.Uuid)
+	require.True(t, got.SkipUpdate)
+	require.True(t, got.ForceInteractive)
+}
+
 func TestCreateOrUpdateYakScriptByName_PersistsZeroValues(t *testing.T) {
 	db := newYakScriptTestDB(t)
 
-	const scriptName = "zero-value-update-by-name"
+	scriptName := newYakScriptTestName("zero-value-update-by-name")
 	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, &schema.YakScript{
 		ScriptName:           scriptName,
 		Type:                 "yak",
@@ -72,7 +105,7 @@ func TestCreateOrUpdateYakScriptByName_PersistsZeroValues(t *testing.T) {
 		GeneralModuleKey:     "module-key",
 	}))
 
-	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, &schema.YakScript{
+	updateScript := &schema.YakScript{
 		ScriptName:           scriptName,
 		Type:                 "yak",
 		Content:              "",
@@ -90,7 +123,12 @@ func TestCreateOrUpdateYakScriptByName_PersistsZeroValues(t *testing.T) {
 		IsGeneralModule:      false,
 		GeneralModuleVerbose: "",
 		GeneralModuleKey:     "",
-	}))
+	}
+	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, updateScript))
+	require.EqualValues(t, 123, updateScript.OnlineId)
+	require.True(t, updateScript.OnlineIsPrivate)
+	require.True(t, updateScript.SkipUpdate)
+	require.True(t, updateScript.ForceInteractive)
 
 	got, err := GetYakScriptByName(db, scriptName)
 	require.NoError(t, err)
@@ -102,10 +140,10 @@ func TestCreateOrUpdateYakScriptByName_PersistsZeroValues(t *testing.T) {
 	require.Equal(t, "", got.AIDesc)
 	require.Equal(t, "", got.AIKeywords)
 	require.Equal(t, "", got.AIUsage)
-	require.EqualValues(t, 0, got.OnlineId)
-	require.False(t, got.OnlineIsPrivate)
-	require.False(t, got.SkipUpdate)
-	require.False(t, got.ForceInteractive)
+	require.EqualValues(t, 123, got.OnlineId)
+	require.True(t, got.OnlineIsPrivate)
+	require.True(t, got.SkipUpdate)
+	require.True(t, got.ForceInteractive)
 	require.False(t, got.IsGeneralModule)
 	require.Equal(t, "", got.GeneralModuleVerbose)
 	require.Equal(t, "", got.GeneralModuleKey)
@@ -114,7 +152,7 @@ func TestCreateOrUpdateYakScriptByName_PersistsZeroValues(t *testing.T) {
 func TestCreateOrUpdateYakScriptByName_MapUpdateOnlyTouchesSpecifiedFields(t *testing.T) {
 	db := newYakScriptTestDB(t)
 
-	const scriptName = "map-update-by-name"
+	scriptName := newYakScriptTestName("map-update-by-name")
 	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, &schema.YakScript{
 		ScriptName:  scriptName,
 		Type:        "yak",
@@ -123,7 +161,7 @@ func TestCreateOrUpdateYakScriptByName_MapUpdateOnlyTouchesSpecifiedFields(t *te
 		AIDesc:      "desc",
 	}))
 
-	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, map[string]interface{}{
+	require.NoError(t, UpdateYakScriptFieldsByName(db, scriptName, map[string]interface{}{
 		"enable_for_ai": false,
 	}))
 
@@ -137,12 +175,14 @@ func TestCreateOrUpdateYakScriptByName_MapUpdateOnlyTouchesSpecifiedFields(t *te
 func TestCreateOrUpdateYakScript_CreatesNewRecordWhenIDMissing(t *testing.T) {
 	db := newYakScriptTestDB(t)
 
-	const scriptName = "create-or-update-by-id"
-	require.NoError(t, CreateOrUpdateYakScriptByID(db, 0, &schema.YakScript{
+	scriptName := newYakScriptTestName("create-or-update-by-id")
+	script := &schema.YakScript{
 		ScriptName: scriptName,
 		Type:       "yak",
 		Content:    "print('created')",
-	}))
+	}
+	require.NoError(t, CreateOrUpdateYakScriptByID(db, 0, script))
+	require.NotZero(t, script.ID)
 
 	got, err := GetYakScriptByName(db, scriptName)
 	require.NoError(t, err)
@@ -153,7 +193,7 @@ func TestCreateOrUpdateYakScript_CreatesNewRecordWhenIDMissing(t *testing.T) {
 func TestCreateOrUpdateYakScriptByID_PersistsZeroValues(t *testing.T) {
 	db := newYakScriptTestDB(t)
 
-	const scriptName = "zero-value-update-by-id"
+	scriptName := newYakScriptTestName("zero-value-update-by-id")
 	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, &schema.YakScript{
 		ScriptName:  scriptName,
 		Type:        "yak",
@@ -189,7 +229,7 @@ func TestCreateOrUpdateYakScriptByID_PersistsZeroValues(t *testing.T) {
 func TestCreateOrUpdateYakScript_MapUpdateOnlyTouchesSpecifiedFields(t *testing.T) {
 	db := newYakScriptTestDB(t)
 
-	const scriptName = "map-update-by-id"
+	scriptName := newYakScriptTestName("map-update-by-id")
 	require.NoError(t, CreateOrUpdateYakScriptByName(db, scriptName, &schema.YakScript{
 		ScriptName: scriptName,
 		Type:       "yak",
@@ -201,7 +241,7 @@ func TestCreateOrUpdateYakScript_MapUpdateOnlyTouchesSpecifiedFields(t *testing.
 	existing, err := GetYakScriptByName(db, scriptName)
 	require.NoError(t, err)
 
-	require.NoError(t, CreateOrUpdateYakScriptByID(db, int64(existing.ID), map[string]interface{}{
+	require.NoError(t, UpdateYakScriptFieldsByID(db, int64(existing.ID), map[string]interface{}{
 		"ignored": true,
 	}))
 
@@ -210,4 +250,38 @@ func TestCreateOrUpdateYakScript_MapUpdateOnlyTouchesSpecifiedFields(t *testing.
 	require.Equal(t, "print('before')", got.Content)
 	require.Equal(t, "keep me", got.Help)
 	require.True(t, got.Ignored)
+}
+
+func TestQueryYakScript_FilterEnableForAI(t *testing.T) {
+	db := newYakScriptTestDB(t)
+
+	enabledName := newYakScriptTestName("enable-for-ai")
+	disabledName := newYakScriptTestName("disable-for-ai")
+	require.NoError(t, CreateOrUpdateYakScriptByName(db, enabledName, &schema.YakScript{
+		ScriptName:  enabledName,
+		Type:        "yak",
+		Content:     "print('ai')",
+		EnableForAI: true,
+	}))
+	require.NoError(t, CreateOrUpdateYakScriptByName(db, disabledName, &schema.YakScript{
+		ScriptName:  disabledName,
+		Type:        "yak",
+		Content:     "print('no-ai')",
+		EnableForAI: false,
+	}))
+
+	_, allScripts, err := QueryYakScript(db, &ypb.QueryYakScriptRequest{
+		Pagination: &ypb.Paging{Page: 1, Limit: 100},
+	})
+	require.NoError(t, err)
+	require.Len(t, allScripts, 2)
+
+	_, aiScripts, err := QueryYakScript(db, &ypb.QueryYakScriptRequest{
+		Pagination:  &ypb.Paging{Page: 1, Limit: 100},
+		EnableForAI: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, aiScripts, 1)
+	require.Equal(t, enabledName, aiScripts[0].ScriptName)
+	require.True(t, aiScripts[0].EnableForAI)
 }

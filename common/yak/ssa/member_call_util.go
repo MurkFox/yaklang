@@ -28,9 +28,12 @@ func setMemberCallRelationship(obj, key, member Value) {
 	}
 	//todo：fix one value for more object-key
 
-	handlerMemberCall := func(obj Value) {
-		for _, edgeID := range obj.(*Phi).Edge {
-			edgeValue, ok := obj.GetValueById(edgeID)
+	handlerMemberCall := func(phi *Phi) {
+		if phi == nil {
+			return
+		}
+		for _, edgeID := range phi.Edge {
+			edgeValue, ok := phi.GetValueById(edgeID)
 			if !ok || edgeValue == nil {
 				continue
 			}
@@ -56,7 +59,7 @@ func setMemberCallRelationship(obj, key, member Value) {
 			}
 			if und, ok := ToUndefined(edgeValue); ok { // 遇到库类和return phi value
 				if und.Kind == UndefinedValueValid || und.Kind == UndefinedValueReturn {
-					handlerMemberCall(obj)
+					handlerMemberCall(phi)
 				}
 			}
 		}
@@ -82,21 +85,23 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 		return
 	}
 	ret.exist = true
-	ret.ObjType = value.GetType()
+	valueType := value.GetType()
+	ret.ObjType = valueType
+	keyText := key.String()
 	if constInst, ok := ToConstInst(key); ok {
 		if constInst.IsNumber() {
 			ret.name = fmt.Sprintf("#%d[%d]", value.GetId(), constInst.Number())
 		}
 		if constInst.IsString() {
-			ret.name = fmt.Sprintf("#%d.%s", value.GetId(), constInst.VarString())
+			ret.name = fmt.Sprintf("#%d.%s", value.GetId(), keyText)
 		}
 	} else {
 		// key is not const value
 		// can't get member value
 		ret.name = fmt.Sprintf("#%d.#%d", value.GetId(), key.GetId())
-		switch value.GetType().GetTypeKind() {
+		switch valueType.GetTypeKind() {
 		case SliceTypeKind, MapTypeKind:
-			objTyp, _ := ToObjectType(value.GetType())
+			objTyp, _ := ToObjectType(valueType)
 			ret.typ = objTyp.FieldType
 			return
 		case BytesTypeKind, StringTypeKind:
@@ -112,12 +117,12 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 	// }
 
 	// check is method
-	if method := GetMethod(value.GetType(), key.String(), true); !utils.IsNil(method) {
+	if method := GetMethod(valueType, keyText, true); !utils.IsNil(method) {
 		ret.typ = method.GetType()
 		return
 	}
-	if blueprint, b := ToClassBluePrintType(value.GetType()); b {
-		if method := blueprint.GetStaticMethod(key.String()); !utils.IsNil(method) {
+	if blueprint, b := ToClassBluePrintType(valueType); b {
+		if method := blueprint.GetStaticMethod(keyText); !utils.IsNil(method) {
 			ret.typ = method.GetType()
 			return
 		}
@@ -128,11 +133,11 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 		}
 		return ret
 	}
-	switch value.GetType().GetTypeKind() {
+	switch valueType.GetTypeKind() {
 	case ObjectTypeKind:
-		typ, ok := ToObjectType(value.GetType())
+		typ, ok := ToObjectType(valueType)
 		if !ok {
-			log.Errorf("checkCanMemberCall: %v is structTypeKind but is not a ObjectType", value.GetType())
+			log.Errorf("checkCanMemberCall: %v is structTypeKind but is not a ObjectType", valueType)
 			break
 		}
 		if fieldTyp := typ.GetField(key); fieldTyp != nil {
@@ -143,9 +148,9 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 		}
 		return
 	case StructTypeKind: // string
-		typ, ok := ToObjectType(value.GetType())
+		typ, ok := ToObjectType(valueType)
 		if !ok {
-			log.Errorf("checkCanMemberCall: %v is structTypeKind but is not a ObjectType", value.GetType())
+			log.Errorf("checkCanMemberCall: %v is structTypeKind but is not a ObjectType", valueType)
 			break
 		}
 		if TypeCompare(CreateStringType(), key.GetType()) {
@@ -159,9 +164,9 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 			// type check error
 		}
 	case TupleTypeKind:
-		typ, ok := ToObjectType(value.GetType())
+		typ, ok := ToObjectType(valueType)
 		if !ok {
-			log.Errorf("checkCanMemberCall: %v is TupleTypeKind but is not a ObjectType", value.GetType())
+			log.Errorf("checkCanMemberCall: %v is TupleTypeKind but is not a ObjectType", valueType)
 			break
 		}
 		if TypeCompare(CreateNumberType(), key.GetType()) {
@@ -171,9 +176,9 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 			}
 		}
 	case MapTypeKind: // string / number
-		typ, ok := ToObjectType(value.GetType())
+		typ, ok := ToObjectType(valueType)
 		if !ok {
-			log.Errorf("checkCanMemberCall: %v is MapTypeKind but is not a ObjectType", value.GetType())
+			log.Errorf("checkCanMemberCall: %v is MapTypeKind but is not a ObjectType", valueType)
 			break
 		}
 		if TypeCompare(typ.KeyTyp, key.GetType()) {
@@ -189,9 +194,9 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 			// type check error
 		}
 	case SliceTypeKind:
-		typ, ok := ToObjectType(value.GetType())
+		typ, ok := ToObjectType(valueType)
 		if !ok {
-			log.Errorf("checkCanMemberCall: %v is SliceTypeKind but is not a ObjectType", value.GetType())
+			log.Errorf("checkCanMemberCall: %v is SliceTypeKind but is not a ObjectType", valueType)
 			break
 		}
 		if TypeCompare(CreateNumberType(), key.GetType()) {
@@ -217,12 +222,12 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 		ret.typ = CreateAnyType()
 		return
 	case ClassBluePrintTypeKind:
-		class := value.GetType().(*Blueprint)
-		if member := class.GetStaticMember(key.String()); !utils.IsNil(member) {
+		class := valueType.(*Blueprint)
+		if member := class.GetStaticMember(keyText); !utils.IsNil(member) {
 			ret.typ = member.GetType()
 			return
 		}
-		if member := class.GetNormalMember(key.String()); !utils.IsNil(member) {
+		if member := class.GetNormalMember(keyText); !utils.IsNil(member) {
 			ret.typ = member.GetType()
 			return
 		}
@@ -261,7 +266,7 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 		ret.typ = member.GetType()
 		return
 	}
-	member, exist := value.GetStringMember(key.String())
+	member, exist := value.GetStringMember(keyText)
 	if exist {
 		ret.typ = member.GetType()
 		return
@@ -271,6 +276,9 @@ func checkCanMemberCallExist(value, key Value, function ...bool) (ret checkMembe
 }
 
 func getMemberVerboseName(obj, key Value) string {
+	if utils.IsNil(obj) {
+		return GetKeyString(key)
+	}
 	return fmt.Sprintf("%s.%s", obj.GetVerboseName(), GetKeyString(key))
 }
 

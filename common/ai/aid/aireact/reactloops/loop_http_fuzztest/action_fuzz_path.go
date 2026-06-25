@@ -11,13 +11,15 @@ import (
 )
 
 var fuzzPathAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoopOption {
-	return reactloops.WithRegisterLoopAction(
+	return reactloops.WithRegisterLoopActionWithStreamField(
 		"fuzz_path",
 		"Fuzz the HTTP request path. Use this to test path traversal, different endpoints, or path-based attacks.",
 		[]aitool.ToolOption{
-			aitool.WithStringArrayParam("paths", aitool.WithParam_Description("Paths to test, e.g., ['/admin', '/api/v2', '../etc/passwd', '/backup']"), aitool.WithParam_Required(true)),
+			aitool.WithStringArrayParam("paths", aitool.WithParam_Description("Paths to test, e.g., ['/admin', '/api/v2', '../etc/passwd', '/backup']. Supports arbitrary fuzztag; see the FUZZTAG_REFERENCE and AVAILABLE_PAYLOAD_GROUPS context blocks for the current full tag manual and payload dictionary groups. When path enumeration is needed, prefer concise fuzztag rules over long handwritten lists."), aitool.WithParam_Required(true)),
 			aitool.WithBoolParam("append_mode", aitool.WithParam_Description("If true, append paths to existing path instead of replacing. Default is false (replace mode)")),
-			aitool.WithStringParam("reason", aitool.WithParam_Description("Explain why you want to test these paths")),
+		},
+		[]*reactloops.LoopStreamField{
+			{FieldName: "reason", AINodeId: "thought"},
 		},
 		func(l *reactloops.ReActLoop, action *aicommon.Action) error {
 			paths := action.GetStringSlice("paths")
@@ -49,7 +51,8 @@ var fuzzPathAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoopOption
 			}
 
 			// Execute and compare
-			diffResult, err := executeFuzzAndCompare(loop, fuzzResult, "fuzz_path")
+			paramSummary := fmt.Sprintf("paths=%v; append_mode=%v; reason=%s", paths, appendMode, reason)
+			diffResult, verifyResult, err := executeFuzzAndCompare(loop, fuzzResult, "fuzz_path", paramSummary, action)
 			if err != nil {
 				operator.Fail(err)
 				return
@@ -59,9 +62,8 @@ var fuzzPathAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoopOption
 			if appendMode {
 				mode = "append"
 			}
-			r.AddToTimeline("fuzz_path", fmt.Sprintf("Tested paths (%s mode): %v\n%s", mode, paths, diffResult))
-			operator.Feedback(diffResult)
+			r.AddToTimeline("fuzz_path", fmt.Sprintf("Tested paths (%s mode): %v\n%s", mode, paths, buildFuzzTimelineSummary(diffResult)))
+			applyFuzzVerificationOutcome(loop, operator, diffResult, verifyResult)
 		},
 	)
 }
-

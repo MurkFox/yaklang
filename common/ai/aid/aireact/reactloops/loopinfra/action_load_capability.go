@@ -17,13 +17,13 @@ var loopAction_LoadCapability = &reactloops.LoopAction{
 	Description: "自动加载一些外部能力，这个外部能力可以被自动检测类型，并且加载。可以出现工具调用(tool)，专注模式(focus_mode)，技能(skill)或者模版/蓝图（forge/blueprint）",
 	Options: []aitool.ToolOption{
 		aitool.WithStringParam(
-			"identifier",
+			"capability_identifier",
 			aitool.WithParam_Description(`只对 {"@action":"load_capability" ...} 时生效，这个标识符会被自动检测是 skill/tool/forge/focus_mode/filename, 然后自动加载`),
 		),
 	},
 	StreamFields: []*reactloops.LoopStreamField{
 		{
-			FieldName: "identifier",
+			FieldName: "capability_identifier",
 			AINodeId:  "load_capability",
 		},
 	},
@@ -32,9 +32,9 @@ var loopAction_LoadCapability = &reactloops.LoopAction{
 }
 
 func loadCapabilityVerifier(loop *reactloops.ReActLoop, action *aicommon.Action) error {
-	identifier := strings.TrimSpace(action.GetString("identifier"))
+	identifier := strings.TrimSpace(action.GetString("capability_identifier"))
 	if identifier == "" {
-		identifier = strings.TrimSpace(action.GetInvokeParams("next_action").GetString("identifier"))
+		identifier = strings.TrimSpace(action.GetInvokeParams("next_action").GetString("capability_identifier"))
 	}
 	if identifier == "" {
 		return utils.Error("load_capability action requires 'identifier' parameter")
@@ -129,59 +129,7 @@ func handleLoadTool(
 	}
 
 	result, directly, err := invoker.ExecuteToolRequiredAndCall(taskCtx, identifier)
-	if err != nil {
-		errMsg := fmt.Sprintf("Tool '%s' execution failed: %v.", identifier, err)
-		invoker.AddToTimeline("[LOAD_CAPABILITY_TOOL_ERROR]", errMsg)
-		op.Feedback(errMsg + " Please try a different tool or approach.")
-		op.SetReflectionLevel(reactloops.ReflectionLevel_Critical)
-		op.SetReflectionData("tool_error", err.Error())
-		op.SetReflectionData("tool_name", identifier)
-		op.Continue()
-		return
-	}
-	if directly {
-		answer, err := invoker.DirectlyAnswer(taskCtx, "在上一次工具调用中，用户中断了工具执行，要求直接回答一些问题", nil)
-		if err != nil {
-			op.Fail(utils.Error("DirectlyAnswer fail, reason: " + err.Error()))
-			return
-		}
-		invoker.AddToTimeline("directly-answer", answer)
-		op.Exit()
-		return
-	}
-	if result == nil {
-		invoker.AddToTimeline("error", fmt.Sprintf("load_capability tool[%v] returned nil result", identifier))
-		op.Continue()
-		return
-	}
-	if result.Error != "" {
-		invoker.AddToTimeline("call["+identifier+"] error", result.Error)
-	}
-
-	task = loop.GetCurrentTask()
-	if task == nil {
-		op.Continue()
-		return
-	}
-	verifyResult, err := invoker.VerifyUserSatisfaction(taskCtx, task.GetUserInput(), true, identifier)
-	if err != nil {
-		op.Fail(err)
-		return
-	}
-	loop.PushSatisfactionRecordWithCompletedTaskIndex(
-		verifyResult.Satisfied, verifyResult.Reasoning,
-		verifyResult.CompletedTaskIndex, verifyResult.NextMovements,
-	)
-	if verifyResult.Satisfied {
-		op.Exit()
-		return
-	}
-	feedbackMsg := fmt.Sprintf("[Verification] Task not yet satisfied.\nReasoning: %s", verifyResult.Reasoning)
-	if summary := aicommon.FormatVerifyNextMovementsSummary(verifyResult.NextMovements); summary != "" {
-		feedbackMsg += fmt.Sprintf("\nNext Steps: %s", summary)
-	}
-	op.Feedback(feedbackMsg)
-	op.Continue()
+	handleToolCallResult(loop, taskCtx, invoker, identifier, result, directly, err, op)
 }
 
 // handleLoadForgeWithSkillFallback tries loading as forge first. If forge is rejected
@@ -194,6 +142,17 @@ func handleLoadForgeWithSkillFallback(
 	op *reactloops.LoopActionHandlerOperator,
 	hasSkillAlt bool,
 ) {
+	if !reactloops.IsPlanAndExecAllowed(loop, invoker) {
+		if hasSkillAlt {
+			log.Infof("load_capability: forge '%s' disabled, falling back to skill alternative", identifier)
+			invoker.AddToTimeline("[LOAD_CAPABILITY_FORGE_TO_SKILL_FALLBACK]",
+				fmt.Sprintf("'%s' exists as both forge and skill. Forge execution is disabled, falling back to skill.", identifier))
+			handleLoadSkill(loop, invoker, identifier, op)
+			return
+		}
+		handleLoadForgeDisabled(invoker, identifier, op)
+		return
+	}
 	task := loop.GetCurrentTask()
 	if task != nil && task.IsAsyncMode() && hasSkillAlt {
 		log.Infof("load_capability: forge '%s' rejected (async mode), falling back to skill alternative", identifier)
@@ -203,6 +162,24 @@ func handleLoadForgeWithSkillFallback(
 		return
 	}
 	handleLoadForge(loop, invoker, ctx, identifier, op)
+}
+
+func handleLoadForgeDisabled(
+	invoker aicommon.AIInvokeRuntime,
+	identifier string,
+	op *reactloops.LoopActionHandlerOperator,
+) {
+	log.Warnf("load_capability: rejecting forge '%s' because AI forge/plan execution is disabled", identifier)
+	rejectMsg := fmt.Sprintf(
+		"REJECTED: Cannot start AI Blueprint '%s' — blueprint/plan execution is disabled by the current config or loop policy. "+
+			"You MUST use tools, skills, focus modes, or directly answer instead of starting a forge.",
+		identifier)
+	invoker.AddToTimeline("[LOAD_CAPABILITY_FORGE_DISABLED]", rejectMsg)
+	op.Feedback(rejectMsg)
+	op.SetReflectionLevel(reactloops.ReflectionLevel_Critical)
+	op.SetReflectionData("forge_rejected_reason", "forge_disabled")
+	op.SetReflectionData("forge_name", identifier)
+	op.Continue()
 }
 
 // handleLoadForge starts an async blueprint/forge execution.
@@ -235,10 +212,12 @@ func handleLoadForge(
 	log.Infof("load_capability: dispatching '%s' as blueprint/forge", identifier)
 	invoker.AddToTimeline("[LOAD_CAPABILITY_FORGE]",
 		fmt.Sprintf("Starting AI Blueprint '%s' in async mode", identifier))
+	recommendCapabilitiesFromForgePrompts(loop, invoker, identifier, "AI Blueprint "+identifier)
 
 	op.RequestAsyncMode()
 
 	task = op.GetTask()
+	task.SetAsyncMode(true)
 	taskCtx := task.GetContext()
 	invoker.RequireAIForgeAndAsyncExecute(taskCtx, identifier, func(err error) {
 		loop.FinishAsyncTask(task, err)
@@ -302,13 +281,21 @@ func handleLoadSkill(
 
 	persistLoadedSkillNames(loop, invoker)
 	emitSkillReferenceMaterial(invoker, identifier, mgr)
+	if cfg, ok := invoker.GetConfig().(*aicommon.Config); ok {
+		aicommon.NotifySessionSnapshotEmit(cfg, true)
+	}
+	recommendationSummary := recommendCapabilitiesFromSkillContent(loop, invoker, identifier, "Skill "+identifier)
 
-	op.Feedback(fmt.Sprintf(
+	feedbackMsg := fmt.Sprintf(
 		"Skill '%s' has been loaded into the context. "+
 			"The SKILL.md content and file tree are now displayed in the SKILLS_CONTEXT section of your prompt. "+
 			"Read the skill content from your prompt's View Window and proceed with the task. "+
 			"Do NOT load this skill again.",
-		identifier))
+		identifier)
+	if recommendationSummary != "" {
+		feedbackMsg += fmt.Sprintf(" Related capabilities mentioned in SKILL.md: %s.", recommendationSummary)
+	}
+	op.Feedback(feedbackMsg)
 	op.Continue()
 }
 
@@ -386,7 +373,7 @@ func handleLoadUnknown(
 	identifier string,
 	op *reactloops.LoopActionHandlerOperator,
 ) {
-	log.Infof("load_capability: identifier '%s' is unknown, falling back to intent recognition", identifier)
+	log.Infof("load_capability: identifier '%s' is unknown, falling back to capability search", identifier)
 
 	// Mark this identifier as "failed unknown" to detect loops
 	failedKey := "_load_cap_failed_unknown_" + identifier
@@ -410,101 +397,64 @@ func handleLoadUnknown(
 
 	invoker.AddToTimeline("[LOAD_CAPABILITY_UNKNOWN]",
 		fmt.Sprintf("Identifier '%s' not found in any registry. "+
-			"Running 1-iteration intent recognition fallback. "+
+			"Running capability search fallback. "+
 			"Do NOT call load_capability('%s') again after this — use the discovered capabilities instead.",
 			identifier, identifier))
 
-	cfg := invoker.GetConfig()
-	taskCtx := cfg.GetContext()
-	task := loop.GetCurrentTask()
-	if task != nil {
-		taskCtx = task.GetContext()
-	}
-
-	intentTask := aicommon.NewStatefulTaskBase(
-		invoker.GetCurrentTaskId()+"_load_cap_intent",
-		identifier,
-		taskCtx,
-		cfg.GetEmitter(),
-	)
-
-	originOptions := cfg.OriginOptions()
-	var opts []any
-	for _, option := range originOptions {
-		opts = append(opts, option)
-	}
-
-	var intentLoop *reactloops.ReActLoop
-	opts = append(opts, reactloops.WithOnLoopInstanceCreated(func(l *reactloops.ReActLoop) {
-		intentLoop = l
-	}))
-
-	_, err := invoker.ExecuteLoopTaskIF(schema.AI_REACT_LOOP_NAME_INTENT, intentTask, opts...)
+	searchResult, err := reactloops.SearchCapabilities(invoker, loop, reactloops.CapabilitySearchInput{
+		Query:               identifier,
+		IncludeCatalogMatch: true,
+	})
 	if err != nil {
-		log.Warnf("load_capability: intent loop fallback failed: %v", err)
+		log.Warnf("load_capability: capability search fallback failed: %v", err)
 		failMsg := fmt.Sprintf(
-			"Identifier '%s' was NOT found, and intent recognition FAILED (reason: %v). "+
+			"Identifier '%s' was NOT found, and capability search FAILED (reason: %v). "+
 				"Do NOT retry load_capability with '%s'. "+
 				"Use search_capabilities with a descriptive query, or proceed with already-available tools.",
 			identifier, err, identifier)
-		invoker.AddToTimeline("[LOAD_CAPABILITY_INTENT_FAILED]", failMsg)
+		invoker.AddToTimeline("[LOAD_CAPABILITY_SEARCH_FAILED]", failMsg)
 		op.Feedback(failMsg)
 		op.SetReflectionLevel(reactloops.ReflectionLevel_Critical)
-		op.SetReflectionData("intent_error", err.Error())
+		op.SetReflectionData("capability_search_error", err.Error())
 		op.SetReflectionData("failed_identifier", identifier)
 		op.Continue()
 		return
 	}
 
-	if intentLoop == nil {
-		log.Warnf("load_capability: intent loop reference is nil")
+	if searchResult == nil {
+		log.Warnf("load_capability: capability search result is nil")
 		failMsg := fmt.Sprintf(
-			"Identifier '%s' was NOT found. Intent recognition completed but results could not be extracted. "+
+			"Identifier '%s' was NOT found. Capability search completed but no results could be extracted. "+
 				"Do NOT retry. Use search_capabilities instead.",
 			identifier)
-		invoker.AddToTimeline("[LOAD_CAPABILITY_INTENT_NIL]", failMsg)
+		invoker.AddToTimeline("[LOAD_CAPABILITY_SEARCH_NIL]", failMsg)
 		op.Feedback(failMsg)
 		op.Continue()
 		return
 	}
 
-	intentAnalysis := intentLoop.Get("intent_analysis")
-	recommendedTools := intentLoop.Get("recommended_tools")
-	recommendedForges := intentLoop.Get("recommended_forges")
-	contextEnrichment := intentLoop.Get("context_enrichment")
-	retrievalTags := intentLoop.Get("task_retrieval_tags")
-	retrievalQuestions := intentLoop.Get("task_retrieval_questions")
-	retrievalTarget := intentLoop.Get("task_retrieval_target")
-	matchedToolNames := intentLoop.Get("matched_tool_names")
-	matchedForgeNames := intentLoop.Get("matched_forge_names")
-	matchedSkillNames := intentLoop.Get("matched_skill_names")
-
-	log.Infof("load_capability: intent fallback completed, analysis=%d bytes, tools=%s, forges=%s, skills=%s",
-		len(intentAnalysis), matchedToolNames, matchedForgeNames, matchedSkillNames)
-
-	compactIntent := reactloops.CompactIntentSummary(intentAnalysis)
-	if compactIntent == "" {
-		compactIntent = reactloops.CompactIntentSummary(identifier)
-	}
-
-	if intentAnalysis != "" {
-		loop.Set("intent_analysis", compactIntent)
-		invoker.AddToTimeline("load_capability_intent_analysis", fmt.Sprintf("意图识别：%s", compactIntent))
-	}
-	if recommendedTools != "" {
+	reactloops.ApplyCapabilitySearchResult(invoker, loop, searchResult)
+	compactIntent := reactloops.CompactIntentSummary(identifier)
+	loop.Set("intent_analysis", compactIntent)
+	if recommendedTools := renderCapabilityToolRecommendations(searchResult); recommendedTools != "" {
 		loop.Set("intent_recommended_tools", recommendedTools)
 	}
-	if recommendedForges != "" {
+	if recommendedForges := renderCapabilityForgeRecommendations(searchResult); recommendedForges != "" {
 		loop.Set("intent_recommended_forges", recommendedForges)
 	}
-	if contextEnrichment != "" {
-		loop.Set("intent_context_enrichment", contextEnrichment)
+	if searchResult.ContextEnrichment != "" {
+		loop.Set("intent_context_enrichment", searchResult.ContextEnrichment)
 	}
-	reactloops.ApplyTaskRetrievalInfoToTask(loop.GetCurrentTask(), retrievalTags, retrievalQuestions, retrievalTarget)
 
-	populateExtraCapabilitiesFromIntent(invoker, loop, matchedToolNames, matchedForgeNames, matchedSkillNames)
+	matchedToolNames := strings.Join(searchResult.MatchedToolNames, ",")
+	matchedForgeNames := strings.Join(searchResult.MatchedForgeNames, ",")
+	matchedSkillNames := strings.Join(searchResult.MatchedSkillNames, ",")
+
+	log.Infof("load_capability: capability search fallback completed, tools=%s, forges=%s, skills=%s",
+		matchedToolNames, matchedForgeNames, matchedSkillNames)
 
 	var summary strings.Builder
+	summary.WriteString(fmt.Sprintf("Identifier '%s' was NOT found. Do NOT retry load_capability(%q).\n", identifier, identifier))
 	summary.WriteString(fmt.Sprintf("未找到能力名：%s\n", identifier))
 	if compactIntent != "" {
 		summary.WriteString("意图：" + compactIntent + "\n")
@@ -520,7 +470,7 @@ func handleLoadUnknown(
 	}
 	summary.WriteString(fmt.Sprintf("不要再次 load_capability(%q)，请改用以上正确名称。", identifier))
 
-	invoker.AddToTimeline("[LOAD_CAPABILITY_INTENT_DONE]",
+	invoker.AddToTimeline("[LOAD_CAPABILITY_SEARCH_DONE]",
 		fmt.Sprintf("能力候选已识别：%s | 工具[%s] 蓝图[%s] 技能[%s] | 不要再次 load_capability(%s)",
 			compactIntent,
 			reactloops.CompactCapabilityNames(matchedToolNames, 2),

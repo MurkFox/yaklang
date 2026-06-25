@@ -15,7 +15,7 @@ import (
 )
 
 func (s *Server) CreateHotPatchTemplate(ctx context.Context, req *ypb.HotPatchTemplate) (*ypb.CreateHotPatchTemplateResponse, error) {
-	err := yakit.CreateHotPatchTemplate(s.GetProfileDatabase(), req.GetName(), req.GetContent(), req.GetType())
+	err := yakit.CreateHotPatchTemplate(s.GetProfileDatabase(), req.GetName(), req.GetContent(), req.GetType(), req.GetTags())
 	if err != nil {
 		return nil, err
 	}
@@ -65,6 +65,7 @@ func (s *Server) UpdateHotPatchTemplate(ctx context.Context, req *ypb.UpdateHotP
 		template.GetName(),
 		template.GetContent(),
 		template.GetType(),
+		template.GetTags(),
 		req.GetCondition(),
 	)
 
@@ -133,6 +134,16 @@ func (s *Server) QueryHotPatchTemplateList(ctx context.Context, req *ypb.QueryHo
 
 }
 
+func (s *Server) GetHotPatchTemplateTags(ctx context.Context, req *ypb.Empty) (*ypb.GetHotPatchTemplateTagsResponse, error) {
+	tags, err := yakit.CountHotPatchTemplateTags(ctx, s.GetProfileDatabase())
+	if err != nil {
+		return nil, err
+	}
+	return &ypb.GetHotPatchTemplateTagsResponse{
+		Tags: tags,
+	}, nil
+}
+
 func (s *Server) UploadHotPatchTemplateToOnline(ctx context.Context, req *ypb.UploadHotPatchTemplateToOnlineRequest) (*ypb.Empty, error) {
 	if req.Token == "" || req.Type == "" || req.Name == "" {
 		return nil, utils.Errorf("params is empty")
@@ -166,10 +177,10 @@ func (s *Server) DownloadHotPatchTemplate(ctx context.Context, req *ypb.Download
 	client := yaklib.NewOnlineClient(consts.GetOnlineBaseUrl())
 	template, err := client.DownloadHotPatchTemplate(req.Token, req.Name, req.Type)
 	if err != nil {
-		return nil, utils.Errorf("save HotPatchTemplate[%s] to database failed: %v", template.Name, err)
+		return nil, utils.Errorf("download HotPatchTemplate[%s] failed: %v", req.Name, err)
 	}
 
-	err = yakit.CreateOrUpdateHotPatchTemplate(s.GetProfileDatabase(), template.Name, template.TemplateType, template.Content)
+	err = yakit.CreateOrUpdateHotPatchTemplate(s.GetProfileDatabase(), template.Name, template.TemplateType, template.Content, template.Tags)
 	if err != nil {
 		return nil, utils.Errorf("save HotPatchTemplate[%s] to database failed: %v", template.Name, err)
 	}

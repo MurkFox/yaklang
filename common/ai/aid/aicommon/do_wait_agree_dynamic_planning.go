@@ -9,7 +9,6 @@ import (
 	"io"
 	"runtime"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
@@ -27,18 +26,31 @@ type PlanningReviewControl func(ctx context.Context, config *Config, ep *Endpoin
 //go:embed prompts/review/ai-review-plan.txt
 var aiPlanReviewPromptTemplate string
 
+//go:embed prompts/review/ai-review-plan_instruction.txt
+var aiPlanReviewInstructionTemplate string
+
+//go:embed prompts/review/ai-review-plan_schema.json
+var aiPlanReviewSchemaTemplate string
+
+//go:embed prompts/review/ai-review-plan_output_example.txt
+var aiPlanReviewOutputExampleTemplate string
+
 //go:embed prompts/review/ai-review-task.txt
 var aiTaskReviewPromptTemplate string
 
+//go:embed prompts/review/ai-review-task_instruction.txt
+var aiTaskReviewInstructionTemplate string
+
+//go:embed prompts/review/ai-review-task_output_example.txt
+var aiTaskReviewOutputExampleTemplate string
+
+//go:embed prompts/review/ai-review-task_schema.json
+var aiTaskReviewSchemaTemplate string
+
 type PlanReviewPromptData struct {
-	CurrentTime      string
-	OSArch           string
-	WorkingDir       string
-	WorkingDirGlance string
-	Timeline         string
-	Nonce            string
-	PlanDetails      string
-	Language         string
+	Nonce       string
+	PlanDetails string
+	Language    string
 }
 
 type TaskReviewPromptData struct {
@@ -46,7 +58,6 @@ type TaskReviewPromptData struct {
 	OSArch           string
 	WorkingDir       string
 	WorkingDirGlance string
-	Timeline         string
 	Nonce            string
 	TaskDetails      string
 	ShortSummary     string
@@ -58,19 +69,8 @@ type TaskReviewPromptData struct {
 
 func generatePlanReviewPrompt(config *Config, materials aitool.InvokeParams) (string, error) {
 	data := &PlanReviewPromptData{
-		CurrentTime: time.Now().Format("2006-01-02 15:04:05"),
-		OSArch:      fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		Nonce:       utils.RandStringBytes(4),
-		Language:    config.Language,
-	}
-
-	data.WorkingDir = config.Workdir
-	if data.WorkingDir != "" {
-		data.WorkingDirGlance = filesys.Glance(data.WorkingDir)
-	}
-
-	if t := config.GetTimeline(); t != nil {
-		data.Timeline = t.Dump()
+		Nonce:    utils.RandStringBytes(4),
+		Language: config.Language,
 	}
 
 	if !utils.IsNil(materials) {
@@ -89,21 +89,42 @@ func generatePlanReviewPrompt(config *Config, materials aitool.InvokeParams) (st
 		}
 	}
 
-	tmpl, err := template.New("plan-review").Parse(aiPlanReviewPromptTemplate)
-	if err != nil {
-		return "", fmt.Errorf("error parsing plan review template: %w", err)
-	}
+	frozenOpen := BuildPromptFrozenOpenMaterials(config)
 
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", fmt.Errorf("error executing plan review template: %w", err)
+	workingDir := config.Workdir
+	var workingDirGlance string
+	if workingDir != "" {
+		workingDirGlance = filesys.Glance(workingDir)
 	}
-	return buf.String(), nil
+	osArch := fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
+
+	prefixMaterials := &PromptMaterials{
+		TaskInstruction:  strings.TrimSpace(aiPlanReviewInstructionTemplate),
+		Schema:           strings.TrimSpace(aiPlanReviewSchemaTemplate),
+		OutputExample:    strings.TrimSpace(aiPlanReviewOutputExampleTemplate),
+		CurrentTime:      time.Now().Format("2006-01-02 15:04"),
+		OSArch:           osArch,
+		WorkingDir:       workingDir,
+		WorkingDirGlance: workingDirGlance,
+		Workspace:        strings.TrimSpace(osArch+workingDir+workingDirGlance) != "",
+	}
+	ApplyPromptFrozenOpenMaterials(prefixMaterials, frozenOpen)
+
+	return NewDefaultPromptPrefixBuilder().AssemblePromptWithDynamicSection(
+		prefixMaterials,
+		"plan-review-dynamic",
+		aiPlanReviewPromptTemplate,
+		data,
+		data.Nonce,
+	)
 }
 
 func generateTaskReviewPrompt(config *Config, materials aitool.InvokeParams) (string, error) {
+	// CurrentTime 用分钟粒度: 让 BACKGROUND 段在分钟内多次调用时字节稳定,
+	// 配合 PROMPT_SECTION_semi-dynamic 包装使 prefix cache 能命中。
+	// 关键词: aicache 分钟粒度时间戳, semi-dynamic 稳定哈希
 	data := &TaskReviewPromptData{
-		CurrentTime: time.Now().Format("2006-01-02 15:04:05"),
+		CurrentTime: time.Now().Format("2006-01-02 15:04"),
 		OSArch:      fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
 		Nonce:       utils.RandStringBytes(4),
 		Language:    config.Language,
@@ -114,9 +135,7 @@ func generateTaskReviewPrompt(config *Config, materials aitool.InvokeParams) (st
 		data.WorkingDirGlance = filesys.Glance(data.WorkingDir)
 	}
 
-	if t := config.GetTimeline(); t != nil {
-		data.Timeline = t.Dump()
-	}
+	frozenOpen := BuildPromptFrozenOpenMaterials(config)
 
 	if !utils.IsNil(materials) {
 		data.ShortSummary = materials.GetString("short_summary")
@@ -139,16 +158,28 @@ func generateTaskReviewPrompt(config *Config, materials aitool.InvokeParams) (st
 		}
 	}
 
-	tmpl, err := template.New("task-review").Parse(aiTaskReviewPromptTemplate)
-	if err != nil {
-		return "", fmt.Errorf("error parsing task review template: %w", err)
+	prefixMaterials := &PromptMaterials{
+		TaskInstruction:  strings.TrimSpace(aiTaskReviewInstructionTemplate),
+		Schema:           strings.TrimSpace(aiTaskReviewSchemaTemplate),
+		OutputExample:    strings.TrimSpace(aiTaskReviewOutputExampleTemplate),
+		CurrentTime:      data.CurrentTime,
+		OSArch:           data.OSArch,
+		WorkingDir:       data.WorkingDir,
+		WorkingDirGlance: data.WorkingDirGlance,
+		Workspace:        strings.TrimSpace(data.OSArch+data.WorkingDir+data.WorkingDirGlance) != "",
+	}
+	ApplyPromptFrozenOpenMaterials(prefixMaterials, frozenOpen)
+	if err := PopulateToolInventoryFromConfig(prefixMaterials, config); err != nil {
+		return "", fmt.Errorf("populate task review tool inventory failed: %w", err)
 	}
 
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", fmt.Errorf("error executing task review template: %w", err)
-	}
-	return buf.String(), nil
+	return NewDefaultPromptPrefixBuilder().AssemblePromptWithDynamicSection(
+		prefixMaterials,
+		"task-review-dynamic",
+		aiTaskReviewPromptTemplate,
+		data,
+		data.Nonce,
+	)
 }
 
 var validPlanSuggestions = map[string]bool{
@@ -206,8 +237,8 @@ func normalizeReviewFieldText(raw string) string {
 	return raw
 }
 
-func emitReviewFieldStream(config *Config, nodeID, taskIndex string, reader io.Reader, formatter func(string) string) {
-	if config == nil || config.GetEmitter() == nil || reader == nil {
+func emitReviewFieldStream(emitter *Emitter, nodeID, taskIndex string, reader io.Reader, formatter func(string) string) {
+	if emitter == nil || reader == nil {
 		return
 	}
 	raw, err := io.ReadAll(utils.UTF8Reader(reader))
@@ -222,10 +253,10 @@ func emitReviewFieldStream(config *Config, nodeID, taskIndex string, reader io.R
 	if content == "" {
 		return
 	}
-	_, _ = config.GetEmitter().EmitDefaultStreamEvent(nodeID, strings.NewReader(content), taskIndex)
+	_, _ = emitter.EmitDefaultStreamEvent(nodeID, strings.NewReader(content), taskIndex)
 }
 
-func reviewFieldStreamOptions(config *Config, taskIndex string, specs ...reviewFieldStreamSpec) []ActionMakerOption {
+func reviewFieldStreamOptions(emitter *Emitter, taskIndex string, specs ...reviewFieldStreamSpec) []ActionMakerOption {
 	if len(specs) == 0 {
 		return nil
 	}
@@ -236,7 +267,7 @@ func reviewFieldStreamOptions(config *Config, taskIndex string, specs ...reviewF
 			continue
 		}
 		result = append(result, WithActionFieldStreamHandler([]string{spec.FieldKey}, func(_ string, reader io.Reader) {
-			emitReviewFieldStream(config, spec.NodeID, taskIndex, reader, spec.Formatter)
+			emitReviewFieldStream(emitter, spec.NodeID, taskIndex, reader, spec.Formatter)
 		}))
 	}
 	return result
@@ -271,7 +302,7 @@ func DefaultAIPlanReviewControl(ctx context.Context, config *Config, ep *Endpoin
 		suggestion = action.GetString("suggestion")
 		reason = action.GetString("reason")
 		return nil
-	})
+	}, WithAIRequest_CallerLabel("plan-review"))
 	if err != nil {
 		return nil, fmt.Errorf("plan review AI transaction failed: %w", err)
 	}
@@ -319,12 +350,13 @@ func DefaultAITaskReviewControl(ctx context.Context, config *Config, ep *Endpoin
 	_, _ = emitReviewStatus(config, "task-review-status", "正在审查任务，以便任务动态规划 / start to do task/plan review for dynamic plan", ep.GetId())
 
 	err = CallAITransaction(config, prompt, config.CallQualityPriorityAI, func(rsp *AIResponse) error {
+		boundEmitter := rsp.BindEmitter(config.GetEmitter())
 		stream := rsp.GetOutputStreamReader("task-review", true, config.GetEmitter())
 		stream = io.TeeReader(stream, &rawResponse)
 		actionOpts := []ActionMakerOption{
 			WithActionAlias("object"),
 		}
-		actionOpts = append(actionOpts, reviewFieldStreamOptions(config, rsp.GetTaskIndex(),
+		actionOpts = append(actionOpts, reviewFieldStreamOptions(boundEmitter, rsp.GetTaskIndex(),
 			reviewFieldStreamSpec{FieldKey: "task_delta_summary", NodeID: "task-review-adjustment"},
 		)...)
 		action, err := ExtractActionFromStream(ctx, stream, "task_review", actionOpts...)
@@ -336,7 +368,7 @@ func DefaultAITaskReviewControl(ctx context.Context, config *Config, ep *Endpoin
 		taskDeltaSummary = action.GetString("task_delta_summary")
 		taskDeltasArray = action.GetInvokeParamsArray("task_deltas")
 		return nil
-	})
+	}, WithAIRequest_CallerLabel("task-review"))
 	if err != nil {
 		return nil, fmt.Errorf("task review AI transaction failed: %w", err)
 	}

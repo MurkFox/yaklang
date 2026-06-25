@@ -73,13 +73,16 @@ func (*SSABuilder) BuildFromAST(raw ssa.FrontAST, b *ssa.FunctionBuilder) error 
 		constMap:        make(map[string]ssa.Value),
 		globalNames:     make(map[string]bool),
 	}
+	// Nested defs use a fresh scope root per function; reading outer/module names goes through
+	// getParentFunctionVariable, which is only active when SupportClosure is set (see ssa readValueEx).
+	build.SupportClosure = true
 	build.VisitRoot(ast)
 	return nil
 }
 
 // WrapWithPreprocessedFS wraps the filesystem with preprocessing if needed.
 // For Python, this is a no-op currently as Python doesn't need template preprocessing like Java.
-func (s *SSABuilder) WrapWithPreprocessedFS(fs fi.FileSystem) fi.FileSystem {
+func (s *SSABuilder) WrapWithPreprocessedFS(fs fi.FileSystem, _ bool) fi.FileSystem {
 	// Python doesn't need special filesystem preprocessing like Java's template files (JSP, Freemarker, etc.)
 	return fs
 }
@@ -184,6 +187,9 @@ type singleFileBuilder struct {
 	staticLoopControls     []*staticLoopControl
 	wildcardImportPackages []string
 	tryControls            []*tryControl
+	// topLevelFuncShells maps each module-level funcdef AST node to its SSA function shell,
+	// pre-created before bodies are built so later-defined callees resolve in earlier defs.
+	topLevelFuncShells map[*pythonparser.FuncdefContext]*ssa.Function
 }
 
 type staticLoopControlState uint8
@@ -248,6 +254,119 @@ func (b *singleFileBuilder) addWildcardImportPackage(pkg string) {
 		}
 	}
 	b.wildcardImportPackages = append(b.wildcardImportPackages, pkg)
+}
+
+// pythonDottedModuleFromEditor maps the compiling source file to the dotted name used as the
+// virtual library key for imports: "db_manager.py" -> "db_manager", "helper/db_manager.py" -> "helper.db_manager".
+func pythonDottedModuleFromEditor(editor *memedit.MemEditor) string {
+	if editor == nil {
+		return ""
+	}
+	p := strings.TrimSpace(editor.GetFilePath())
+	if p == "" {
+		p = strings.TrimSpace(editor.GetUrl())
+	}
+	p = filepath.ToSlash(p)
+	p = strings.TrimPrefix(p, "/")
+	if p == "" {
+		return ""
+	}
+	base := filepath.Base(p)
+	if strings.EqualFold(base, "__init__.py") {
+		dir := filepath.Dir(p)
+		if dir == "." || dir == "" {
+			return ""
+		}
+		return strings.ReplaceAll(strings.TrimPrefix(filepath.ToSlash(dir), "/"), "/", ".")
+	}
+	if ext := filepath.Ext(p); strings.EqualFold(ext, ".py") {
+		p = strings.TrimSuffix(p, ext)
+	}
+	return strings.ReplaceAll(p, "/", ".")
+}
+
+// syncPythonVirtualModuleExport publishes a top-level symbol to the per-module virtual library Program
+// so `from <module> import <name>` (bindImportedName / GetOrCreateLibrary) sees the same Value as the merged Application IR.
+func (b *singleFileBuilder) syncPythonVirtualModuleExport(exportName string, typ ssa.Type, val ssa.Value) {
+	if b == nil || exportName == "" || val == nil {
+		return
+	}
+	prog := b.GetProgram()
+	if prog == nil {
+		return
+	}
+	mod := pythonDottedModuleFromEditor(b.GetEditor())
+	if mod == "" {
+		return
+	}
+	lib, err := prog.GetOrCreateLibrary(mod)
+	if err != nil || lib == nil {
+		return
+	}
+	lib.SetExportValue(exportName, val)
+	if typ != nil {
+		lib.SetExportType(exportName, typ)
+	}
+}
+
+// readVirtualModuleExport returns a top-level symbol from the current file's virtual module
+// library so same-module calls use Function exports instead of closure FreeValues.
+func (b *singleFileBuilder) readVirtualModuleExport(name string) ssa.Value {
+	if b == nil || name == "" {
+		return nil
+	}
+	prog := b.GetProgram()
+	if prog == nil {
+		return nil
+	}
+	mod := pythonDottedModuleFromEditor(b.GetEditor())
+	if mod == "" {
+		return nil
+	}
+	lib, ok := prog.GetLibrary(mod)
+	if !ok || lib == nil {
+		var err error
+		lib, err = prog.GetOrCreateLibrary(mod)
+		if err != nil || lib == nil {
+			return nil
+		}
+	}
+	v := lib.GetExportValue(name)
+	if v == nil || isPythonImportPlaceholderValue(v) {
+		return nil
+	}
+	return v
+}
+
+// resolvePythonSubmoduleImport builds an ExternLib for `from pkg import submod` when exports
+// live on the child library (e.g. vulnerabilities.CommandInjection), not on pkg.
+func (b *singleFileBuilder) resolvePythonSubmoduleImport(bindingName, sourceName, packagePath string) ssa.Value {
+	if b == nil || bindingName == "" || sourceName == "" || sourceName == bindingName {
+		return nil
+	}
+	wantSource := joinImportPath(packagePath, bindingName)
+	if sourceName != wantSource {
+		return nil
+	}
+	prog := b.GetProgram()
+	if prog == nil {
+		return nil
+	}
+	childLib, err := prog.GetOrCreateLibrary(sourceName)
+	if err != nil || childLib == nil {
+		return nil
+	}
+	ex := ssa.NewExternLib(bindingName, b.FunctionBuilder, nil)
+	ex.LibraryName = sourceName
+	ex.SetExtern(true)
+	for exportName, exportVal := range childLib.ExportValue {
+		if exportVal == nil || isPythonImportPlaceholderValue(exportVal) {
+			continue
+		}
+		ex.MemberMap[exportName] = exportVal.GetId()
+		ex.Member = append(ex.Member, exportVal.GetId())
+	}
+	return ex
 }
 
 func (b *singleFileBuilder) newDynamicPlaceholder(name string) ssa.Value {
@@ -318,7 +437,11 @@ func (b *singleFileBuilder) shouldUseDynamicMemberFallback(value ssa.Value) bool
 		ssa.SSAOpcodeParameterMember,
 		ssa.SSAOpcodePhi,
 		ssa.SSAOpcodeUndefined,
-		ssa.SSAOpcodeConstInst:
+		ssa.SSAOpcodeConstInst,
+		// Imported modules (e.g. import sqlite3; sqlite3.connect(...)) are ExternLib values.
+		// Use pkg.method as the call target name so SyntaxFlow have: 'sqlite3.connect' matches
+		// the same qualified form as source, instead of only the short method name from ReadMemberCallMethod.
+		ssa.SSAOpcodeExternLib:
 		return true
 	default:
 		return false
@@ -587,6 +710,9 @@ func (b *singleFileBuilder) resolveWildcardImportName(name string) ssa.Value {
 
 		if err := prog.ImportValueFromLib(lib, name); err != nil {
 			return b.bindImportedPlaceholder(name, joinImportPath(pkg, name))
+		}
+		if _, ok := lib.GetExportType(name); ok {
+			_ = prog.ImportTypeFromLib(lib, name, nil)
 		}
 		if imported, ok := prog.ReadImportValue(name); ok {
 			return imported

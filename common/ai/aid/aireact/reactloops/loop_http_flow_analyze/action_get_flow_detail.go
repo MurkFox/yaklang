@@ -2,6 +2,7 @@ package loop_http_flow_analyze
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
@@ -36,6 +37,15 @@ var getHTTPFlowDetailAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActL
 				return
 			}
 
+			locatorDesc := buildLocatorDesc(action)
+			log.Infof("[get_http_flow_detail] loading flow: %s", locatorDesc)
+
+			// 输出简洁的累积流（2行）
+			line1 := fmt.Sprintf("加载 %s", locatorDesc)
+			reactloops.EmitActionLog(loop, "http-flow-detail", line1)
+
+			reactloops.EmitStatus(loop, "加载流详情中 / Loading Flow Detail...")
+
 			var flow *schema.HTTPFlow
 			var err error
 
@@ -51,11 +61,15 @@ var getHTTPFlowDetailAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActL
 			}
 
 			if err != nil || flow == nil {
+				reactloops.EmitStatus(loop, "加载失败：未找到流 / Load Failed: Flow Not Found")
 				invoker.AddToTimeline("get_http_flow_detail", fmt.Sprintf("Failed to load HTTP flow: %v", err))
-				log.Errorf("get_http_flow_detail failed: %v", err)
+				log.Errorf("[get_http_flow_detail] failed to load (%s): %v", locatorDesc, err)
+				recordAction(loop, "get_http_flow_detail", locatorDesc, "failed: flow not found", "")
 				operator.Continue()
 				return
 			}
+
+			reactloops.EmitStatus(loop, "加载完成 / Load Complete")
 
 			req := flowRequest(flow)
 			rsp := flowResponse(flow)
@@ -82,10 +96,59 @@ var getHTTPFlowDetailAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActL
 			}
 
 			summary := builder.String()
-			loop.GetInvoker().AddToTimeline("get_http_flow_detail", summary)
+			invoker.AddToTimeline("get_http_flow_detail", summary)
 			loop.Set("current_flow", summary)
+
+			reqSize := len(req)
+			rspSize := len(rsp)
+			tagsStr := ""
+			if flow.Tags != "" {
+				tagsStr = fmt.Sprintf(", tags=%s", shrinkTags(flow.Tags))
+			}
+			line2 := fmt.Sprintf("成功加载 %s %s %d %s (%s req, %s rsp)%s",
+				flow.Method,
+				utils.ShrinkString(flow.Url, 80),
+				flow.StatusCode,
+				http.StatusText(int(flow.StatusCode)),
+				humanizeSize(reqSize),
+				humanizeSize(rspSize),
+				tagsStr)
+
+			reactloops.EmitActionLog(loop, "http-flow-detail", line2, summary)
+
+			flowBrief := fmt.Sprintf("#%d %s %d %s", flow.ID, flow.Method, flow.StatusCode, utils.ShrinkString(flow.Url, 80))
+			log.Infof("[get_http_flow_detail] loaded: %s (req=%d bytes, rsp=%d bytes, tags=%s, source=%s)",
+				flowBrief, len(req), len(rsp), shrinkTags(flow.Tags), flow.SourceType)
+			recordAction(loop, "get_http_flow_detail", locatorDesc, flowBrief, "")
 
 			operator.Feedback(summary)
 		},
 	)
+}
+
+func buildLocatorDesc(action *aicommon.Action) string {
+	var parts []string
+	if v := action.GetInt("id"); v > 0 {
+		parts = append(parts, fmt.Sprintf("id=%d", v))
+	}
+	if v := action.GetString("hash"); v != "" {
+		parts = append(parts, fmt.Sprintf("hash=%s", utils.ShrinkString(v, 20)))
+	}
+	if v := action.GetString("hidden_index"); v != "" {
+		parts = append(parts, fmt.Sprintf("hidden_index=%s", utils.ShrinkString(v, 30)))
+	}
+	if len(parts) == 0 {
+		return "(no locator)"
+	}
+	return strings.Join(parts, ", ")
+}
+
+func humanizeSize(bytes int) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%dB", bytes)
+	} else if bytes < 1024*1024 {
+		return fmt.Sprintf("%.1fKB", float64(bytes)/1024)
+	} else {
+		return fmt.Sprintf("%.1fMB", float64(bytes)/(1024*1024))
+	}
 }

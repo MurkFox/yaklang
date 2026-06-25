@@ -1,32 +1,36 @@
 package ssa
 
 import (
-	"context"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	tl "github.com/yaklang/yaklang/common/yak/templateLanguage"
 
 	"github.com/yaklang/yaklang/common/sca/dxtypes"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/diagnostics"
 
 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	"github.com/yaklang/yaklang/common/utils/memedit"
 	"github.com/yaklang/yaklang/common/utils/omap"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssautil"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
 
 func NewProgram(
-	ctx context.Context,
-	ProgramName string, databaseKind ProgramCacheKind, kind ssadb.ProgramKind,
-	fs fi.FileSystem, programPath string, fileSize int,
-	ttl ...time.Duration,
+	cfg *ssaconfig.Config,
+	databaseKind ProgramCacheKind,
+	kind ssadb.ProgramKind,
+	fs fi.FileSystem,
+	programPath string,
+	fileSize int,
 ) *Program {
+	cfg = ensureProgramConfig(cfg)
+	programName := cfg.GetProgramName()
 	prog := &Program{
-		Name:                    ProgramName,
+		Name:                    programName,
 		ProgramKind:             kind,
 		LibraryFile:             make(map[string][]string),
 		UpStream:                omap.NewEmptyOrderedMap[string, *Program](),
@@ -39,7 +43,6 @@ func NewProgram(
 		Blueprint:               omap.NewEmptyOrderedMap[string, *Blueprint](),
 		BlueprintStack:          utils.NewStack[*Blueprint](),
 		editorStack:             omap.NewOrderedMap(make(map[string]*memedit.MemEditor)),
-		editorMap:               omap.NewOrderedMap(make(map[string]*memedit.MemEditor)),
 		FileList:                make(map[string]string),
 		LineCount:               0,
 		cacheExternInstance:     make(map[string]Value),
@@ -52,7 +55,8 @@ func NewProgram(
 		Template:                make(map[string]tl.TemplateGeneratedInfo),
 		CurrentIncludingStack:   utils.NewStack[string](),
 		config:                  NewLanguageConfig(),
-		NameCache:               ssadb.NewNameCache(ProgramName),
+		NameCache:               ssadb.NewNameCache(programName),
+		compileConfig:           cfg,
 	}
 
 	prog.GlobalVariablesBlueprint = NewBlueprint("__GlobalVariables__")
@@ -61,7 +65,7 @@ func NewProgram(
 
 	if kind == Application {
 		prog.Application = prog
-		prog.Cache = NewDBCache(ctx, prog, databaseKind, fileSize, ttl...)
+		prog.Cache = NewDBCache(cfg, prog, databaseKind, fileSize)
 	}
 	prog.DatabaseKind = databaseKind
 	prog.Loader = ssautil.NewPackageLoader(
@@ -69,7 +73,7 @@ func NewProgram(
 		ssautil.WithIncludePath(programPath),
 		ssautil.WithBasePath(programPath),
 	)
-	prog.ctx = ctx
+	prog.ctx = cfg.GetContext()
 	return prog
 }
 
@@ -88,7 +92,6 @@ func NewTmpProgram(ProgramName string) *Program {
 		Blueprint:               omap.NewEmptyOrderedMap[string, *Blueprint](),
 		BlueprintStack:          utils.NewStack[*Blueprint](),
 		editorStack:             omap.NewOrderedMap(make(map[string]*memedit.MemEditor)),
-		editorMap:               omap.NewOrderedMap(make(map[string]*memedit.MemEditor)),
 		FileList:                make(map[string]string),
 		LineCount:               0,
 		cacheExternInstance:     make(map[string]Value),
@@ -109,13 +112,18 @@ func NewTmpProgram(ProgramName string) *Program {
 }
 func (prog *Program) createSubProgram(name string, kind ssadb.ProgramKind, path ...string) *Program {
 	fs := prog.Loader.GetFilesysFileSystem()
-	fullPath := prog.GetCurrentEditor().GetFilename()
-	endPath := fs.Join(path...)
-	programPath, _, _ := strings.Cut(fullPath, endPath)
-	subProg := NewProgram(prog.ctx, name, prog.DatabaseKind, kind, fs, programPath, 0)
+	programPath := prog.Loader.GetBasePath()
+	if currentEditor := prog.GetCurrentEditor(); currentEditor != nil {
+		fullPath := currentEditor.GetFilename()
+		endPath := fs.Join(path...)
+		if prefix, _, ok := strings.Cut(fullPath, endPath); ok {
+			programPath = prefix
+		}
+	}
+	subProg := NewProgram(cloneProgramConfig(prog.compileConfig, name), prog.DatabaseKind, kind, fs, programPath, 0)
 	subProg.Application = prog.Application
 	subProg.config = prog.config
-	subProg.SetDiagnosticsRecorder(prog.DiagnosticsRecorder())
+	subProg.SetDiagnosticsRecorder(prog.diagnosticsRecorderForChild())
 
 	subProg.Loader.AddIncludePath(prog.Loader.GetIncludeFiles()...)
 	subProg.Language = prog.Language
@@ -141,6 +149,38 @@ func (prog *Program) createSubProgram(name string, kind ssadb.ProgramKind, path 
 	subProg.NameCache = prog.NameCache
 	subProg.fixImportCallback = make([]func(), 0)
 	return subProg
+}
+
+func ensureProgramConfig(cfg *ssaconfig.Config) *ssaconfig.Config {
+	if cfg != nil {
+		return cfg
+	}
+	ret, err := ssaconfig.New(ssaconfig.ModeSSACompile)
+	if err != nil {
+		return &ssaconfig.Config{}
+	}
+	return ret
+}
+
+func cloneProgramConfig(base *ssaconfig.Config, programName string) *ssaconfig.Config {
+	opts := []ssaconfig.Option{
+		ssaconfig.WithSetProgramName(programName),
+	}
+	if base != nil {
+		opts = append(opts,
+			ssaconfig.WithContext(base.GetContext()),
+			ssaconfig.WithCompileIrCacheTTL(base.GetCompileIrCacheTTL()),
+			ssaconfig.WithCompileIrCacheMax(base.GetCompileIrCacheMax()),
+		)
+	}
+	ret, err := ssaconfig.New(ssaconfig.ModeSSACompile, opts...)
+	if err != nil {
+		return ensureProgramConfig(base)
+	}
+	if base != nil {
+		ret.SetCompileProjectBytes(base.GetCompileProjectBytes())
+	}
+	return ret
 }
 func (prog *Program) IsVirtualImport() bool {
 	return prog.config.VirtualImport
@@ -179,6 +219,9 @@ func (prog *Program) GetLibrary(name string) (*Program, bool) {
 	currentEditor := prog.GetCurrentEditor()
 	// this program has current file
 	hasFile := func(p *Program) bool {
+		if currentEditor == nil {
+			return false
+		}
 		if hash, ok := p.FileList[currentEditor.GetUrl()]; ok {
 			if hash == currentEditor.GetIrSourceHash() {
 				return true
@@ -298,6 +341,9 @@ func (prog *Program) EachFunction(handler func(*Function)) {
 }
 
 func (prog *Program) Finish() {
+	if prog == nil || utils.IsNil(prog) {
+		return
+	}
 	// only run once and not wait
 	if prog.finished {
 		return
@@ -312,10 +358,17 @@ func (prog *Program) Finish() {
 	// log.Errorf("BUG!! program %s has not finish ast", prog.Name)
 	prog.LazyBuild() // finish
 	// }
-	prog.UpStream.ForEach(func(i string, v *Program) bool {
-		v.Finish()
+
+	pending := make([]*Program, 0)
+	prog.UpStream.ForEach(func(_ string, v *Program) bool {
+		if v != nil {
+			pending = append(pending, v)
+		}
 		return true
 	})
+	for _, v := range pending {
+		v.Finish()
+	}
 }
 
 func (prog *Program) SearchIndexAndOffsetByOffset(searchOffset int) (index int, offset int) {
@@ -347,22 +400,81 @@ func (prog *Program) GetFrontValueByOffset(searchOffset int) (offset int, value 
 }
 
 func (p *Program) ShouldVisit(path string) bool {
-	return p.editorMap.Have(path)
+	if p == nil {
+		return false
+	}
+	if p.Cache != nil && p.Cache.sources != nil {
+		return p.Cache.sources.HasVisitedURL(path)
+	}
+	return false
 }
 
 func (p *Program) GetEditor(url string) (*memedit.MemEditor, bool) {
-	return p.editorMap.Get(url)
+	if p == nil {
+		return nil, false
+	}
+	if url == "" {
+		if editor := p.GetCurrentEditor(); editor != nil {
+			return editor, true
+		}
+	}
+	if p.Cache != nil && p.Cache.sources != nil {
+		if editor, ok := p.Cache.sources.GetVisitedEditorByURL(url); ok {
+			return editor, true
+		}
+		if editor, ok := p.Cache.sources.GetEditorByURL(url); ok {
+			return editor, true
+		}
+	}
+	if editor := p.GetCurrentEditor(); editor != nil && editor.GetUrl() == url {
+		return editor, true
+	}
+	return nil, false
+}
+
+func (p *Program) GetEditorByHash(hash string) (*memedit.MemEditor, bool) {
+	if p == nil || hash == "" {
+		return nil, false
+	}
+	if editor := p.GetCurrentEditor(); editor != nil && editor.GetIrSourceHash() == hash {
+		return editor, true
+	}
+	if p.Cache != nil && p.Cache.sources != nil {
+		if editor, ok := p.Cache.sources.GetEditorByHash(hash); ok {
+			return editor, true
+		}
+	}
+	editor, err := ssadb.GetEditorByHash(hash)
+	if err != nil || editor == nil {
+		return nil, false
+	}
+	p.SetEditor(editor.GetUrl(), editor)
+	return editor, true
 }
 
 func (p *Program) SetEditor(url string, me *memedit.MemEditor) {
-	p.editorMap.Set(url, me)
+	if p != nil && p.Cache != nil && p.Cache.sources != nil {
+		p.Cache.sources.markVisitedEditor(url, me)
+	}
 }
 
 func (p *Program) GetIncludeFiles() []string {
-	return p.editorMap.Keys()
+	if p != nil && p.Cache != nil && p.Cache.sources != nil {
+		return p.Cache.sources.EditorURLs()
+	}
+	if editor := p.GetCurrentEditor(); editor != nil && editor.GetUrl() != "" {
+		return []string{editor.GetUrl()}
+	}
+	return nil
 }
 func (p *Program) GetIncludeFileNum() int {
-	return p.editorMap.Len()
+	if p != nil && p.Cache != nil && p.Cache.sources != nil {
+		return len(p.Cache.sources.EditorURLs())
+	}
+	if editor := p.GetCurrentEditor(); editor != nil && editor.GetUrl() != "" {
+		return 1
+	}
+	return 0
 }
 
 func (p *Program) PushEditor(e *memedit.MemEditor) {
@@ -444,4 +556,83 @@ func (p *Program) SetTemplate(path string, info tl.TemplateGeneratedInfo) {
 		return
 	}
 	p.Template[path] = info
+}
+
+func (prog *Program) SetDiagnosticsRecorder(rec *diagnostics.Recorder) {
+	if prog == nil {
+		return
+	}
+	prog.diagnosticsRecorder = rec
+	root := prog.Application
+	if root == nil {
+		root = prog
+	}
+	if prog != root {
+		return
+	}
+	root.UpStream.ForEach(func(_ string, sub *Program) bool {
+		if sub != nil {
+			sub.diagnosticsRecorder = rec
+		}
+		return true
+	})
+}
+
+func (prog *Program) DiagnosticsRecorder() *diagnostics.Recorder {
+	if prog == nil {
+		return nil
+	}
+	return prog.diagnosticsRecorder
+}
+
+func (prog *Program) diagnosticsRecorderForChild() *diagnostics.Recorder {
+	if rec := prog.DiagnosticsRecorder(); rec != nil {
+		return rec
+	}
+	if app := prog.Application; app != nil && app != prog {
+		return app.DiagnosticsRecorder()
+	}
+	return nil
+}
+
+func (prog *Program) DiagnosticsTrack(name string, steps ...func() error) {
+	_ = prog.DiagnosticsTrackErr(name, steps...)
+}
+
+func (prog *Program) DiagnosticsTrackErr(name string, steps ...func() error) error {
+	if len(steps) == 0 {
+		return nil
+	}
+	if prog == nil {
+		return runDiagnosticSteps(steps)
+	}
+	if rec := prog.DiagnosticsRecorder(); rec != nil {
+		return rec.Track(name, steps...)
+	}
+	return runDiagnosticSteps(steps)
+}
+
+func runDiagnosticSteps(steps []func() error) error {
+	for _, step := range steps {
+		if step != nil {
+			if err := step(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *ProgramCache) diagnosticsTrack(name string, steps ...func() error) {
+	_ = c.diagnosticsTrackErr(name, steps...)
+}
+
+func (c *ProgramCache) diagnosticsTrackErr(name string, steps ...func() error) error {
+	if c == nil || len(steps) == 0 {
+		return nil
+	}
+	if prog := c.program; prog != nil {
+		return prog.DiagnosticsTrackErr(name, steps...)
+	}
+	return runDiagnosticSteps(steps)
 }

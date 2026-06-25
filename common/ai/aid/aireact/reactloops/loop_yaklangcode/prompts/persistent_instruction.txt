@@ -22,7 +22,7 @@
 ---
 
 **ABSOLUTELY CRITICAL - 生成代码时的必须事项：**
-1. [必须] 当使用 'write_code' 或 'modify_code' 时，你必须ALWAYS在响应中包含 <|GEN_CODE_{{ .Nonce }}|> 代码块
+1. [必须] 当使用 'write_code' 或 'modify_code' 时，你必须ALWAYS在响应中包含 <|GEN_CODE_CURRENT_NONCE|> 代码块
 2. [必须] 不能只输出 JSON！必须输出：JSON行 + 代码块
 3. [禁止] 禁止在生成的代码中包含任何行号前缀（如 `18 |`, `19 |`, `20 |` 等）
 4. [禁止] 禁止在生成的代码中包含任何 `|` 分隔符
@@ -34,9 +34,9 @@
 ```
 {"@action": "write_code", ...}
 
-<|GEN_CODE_{{ .Nonce }}|>
+<|GEN_CODE_CURRENT_NONCE|>
 你的Yaklang代码
-<|GEN_CODE_END_{{ .Nonce }}|>
+<|GEN_CODE_END_CURRENT_NONCE|>
 ```
 
 **错误示例（绝对禁止）：**
@@ -162,6 +162,55 @@ if err != nil {
 需求 → grep 搜索 → 基于样例写代码 → 成功
      ↓（如遇错误）
      grep 搜索 → 精确修改 → 成功
+```
+
+---
+
+## YakDocument 标准库文档查询（yakdoc_*）
+
+**文档查签名，grep 查样例** — 两者互补，不要混用职责。
+
+| 场景 | 优先工具 |
+|------|----------|
+| 不知道库名，知道功能（如 HTTP POST、发包） | **`yakdoc_search`** |
+| `ExternLib [...] don't has [...]` API 不存在 | 先看 lint 自动附加的文档；不够再 `yakdoc_function_details` |
+| 已知库名，需列全部成员 | `yakdoc_library_details` |
+| 语法错误 / DSL 写法 / 完整实现样例 | `grep_yaklang_samples` 或 `semantic_search_yaklang_samples` |
+
+### YakDocument 工具
+
+1. **`yakdoc_search`** — 按关键词模糊搜索 API（不知道库名时首选）
+2. **`yakdoc_get_all_library_names`** — 列出全部标准库名
+3. **`yakdoc_library_details`** — 列出某库的 functions/variables 名称
+4. **`yakdoc_function_details`** — 查询函数签名、参数、返回值、说明
+5. **`yakdoc_variable_details`** — 查询变量/实例说明
+
+**不知道库名时的流程：**
+```
+功能意图（如 "发 POST 请求"）
+  ↓
+yakdoc_search(query="HTTP POST")
+  ↓
+yakdoc_function_details(library="poc", function=["Post"])
+  ↓
+write_code / modify_code
+```
+
+**ExternLib 报错流程：**
+```
+ExternLib 报错
+  ↓
+阅读 lint 反馈中【已自动附加 YakDocument】的相近 API 与建议签名
+  ↓
+直接 modify_code；信息不足时再 yakdoc_function_details
+```
+
+**示例：**
+```json
+{"@action": "yakdoc_search", "query": "HTTP POST 请求", "human_readable_thought": "不知道用哪个库发包，先按功能搜索 API"}
+```
+```json
+{"@action": "yakdoc_function_details", "library": "poc", "function": ["Post"], "human_readable_thought": "确认 Post 函数签名与参数"}
 ```
 
 ---

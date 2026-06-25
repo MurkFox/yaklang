@@ -3,21 +3,16 @@ package ssaapi
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
 
-	"github.com/gobwas/glob"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/diagnostics"
 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	"github.com/yaklang/yaklang/common/utils/memedit"
 	"github.com/yaklang/yaklang/common/yak/ssa"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
-	"github.com/yaklang/yaklang/common/yak/ssaapi/ssareducer"
 )
 
 type ProcessFunc func(msg string, process float64)
-type ExcludeFunc func(path string) bool
 
 type Config struct {
 	*ssaconfig.Config // config
@@ -41,7 +36,6 @@ type Config struct {
 	process ProcessFunc
 
 	// for build
-	cacheTTL                []time.Duration
 	externLib               map[string]map[string]any
 	externValue             map[string]any
 	defineFunc              map[string]any
@@ -59,8 +53,6 @@ type Config struct {
 	excludeFile ExcludeFunc
 
 	logLevel string
-
-	astSequence ssareducer.ASTSequenceType
 
 	// diagnostics configuration
 	diagnosticsEnabled  bool
@@ -86,81 +78,22 @@ func (c *Config) CalcHash() string {
 
 var WithConfigInfo = ssaconfig.WithCodeSourceMap
 
-var DefaultExcludeFiles = []string{
-	"**/Vendor/**",
-	"Vendor/**",
-	"**/vendor/**",
-	"vendor/**",
-	"**/classes/**",
-	"**/target/**",
-	"**include/**",
-	"**caches/**",
-	"**cache/**",
-	"**tmp/**",
-	"**alipay/**",
-	"**includes/**",
-	"**temp/**",
-	"**zh_cn/**",
-	"**zh_en/**",
-	"**plugins/**",
-	"**PHPExcel/**",
-}
+type ExcludeFunc = ssaconfig.CompileExcludeFunc
+
+// DefaultExcludeFiles is kept for backward compatibility.
+var DefaultExcludeFiles = ssaconfig.DefaultCompileExcludeGlobs
 
 func newExcludeFunc(patterns []string, basePath string) ExcludeFunc {
-	var compile []glob.Glob
-	seenPatterns := make(map[string]bool)
-	patterns = append(patterns, DefaultExcludeFiles...)
-	addPattern := func(pattern string) {
-		pattern = strings.TrimSpace(pattern)
-		if pattern == "" {
-			return
-		}
-		if seenPatterns[pattern] {
-			return
-		}
-		seenPatterns[pattern] = true
-		g, err := glob.Compile(pattern)
-		if err != nil {
-			log.Warnf("failed to compile exclude pattern: %v, pattern: %s", err, pattern)
-			return
-		}
-		compile = append(compile, g)
-	}
+	return ssaconfig.BuildCompileExcludeFunc(patterns, basePath)
+}
 
-	// normalizePattern handles folder patterns:
-	// "vendor/" -> ["vendor", "vendor/**"] to match folder and all contents
-	normalizePattern := func(pattern string) []string {
-		if strings.HasSuffix(pattern, "/") {
-			base := strings.TrimSuffix(pattern, "/")
-			return []string{base, base + "/**"}
-		}
-		return []string{pattern}
-	}
+// CompileExcludeFunc returns a matcher that merges user patterns with built-in compile excludes.
+func CompileExcludeFunc(extraPatterns []string, basePath string) ExcludeFunc {
+	return ssaconfig.BuildCompileExcludeFunc(extraPatterns, basePath)
+}
 
-	for _, pattern := range patterns {
-		// Apply normalization for folder patterns
-		for _, p := range normalizePattern(pattern) {
-			addPattern(p)
-		}
-
-		// 普通化分隔符（处理不同系统）
-		relPattern := strings.TrimPrefix(pattern, basePath)
-		relPattern = strings.TrimLeft(relPattern, "/")
-		if relPattern != pattern {
-			for _, p := range normalizePattern(relPattern) {
-				addPattern(p)
-			}
-		}
-	}
-
-	return func(path string) bool {
-		for _, g := range compile {
-			if match := g.Match(path); match {
-				return true
-			}
-		}
-		return false
-	}
+func resolveCompileExcludeFunc(exclude ExcludeFunc) ExcludeFunc {
+	return ssaconfig.ResolveCompileExcludeFunc(exclude)
 }
 
 func (c *Config) Processf(process float64, format string, arg ...any) {
@@ -172,18 +105,16 @@ func (c *Config) Processf(process float64, format string, arg ...any) {
 	}
 }
 
-var WithASTOrder = ssaconfig.SetOption("ssa_compile/ast_order", func(c *Config, v ssareducer.ASTSequenceType) {
-	c.astSequence = v
-})
+func WithASTOrder(sequence ssaconfig.ASTSequenceType) ssaconfig.Option {
+	return ssaconfig.WithCompileASTSequence(sequence)
+}
 
 var WithLogLevel = ssaconfig.SetOption("ssa_compile/log_level", func(c *Config, v string) {
 	c.logLevel = v
 	log.SetLevel(v)
 })
 
-var WithCacheTTL = ssaconfig.SetOption("ssa_compile/cache_ttl", func(c *Config, v time.Duration) {
-	c.cacheTTL = append(c.cacheTTL, v)
-})
+var WithCacheTTL = ssaconfig.WithCompileIrCacheTTL
 
 var WithExcludeFunc = ssaconfig.WithCompileExcludeFiles
 
@@ -191,9 +122,30 @@ var WithExcludeFunc = ssaconfig.WithCompileExcludeFiles
 // the compile-time exclude files option.
 var WithExcludeFile = ssaconfig.WithCompileExcludeFiles
 
-var WithProcess = ssaconfig.SetOption("ssa_compile/process", func(c *Config, v ProcessFunc) {
+var withProcessOption = ssaconfig.SetOption("ssa_compile/process", func(c *Config, v ProcessFunc) {
 	c.process = v
 })
+
+// WithProcess 设置编译进度回调（导出名为 ssa.withProcess）
+// 编译过程中会以 (进度消息, 进度比例) 回调该函数，常用于展示编译进度
+//
+// 参数:
+//   - v: 进度回调函数，参数为 (msg 进度消息, process 进度比例 0~1)
+//
+// 返回值:
+//   - 编译配置可选项，可传入 ssa.Parse
+//
+// Example:
+// ```
+// called = false
+// prog = ssa.Parse(`a = 1; b = a + 1; println(b)`, ssa.withProcess((msg, process) => { called = true }))~
+// println(called)   // OUT: true
+// assert prog != nil, "parse with withProcess option should succeed"
+// assert called == true, "process callback should be invoked during compilation"
+// ```
+func WithProcess(v ProcessFunc) ssaconfig.Option {
+	return withProcessOption(v)
+}
 
 var WithReCompile = ssaconfig.WithCompileReCompile
 
@@ -209,6 +161,18 @@ var WithFileSystem = ssaconfig.SetOption("ssa_compile/file_system", func(c *Conf
 var WithRawLanguage = ssaconfig.WithProjectRawLanguage
 var WithLanguage = ssaconfig.WithProjectLanguage
 
+// WithFileSystemEntry 设置编译入口文件（导出名为 ssa.withEntryFile）
+// 参数:
+//   - v: 一个或多个入口文件路径，支持逗号分隔
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withEntryFile("src/main/java/App.java")
+// println(opt)
+// ```
 func WithFileSystemEntry(v ...string) ssaconfig.Option {
 	return ssaconfig.WithCompileEntryFiles(v...)
 }
@@ -229,6 +193,20 @@ var withExternLib = ssaconfig.SetOption("ssa_compile/extern_lib", func(
 	c.externLib[a.name] = a.table
 })
 
+// WithExternLib 为 SSA 编译注入外部库（导出名为 ssa.withExternLib）
+// 用于让分析器识别自定义的库函数与符号
+// 参数:
+//   - name: 库名
+//   - table: 库的符号表（名称到值的映射）
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withExternLib("mylib", {"foo": func() { return 1 }})
+// println(opt)
+// ```
 func WithExternLib(name string, table map[string]any) ssaconfig.Option {
 	return func(c *ssaconfig.Config) error {
 		withExternLib(struct {
@@ -242,11 +220,30 @@ func WithExternLib(name string, table map[string]any) ssaconfig.Option {
 	}
 }
 
-var WithExternValue = ssaconfig.SetOption("ssa_compile/extern_value", func(c *Config, table map[string]any) {
+var withExternValueOption = ssaconfig.SetOption("ssa_compile/extern_value", func(c *Config, table map[string]any) {
 	for name, value := range table {
 		c.externValue[name] = value
 	}
 })
+
+// WithExternValue 为 SSA 编译注入外部值符号（导出名为 ssa.withExternValue）
+// 让分析器把这些名称识别为已知的外部符号，避免被当作未定义变量
+//
+// 参数:
+//   - table: 外部值的符号表（名称到值的映射）
+//
+// 返回值:
+//   - 编译配置可选项，可传入 ssa.Parse
+//
+// Example:
+// ```
+// prog = ssa.Parse(`x = EXTERN_VAL`, ssa.withExternValue({"EXTERN_VAL": 123}))~
+// println(prog != nil)   // OUT: true
+// assert prog != nil, "parse with withExternValue option should succeed"
+// ```
+func WithExternValue(table map[string]any) ssaconfig.Option {
+	return withExternValueOption(table)
+}
 
 var WithExternMethod = ssaconfig.SetOption("ssa_compile/extern_method", func(c *Config, b ssa.MethodBuilder) {
 	c.externMethod = b
@@ -344,24 +341,19 @@ func DefaultConfig(opts ...ssaconfig.Option) (*Config, error) {
 	c := &Config{
 		LanguageBuilder:            nil,
 		programPath:                ".",
-		cacheTTL:                   make([]time.Duration, 0),
 		externLib:                  make(map[string]map[string]any),
 		externValue:                make(map[string]any),
 		defineFunc:                 make(map[string]any),
 		DatabaseProgramCacheHitter: func(any) {},
 		ctx:                        sc.GetContext(),
-		excludeFile: func(path string) bool {
-			return false
-		},
-		logLevel:    "error",
-		astSequence: ssareducer.OutOfOrder,
-		Config:      sc,
+		logLevel:                   "error",
+		Config:                     sc,
 	}
-	if !utils.IsNil(sc.SSACompile) {
-		if exclude := sc.SSACompile.ExcludeFiles; exclude != nil {
-			c.excludeFile = newExcludeFunc(exclude, sc.GetCodeSourceLocalFile())
-		}
+	var userExclude []string
+	if sc.SSACompile != nil {
+		userExclude = sc.SSACompile.ExcludeFiles
 	}
+	c.excludeFile = ssaconfig.BuildCompileExcludeFunc(userExclude, sc.GetCodeSourceLocalFile())
 
 	ssaconfig.ApplyExtraOptions(c, c.Config)
 
@@ -375,7 +367,7 @@ func DefaultConfig(opts ...ssaconfig.Option) (*Config, error) {
 		}
 	}
 	switch c.databaseKind {
-	case ssa.ProgramCacheNone:
+	case ssa.ProgramCacheKind(0):
 		c.databaseKind = ssa.ProgramCacheMemory
 		if c.GetProgramName() != "" {
 			// if set program name, use db write

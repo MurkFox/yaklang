@@ -11,6 +11,7 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops/loop_plan"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 
@@ -43,9 +44,9 @@ func (pr *planRequest) GetInteractCount() int64 {
 
 func (pr *planRequest) CallAI(request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 	for _, cb := range []aicommon.AICallbackType{
-		pr.cod.QualityPriorityAICallback,
-		pr.cod.SpeedPriorityAICallback,
-		pr.cod.OriginalAICallback,
+		pr.cod.GetQualityPriorityAICallback(),
+		pr.cod.GetSpeedPriorityAICallback(),
+		pr.cod.GetOriginalAICallback(),
 	} {
 		if cb == nil {
 			continue
@@ -57,8 +58,8 @@ func (pr *planRequest) CallAI(request *aicommon.AIRequest) (*aicommon.AIResponse
 
 func (pr *planRequest) CallSpeedPriorityAI(request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 	for _, cb := range []aicommon.AICallbackType{
-		pr.cod.SpeedPriorityAICallback,
-		pr.cod.OriginalAICallback,
+		pr.cod.GetSpeedPriorityAICallback(),
+		pr.cod.GetOriginalAICallback(),
 	} {
 		if cb == nil {
 			continue
@@ -70,8 +71,8 @@ func (pr *planRequest) CallSpeedPriorityAI(request *aicommon.AIRequest) (*aicomm
 
 func (pr *planRequest) CallQualityPriorityAI(request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 	for _, cb := range []aicommon.AICallbackType{
-		pr.cod.QualityPriorityAICallback,
-		pr.cod.OriginalAICallback,
+		pr.cod.GetQualityPriorityAICallback(),
+		pr.cod.GetOriginalAICallback(),
 	} {
 		if cb == nil {
 			continue
@@ -83,6 +84,16 @@ func (pr *planRequest) CallQualityPriorityAI(request *aicommon.AIRequest) (*aico
 
 type PlanResponse struct {
 	RootTask *AiTask `json:"root_task"`
+	// Facts is a read-only field populated by loop_plan's output_facts action.
+	// It contains all concrete factual evidence gathered during planning, in Markdown format.
+	Facts string `json:"facts,omitempty"`
+	// Evidence is a read-only field populated during plan execution.
+	// It contains runtime discoveries accumulated from verification and output_evidence.
+	Evidence string `json:"evidence,omitempty"`
+	// Document is the guidance document generated at the end of the planning loop,
+	// organized using cybernetics & scientific methodology frameworks.
+	// It serves as the foundational reference for all subtask execution.
+	Document string `json:"document,omitempty"`
 }
 
 func (p *PlanResponse) recursiveMergeSubtask(subtask *AiTask, callback func(i *AiTask) error, stopped *utils.AtomicBool) {
@@ -95,7 +106,7 @@ func (p *PlanResponse) recursiveMergeSubtask(subtask *AiTask, callback func(i *A
 		stopped.Set()
 		return
 	}
-	if subtask.Subtasks == nil || len(subtask.Subtasks) <= 0 {
+	if len(subtask.Subtasks) <= 0 {
 		return
 	}
 	for _, st := range subtask.Subtasks {
@@ -137,10 +148,20 @@ func (pr *planRequest) Invoke() (*PlanResponse, error) {
 		if planRes.RootTask != nil {
 			pr.cod.standardizeTaskTreeAndNotify(planRes.RootTask, "mock plan initialized")
 		}
+		if pr.cod.Config != nil {
+			if strings.TrimSpace(planRes.Facts) != "" {
+				appendPlanFactsFrozenPartition(pr.cod.Config, planRes.Facts)
+			}
+			if strings.TrimSpace(planRes.Document) != "" {
+				appendPlanDocumentFrozenPartition(pr.cod.Config, planRes.Document)
+			}
+		}
 		return planRes, nil
 	}
 
 	var rootTask = pr.cod.generateAITaskWithName("root-default", "root-default")
+	var planFacts string
+	var planDocument string
 
 	planTask := aicommon.NewStatefulTaskBase(
 		"plan-task",
@@ -152,116 +173,128 @@ func (pr *planRequest) Invoke() (*PlanResponse, error) {
 
 	// Set PlanPrompt to KeyValueConfig for Plan Loop to use
 	// This content appears only during plan initialization
+	appendPlanPrompt := func(tagName, prompt string) string {
+		if strings.TrimSpace(prompt) == "" {
+			return ""
+		}
+		nonce := utils.RandStringBytes(8)
+		return fmt.Sprintf(
+			"\n<|%s_%s|>\n"+
+				"%s\n"+
+				"<|%s_END_%s|>\n",
+			tagName, nonce, prompt, tagName, nonce)
+	}
+
+	var planPrompt string
+	if globalConfig := yakit.GetCachedAIGlobalConfig(); globalConfig != nil && globalConfig.GetAIPlanPrompt() != "" {
+		planPrompt += appendPlanPrompt(
+			"AI_PLAN",
+			globalConfig.GetAIPlanPrompt(),
+		)
+	}
 	if pr.cod.Config.PlanPrompt != "" {
-		pr.cod.Config.SetConfig(loop_plan.PLAN_PROMPT_KEY, pr.cod.Config.PlanPrompt)
+		planPrompt += appendPlanPrompt(
+			"USER_PLAN",
+			pr.cod.Config.PlanPrompt,
+		)
+	}
+	if planPrompt != "" {
+		pr.cod.Config.SetConfig(loop_plan.PLAN_PROMPT_KEY, planPrompt)
 	}
 
 	err := pr.cod.ExecuteLoopTask(
 		schema.AI_REACT_LOOP_NAME_PLAN,
 		planTask,
-		reactloops.WithOnPostIteraction(func(loop *reactloops.ReActLoop, iteration int, task aicommon.AIStatefulTask, isDone bool, reason any, _ *reactloops.OnPostIterationOperator) {
+		reactloops.WithOnPostIteraction(func(loop *reactloops.ReActLoop, iteration int, task aicommon.AIStatefulTask, isDone bool, reason any, operator *reactloops.OnPostIterationOperator) {
 			if isDone {
-				planData := loop.Get(loop_plan.PLAN_DATA_KEY)
+				operator.DeferAfterCallbacks(func() {
+					planData := loop.Get(loop_plan.PLAN_DATA_KEY)
 
-				if planData == "" {
-					log.Warnf("plan loop finished without producing plan data (iteration=%d), attempting fallback plan generation", iteration)
-					fallbackPlan := pr.generateFallbackPlan(loop)
-					if fallbackPlan != "" {
-						planData = fallbackPlan
-						loop.Set(loop_plan.PLAN_DATA_KEY, planData)
-					} else {
-						log.Errorf("fallback plan generation also failed, plan will be incomplete")
+					if planData == "" {
+						log.Errorf("plan loop finished without producing plan data (iteration=%d), plan will be incomplete", iteration)
 						return
 					}
-				}
 
-				action, err := aicommon.ExtractAction(planData, "plan", "plan")
-				if err != nil {
-					log.Errorf("extract action from plan data failed: %v", err)
-					return
-				}
-				rootTask = pr.cod.generateAITaskWithName(action.GetAnyToString("main_task"), action.GetAnyToString("main_task_goal"))
-
-				if identifier := action.GetAnyToString("main_task_identifier"); identifier != "" {
-					sanitized := aicommon.SanitizeTaskName(identifier)
-					if sanitized != "" {
-						rootTask.SetSemanticIdentifier(sanitized)
+					action, err := aicommon.ExtractAction(planData, "plan", "plan")
+					if err != nil {
+						log.Errorf("extract action from plan data failed: %v", err)
+						return
 					}
-				}
+					rootTask = pr.cod.generateAITaskWithName(action.GetAnyToString("main_task"), action.GetAnyToString("main_task_goal"))
 
-				if !strings.Contains(rootTask.GetUserInput(), pr.rawInput) {
-					nonce := utils.RandStringBytes(4)
-					taskInput := rootTask.GetUserInput()
-					i := utils.MustRenderTemplate(`
+					if identifier := action.GetAnyToString("main_task_identifier"); identifier != "" {
+						sanitized := aicommon.SanitizeTaskName(identifier)
+						if sanitized != "" {
+							rootTask.SetSemanticIdentifier(sanitized)
+						}
+					}
+
+					if !strings.Contains(rootTask.GetUserInput(), pr.rawInput) {
+						nonce := utils.RandStringBytes(4)
+						taskInput := rootTask.GetUserInput()
+						i := utils.MustRenderTemplate(`
 <|用户原始需求_{{.nonce}}|>
 {{ .RawUserInput }}
 <|用户原始需求_END_{{.nonce}}|>
 --- 
 {{ .Origin }}
 `,
-						map[string]any{
-							"nonce":        nonce,
-							"RawUserInput": pr.rawInput,
-							"Origin":       taskInput,
-						})
-					rootTask.SetUserInput(i)
-				}
-
-				for _, subtask := range action.GetInvokeParamsArray("tasks") {
-					if subtask.GetAnyToString("subtask_name") == "" {
-						continue
+							map[string]any{
+								"nonce":        nonce,
+								"RawUserInput": pr.rawInput,
+								"Origin":       taskInput,
+							})
+						rootTask.SetUserInput(i)
 					}
-					rootTask.Subtasks = append(rootTask.Subtasks, pr.cod.generateAITask(subtask))
-				}
-				if rootTask.Name == "" {
-					log.Errorf("plan action missing main_task")
-				}
+
+					for _, subtask := range action.GetInvokeParamsArray("tasks") {
+						if subtask.GetAnyToString("subtask_name") == "" {
+							continue
+						}
+						rootTask.Subtasks = append(rootTask.Subtasks, pr.cod.generateAITask(subtask))
+					}
+					if rootTask.Name == "" {
+						log.Errorf("plan action missing main_task")
+					}
+
+					if facts := loop.Get(loop_plan.PLAN_FACTS_KEY); facts != "" {
+						planFacts = facts
+						if pr.cod.Config != nil {
+							appendPlanFactsFrozenPartition(pr.cod.Config, facts)
+						}
+					}
+
+					if doc := loop.Get(loop_plan.PLAN_DOCUMENT_KEY); doc != "" {
+						planDocument = doc
+						if pr.cod.Config != nil {
+							appendPlanDocumentFrozenPartition(pr.cod.Config, doc)
+						}
+					}
+				})
 			}
 		}))
 	if err != nil {
 		return nil, err
 	}
 	pr.cod.standardizeTaskTreeAndNotify(rootTask, "initial plan generated")
-	return pr.cod.newPlanResponse(rootTask), nil
-}
 
-func (pr *planRequest) generateFallbackPlan(loop *reactloops.ReActLoop) string {
-	enhance := loop.Get(loop_plan.PLAN_ENHANCE_KEY)
-	prompt := fmt.Sprintf(`You must generate a task plan based on the user's original request. 
-Reply with ONLY valid JSON in this exact format:
-{"@action":"plan","main_task":"<task name>","main_task_goal":"<goal>","tasks":[{"subtask_name":"<name>","subtask_goal":"<goal>","depends_on":[]}]}
-
-User request: %s`, pr.rawInput)
-	if enhance != "" {
-		prompt += fmt.Sprintf("\n\nAdditional context gathered:\n%s", enhance)
+	if planFacts != "" && rootTask.Coordinator != nil && rootTask.Coordinator.Config != nil {
+		appendPlanFactsFrozenPartition(rootTask.Coordinator.Config, planFacts)
+	}
+	if planDocument != "" && rootTask.Coordinator != nil && rootTask.Coordinator.Config != nil {
+		appendPlanDocumentFrozenPartition(rootTask.Coordinator.Config, planDocument)
 	}
 
-	aiCallback := pr.cod.SpeedPriorityAICallback
-	if aiCallback == nil {
-		aiCallback = pr.cod.OriginalAICallback
-	}
-	if aiCallback == nil {
-		log.Errorf("no AI callback available for fallback plan generation")
-		return ""
-	}
-
-	forgeResult, err := aicommon.InvokeLiteForge(prompt, aicommon.WithAICallback(aiCallback))
-	if err != nil {
-		log.Errorf("fallback plan LiteForge invocation failed: %v", err)
-		return ""
-	}
-	if forgeResult == nil || forgeResult.Action == nil {
-		log.Errorf("fallback plan LiteForge returned nil result")
-		return ""
-	}
-
-	result := string(utils.Jsonify(forgeResult.Action.GetParams()))
-	log.Infof("fallback plan generated successfully via LiteForge")
-	return result
+	resp := pr.cod.newPlanResponse(rootTask)
+	resp.Facts = planFacts
+	resp.Document = planDocument
+	resp.Evidence = getTaskPlanEvidence(rootTask)
+	return resp, nil
 }
 
 func (c *Coordinator) generateAITask(params aitool.InvokeParams) *AiTask {
-	task := c.generateAITaskWithName(params.GetAnyToString("subtask_name"), params.GetAnyToString("subtask_goal"))
+	taskName := params.GetAnyToString("subtask_name")
+	task := c.generateAITaskWithName(taskName, params.GetAnyToString("subtask_goal"))
 	if params.Has("depends_on") {
 		deps := params.GetStringSlice("depends_on")
 		if deps == nil {
@@ -271,6 +304,18 @@ func (c *Coordinator) generateAITask(params aitool.InvokeParams) *AiTask {
 	}
 	if identifier := params.GetAnyToString("subtask_identifier"); identifier != "" {
 		task.SemanticIdentifier = identifier
+	}
+	nestedTasks := params.GetObjectArray("sub_subtasks")
+	if len(nestedTasks) > 0 {
+		log.Infof("plan convert: task %q has %d nested subtasks from 'sub_subtasks' key", taskName, len(nestedTasks))
+	}
+	for _, subParams := range nestedTasks {
+		if subParams.GetAnyToString("subtask_name") == "" {
+			continue
+		}
+		subTask := c.generateAITask(subParams)
+		subTask.ParentTask = task
+		task.Subtasks = append(task.Subtasks, subTask)
 	}
 	return task
 }
@@ -327,21 +372,13 @@ func (c *Coordinator) generateSemanticIdentifier(name string) string {
 		return strings.TrimRight(truncated, "_")
 	}
 
-	aiCallback := c.SpeedPriorityAICallback
-	if aiCallback == nil {
-		aiCallback = c.OriginalAICallback
-	}
-	if aiCallback == nil {
-		return truncateFallback()
-	}
-
 	prompt := fmt.Sprintf(`Generate a very short identifier (2-6 words, max 20 characters total) for the following task name.
 The identifier should capture the core meaning. Chinese or English are both acceptable.
 Reply with ONLY the JSON: {"@action":"object","identifier":"YOUR_IDENTIFIER"}
 
 Task name: %s`, name)
 
-	forgeResult, err := aicommon.InvokeLiteForge(prompt, aicommon.WithAICallback(aiCallback))
+	forgeResult, err := c.InvokeLiteForge(prompt)
 	if err != nil {
 		log.Debugf("liteforge failed to generate semantic identifier for %q: %v, falling back to truncation", name, err)
 		return truncateFallback()
@@ -378,10 +415,15 @@ func (c *Coordinator) ensureTaskTreeInitialized(task *AiTask) {
 	// Ensure Coordinator is set
 	task.Coordinator = c
 
+	// Ensure stable TaskId is set (used by frontend & hotpatch scoping)
+	if strings.TrimSpace(task.TaskId) == "" {
+		task.TaskId = uuid.NewString()
+	}
+
 	// Ensure AIStatefulTaskBase is initialized
 	if task.AIStatefulTaskBase == nil {
 		taskBase := aicommon.NewStatefulTaskBase(
-			"plan-task"+uuid.NewString(),
+			task.TaskId,
 			fmt.Sprintf("任务名称: %s\n任务目标: %s", task.Name, task.Goal),
 			c.Ctx,
 			c.Emitter,
@@ -389,6 +431,11 @@ func (c *Coordinator) ensureTaskTreeInitialized(task *AiTask) {
 		)
 		task.AIStatefulTaskBase = taskBase
 		taskBase.SetName(task.Name)
+	} else {
+		// Keep AIStatefulTaskBase id aligned with TaskId if possible
+		if strings.TrimSpace(task.GetId()) == "" || task.GetId() != task.TaskId {
+			task.SetID(task.TaskId)
+		}
 	}
 
 	// Ensure SemanticIdentifier is set

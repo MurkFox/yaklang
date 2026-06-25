@@ -25,6 +25,10 @@ func init() {
 			if c, ok := cfg.(interface{ GetOrCreateWorkDir() string }); ok {
 				state.WorkDir = c.GetOrCreateWorkDir()
 				log.Infof("[CodeAudit] workdir=%s", state.WorkDir)
+				if loaded, ok := TryLoadAuditStateFromWorkDir(state.WorkDir); ok {
+					state = loaded
+					log.Infof("[CodeAudit] restored completed audit state from workdir (phase=%s)", state.GetPhase())
+				}
 			}
 
 			preset := []reactloops.ReActLoopOption{
@@ -118,8 +122,25 @@ func newSubTask(parent aicommon.AIStatefulTask, name string) aicommon.AIStateful
 // buildOrchestratorInitTask 编排四个子 Loop 的 initTask
 func buildOrchestratorInitTask(r aicommon.AIInvokeRuntime, state *AuditState) func(loop *reactloops.ReActLoop, task aicommon.AIStatefulTask, op *reactloops.InitTaskOperator) {
 	return func(loop *reactloops.ReActLoop, task aicommon.AIStatefulTask, op *reactloops.InitTaskOperator) {
-		log.Infof("[CodeAudit] Orchestrator started. workdir=%s", state.WorkDir)
+		log.Infof("[CodeAudit] Orchestrator started. workdir=%s phase=%s", state.WorkDir, state.GetPhase())
 		userInput := task.GetUserInput()
+
+		// 审计已完成：同一 session 内前端仍保持 code_security_audit 专注模式时，走追问子 loop。
+		if state.GetPhase() == AuditPhaseDone {
+			r.AddToTimeline("[AUDIT_FOLLOWUP]", "审计已完成，进入追问模式。用户输入: "+utils.ShrinkTextBlock(userInput, 300))
+			followLoop, err := buildFollowUpLoop(r, state)
+			if err != nil {
+				log.Errorf("[CodeAudit] Failed to build follow-up loop: %v", err)
+				op.Failed(err)
+				return
+			}
+			if err := followLoop.ExecuteWithExistedTask(task); err != nil {
+				log.Warnf("[CodeAudit] Follow-up loop returned error: %v", err)
+			}
+			op.Done()
+			return
+		}
+
 		r.AddToTimeline("[AUDIT_START]", "代码安全审计开始，用户输入: "+utils.ShrinkTextBlock(userInput, 300))
 
 		// 提前创建 audit 输出目录
@@ -138,11 +159,32 @@ func buildOrchestratorInitTask(r aicommon.AIInvokeRuntime, state *AuditState) fu
 		r.AddToTimeline("[PHASE1_START]", "开始 Phase 1：项目探索（使用 dir_explore loop）")
 
 		reconFilePath := filepath.Join(auditDirPath, "recon_notes.md")
+		exploreOpts := []reactloops.ReActLoopOption{
+			reactloops.WithVar("output_report_path", reconFilePath),
+			reactloops.WithVar("explore_work_dir", auditDirPath),
+		}
+		if scanPath := scanTargetPathFromTask(task); scanPath != "" {
+			if st, err := os.Stat(scanPath); err != nil {
+				log.Warnf("[CodeAudit] attached target path not accessible: %q: %v", scanPath, err)
+				op.Failed(fmt.Sprintf(
+					"[CodeAudit] 附件指定的扫描目录无效: %q（%v）。请确认 Type=%q、Key=%q、Value 为存在的目录绝对路径。",
+					scanPath, err, AttachedResourceTypeFile, AttachedResourceKeyCodeAuditTargetPath))
+				return
+			} else if !st.IsDir() {
+				log.Warnf("[CodeAudit] attached target path is not a directory: %q", scanPath)
+				op.Failed(fmt.Sprintf(
+					"[CodeAudit] 附件指定的路径不是目录: %q。请为 Key=%q 提供项目根目录。",
+					scanPath, AttachedResourceKeyCodeAuditTargetPath))
+				return
+			}
+			exploreOpts = append(exploreOpts, reactloops.WithVar("target_path", scanPath))
+			log.Infof("[CodeAudit] Phase1 using attached scan target: %s", scanPath)
+			r.AddToTimeline("[CODE_AUDIT_TARGET]", "扫描目标目录(附件): "+scanPath)
+		}
 		exploreLoop, err := reactloops.CreateLoopByName(
 			schema.AI_REACT_LOOP_NAME_DIR_EXPLORE,
 			r,
-			reactloops.WithVar("output_report_path", reconFilePath),
-			reactloops.WithVar("explore_work_dir", auditDirPath),
+			exploreOpts...,
 		)
 		if err != nil {
 			log.Errorf("[CodeAudit] Failed to create dir_explore loop: %v", err)
@@ -291,6 +333,12 @@ func buildOrchestratorInitTask(r aicommon.AIInvokeRuntime, state *AuditState) fu
 		finalReport := state.GetFinalReport()
 		r.AddToTimeline("[AUDIT_DONE]", "代码安全审计全部完成。报告预览:\n"+utils.ShrinkTextBlock(finalReport, 200))
 		log.Infof("[CodeAudit] All phases complete. Report length: %d bytes", len(finalReport))
+
+		if err := state.PersistToAuditDir(auditDirPath); err != nil {
+			log.Warnf("[CodeAudit] Failed to persist audit state: %v", err)
+		} else {
+			log.Infof("[CodeAudit] Audit state persisted to %s", filepath.Join(auditDirPath, auditStateFileName))
+		}
 
 		op.Done()
 	}

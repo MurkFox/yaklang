@@ -26,12 +26,14 @@ func init() {
 		schema.AI_REACT_LOOP_NAME_INTENT,
 		func(r aicommon.AIInvokeRuntime, opts ...reactloops.ReActLoopOption) (*reactloops.ReActLoop, error) {
 			preset := []reactloops.ReActLoopOption{
+				reactloops.WithDisableTodoSnapshot(true),
+				reactloops.WithDisableLoopPerception(true),
 				reactloops.WithAllowRAG(false),
 				reactloops.WithAllowAIForge(false),
 				reactloops.WithAllowPlanAndExec(false),
 				reactloops.WithAllowToolCall(false),
 				reactloops.WithAllowUserInteract(false),
-				reactloops.WithUseSpeedPriorityAICallback(),
+				reactloops.WithUseSpeedPriorityAICallback(true),
 				reactloops.WithInitTask(buildInitTask(r)),
 				reactloops.WithMaxIterations(1),
 				reactloops.WithPersistentInstruction(instruction),

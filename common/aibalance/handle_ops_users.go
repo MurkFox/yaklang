@@ -11,8 +11,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jinzhu/gorm"
 	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -39,7 +39,7 @@ func safeLikePattern(input string) string {
 // ==================== OPS User Database Operations ====================
 
 // SaveOpsUser saves an OpsUser to the database
-func SaveOpsUser(user *schema.OpsUser) error {
+func SaveOpsUser(user *OpsUser) error {
 	db := GetDB()
 	if db == nil {
 		return fmt.Errorf("database not initialized")
@@ -48,12 +48,12 @@ func SaveOpsUser(user *schema.OpsUser) error {
 }
 
 // GetOpsUserByID retrieves an OpsUser by ID
-func GetOpsUserByID(id uint) (*schema.OpsUser, error) {
+func GetOpsUserByID(id uint) (*OpsUser, error) {
 	db := GetDB()
 	if db == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
-	var user schema.OpsUser
+	var user OpsUser
 	if err := db.First(&user, id).Error; err != nil {
 		return nil, err
 	}
@@ -61,12 +61,12 @@ func GetOpsUserByID(id uint) (*schema.OpsUser, error) {
 }
 
 // GetOpsUserByUsername retrieves an OpsUser by username
-func GetOpsUserByUsername(username string) (*schema.OpsUser, error) {
+func GetOpsUserByUsername(username string) (*OpsUser, error) {
 	db := GetDB()
 	if db == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
-	var user schema.OpsUser
+	var user OpsUser
 	if err := db.Where("username = ?", username).First(&user).Error; err != nil {
 		return nil, err
 	}
@@ -74,12 +74,12 @@ func GetOpsUserByUsername(username string) (*schema.OpsUser, error) {
 }
 
 // GetOpsUserByOpsKey retrieves an OpsUser by OpsKey
-func GetOpsUserByOpsKey(opsKey string) (*schema.OpsUser, error) {
+func GetOpsUserByOpsKey(opsKey string) (*OpsUser, error) {
 	db := GetDB()
 	if db == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
-	var user schema.OpsUser
+	var user OpsUser
 	if err := db.Where("ops_key = ?", opsKey).First(&user).Error; err != nil {
 		return nil, err
 	}
@@ -87,12 +87,12 @@ func GetOpsUserByOpsKey(opsKey string) (*schema.OpsUser, error) {
 }
 
 // GetAllOpsUsers retrieves all OpsUsers
-func GetAllOpsUsers() ([]*schema.OpsUser, error) {
+func GetAllOpsUsers() ([]*OpsUser, error) {
 	db := GetDB()
 	if db == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
-	var users []*schema.OpsUser
+	var users []*OpsUser
 	if err := db.Find(&users).Error; err != nil {
 		return nil, err
 	}
@@ -100,7 +100,7 @@ func GetAllOpsUsers() ([]*schema.OpsUser, error) {
 }
 
 // GetOpsUsersPaginated retrieves OpsUsers with pagination and optional username filter
-func GetOpsUsersPaginated(page, pageSize int, username string) ([]*schema.OpsUser, int64, error) {
+func GetOpsUsersPaginated(page, pageSize int, username string) ([]*OpsUser, int64, error) {
 	db := GetDB()
 	if db == nil {
 		return nil, 0, fmt.Errorf("database not initialized")
@@ -118,7 +118,7 @@ func GetOpsUsersPaginated(page, pageSize int, username string) ([]*schema.OpsUse
 	}
 
 	// Build query
-	dbQuery := db.Model(&schema.OpsUser{})
+	dbQuery := db.Model(&OpsUser{})
 	if username != "" {
 		// Use safeLikePattern to escape special characters and prevent SQL injection
 		dbQuery = dbQuery.Where("username LIKE ?", safeLikePattern(username))
@@ -134,7 +134,7 @@ func GetOpsUsersPaginated(page, pageSize int, username string) ([]*schema.OpsUse
 	offset := (page - 1) * pageSize
 
 	// Query with pagination
-	var users []*schema.OpsUser
+	var users []*OpsUser
 	if err := dbQuery.Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&users).Error; err != nil {
 		return nil, 0, err
 	}
@@ -148,7 +148,7 @@ func DeleteOpsUser(id uint) error {
 	if db == nil {
 		return fmt.Errorf("database not initialized")
 	}
-	return db.Delete(&schema.OpsUser{}, id).Error
+	return db.Delete(&OpsUser{}, id).Error
 }
 
 // ==================== Password Utilities ====================
@@ -341,7 +341,7 @@ func (c *ServerConfig) handleCreateOpsUser(conn net.Conn, request *http.Request)
 	}
 
 	// Create user
-	user := &schema.OpsUser{
+	user := &OpsUser{
 		Username:     reqBody.Username,
 		Password:     hashedPassword,
 		OpsKey:       opsKey,
@@ -823,7 +823,7 @@ func (c *ServerConfig) handleOpsGetMyInfo(conn net.Conn, request *http.Request) 
 
 	// Count API keys created by this user
 	var apiKeyCount int64
-	GetDB().Model(&schema.AiApiKeys{}).Where("created_by_ops_id = ?", user.ID).Count(&apiKeyCount)
+	GetDB().Model(&AiApiKeys{}).Where("created_by_ops_id = ?", user.ID).Count(&apiKeyCount)
 
 	c.writeJSONResponse(conn, http.StatusOK, map[string]interface{}{
 		"success":        true,
@@ -861,7 +861,7 @@ func LogOpsAction(operatorID uint, operatorName, action, targetType, targetID, d
 		}
 	}
 
-	logEntry := &schema.OpsActionLog{
+	logEntry := &OpsActionLog{
 		OperatorID:   operatorID,
 		OperatorName: operatorName,
 		Action:       action,
@@ -920,10 +920,17 @@ func (c *ServerConfig) handleOpsCreateApiKey(conn net.Conn, request *http.Reques
 	}
 	defer request.Body.Close()
 
+	// 关键词: handleOpsCreateApiKey 新增 token_limit 字段, OPS 创建 API Key 支持 Token 限额
+	// 关键词: handleOpsCreateApiKey username remark metainfo, OPS 绑定用户信息
 	var reqBody struct {
-		AllowedModels []string `json:"allowed_models"`
-		TrafficLimit  int64    `json:"traffic_limit"` // Optional, 0 or negative means unlimited
-		Unlimited     bool     `json:"unlimited"`     // Explicitly set unlimited traffic
+		AllowedModels  []string `json:"allowed_models"`
+		TrafficLimit   int64    `json:"traffic_limit"`   // Optional, 0 or negative means unlimited (legacy)
+		Unlimited      bool     `json:"unlimited"`       // Explicitly set unlimited traffic (legacy)
+		TokenLimit     int64    `json:"token_limit"`     // 推荐使用：Token 维度限额，0/负数表示不限制
+		TokenUnlimited bool     `json:"token_unlimited"` // 显式禁用 Token 限额
+		Username       string   `json:"username"`        // 绑定用户名（可重复）
+		Remark         string   `json:"remark"`          // 备注
+		MetaInfo       string   `json:"metainfo"`        // 绑定信息（JSON 文本）
 	}
 
 	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
@@ -961,6 +968,18 @@ func (c *ServerConfig) handleOpsCreateApiKey(conn net.Conn, request *http.Reques
 		trafficLimitEnable = false
 	}
 
+	// Token-dimension limit handling. 与 Traffic 维度独立: OPS 可单独指定/禁用 token 限额。
+	// 关键词: OPS create-api-key TokenLimit TokenLimitEnable 默认逻辑
+	var tokenLimit int64 = 0
+	var tokenLimitEnable bool = false
+	if reqBody.TokenUnlimited {
+		tokenLimit = 0
+		tokenLimitEnable = false
+	} else if reqBody.TokenLimit > 0 {
+		tokenLimit = reqBody.TokenLimit
+		tokenLimitEnable = true
+	}
+
 	// Generate API key
 	apiKey := "mf-" + uuid.New().String()
 
@@ -969,15 +988,21 @@ func (c *ServerConfig) handleOpsCreateApiKey(conn net.Conn, request *http.Reques
 
 	// Create API key record
 	allowedModelsStr := strings.Join(reqBody.AllowedModels, ",")
-	apiKeyRecord := &schema.AiApiKeys{
+	apiKeyRecord := &AiApiKeys{
 		APIKey:             apiKey,
 		AllowedModels:      allowedModelsStr,
 		Active:             true,
 		TrafficLimitEnable: trafficLimitEnable,
 		TrafficLimit:       trafficLimit,
 		TrafficUsed:        0,
+		TokenLimitEnable:   tokenLimitEnable,
+		TokenLimit:         tokenLimit,
+		TokenUsed:          0,
 		CreatedByOpsID:     user.ID,
 		CreatedByOpsName:   user.Username,
+		Username:           strings.TrimSpace(reqBody.Username),
+		Remark:             reqBody.Remark,
+		MetaInfo:           reqBody.MetaInfo,
 	}
 
 	db := GetDB()
@@ -1010,6 +1035,8 @@ func (c *ServerConfig) handleOpsCreateApiKey(conn net.Conn, request *http.Reques
 		"traffic_limit":        trafficLimit,
 		"traffic_limit_enable": trafficLimitEnable,
 		"unlimited":            !trafficLimitEnable,
+		"token_limit":          tokenLimit,
+		"token_limit_enable":   tokenLimitEnable,
 	})
 	LogOpsAction(user.ID, user.Username, "create_api_key", "api_key", fmt.Sprintf("%d", apiKeyRecord.ID), string(detailJSON), request)
 
@@ -1025,15 +1052,24 @@ func (c *ServerConfig) handleOpsCreateApiKey(conn net.Conn, request *http.Reques
 		"traffic_limit":        trafficLimit,
 		"traffic_limit_enable": trafficLimitEnable,
 		"unlimited":            !trafficLimitEnable,
+		"token_limit":          tokenLimit,
+		"token_limit_enable":   tokenLimitEnable,
 		"message":              "API key created successfully",
 	})
 }
 
 // handleOpsGetMyKeys handles GET /ops/api/my-keys
-// Returns API keys created by the current OPS user with pagination support
+// Returns API keys created by the current OPS user with pagination and filtering support.
+// 越权隔离：始终强制 created_by_ops_id = 当前 OPS 用户，任何过滤条件都叠加在该基础之上，
+// OPS 用户永远看不到他人创建的 Key。
 // Query parameters:
 //   - page: page number (default: 1)
 //   - page_size: items per page (default: 20, max: 100)
+//   - username: filter by bound username (partial, SQL-injection-safe LIKE)
+//   - active: filter by status, "true"/"1" -> active only, "false"/"0" -> inactive only
+//   - q: broad keyword search over username/remark/api_key (partial, SQL-injection-safe LIKE)
+//
+// 关键词: handleOpsGetMyKeys 过滤查询, username/active/q 搜索, 标记用户名/用户需求, 越权隔离
 func (c *ServerConfig) handleOpsGetMyKeys(conn net.Conn, request *http.Request, authInfo *AuthInfo) {
 	c.logInfo("Handling OPS get my keys request")
 
@@ -1071,9 +1107,36 @@ func (c *ServerConfig) handleOpsGetMyKeys(conn net.Conn, request *http.Request, 
 		}
 	}
 
-	// Count total API keys created by this OPS user
+	// Parse filter parameters（均为可选；空值即不过滤）。
+	// 关键词: OPS my-keys username/active/q 过滤参数解析
+	usernameFilter := strings.TrimSpace(query.Get("username"))
+	activeFilter := strings.TrimSpace(query.Get("active"))
+	keyword := strings.TrimSpace(query.Get("q"))
+
+	// buildQuery 构造带过滤条件的查询：始终以 created_by_ops_id 为越权隔离基础，
+	// 其余过滤条件按 AND 叠加；LIKE 一律使用 safeLikePattern 转义防 SQL 注入。
+	// 关键词: OPS my-keys buildQuery, created_by_ops_id 强制隔离, safeLikePattern 防注入
+	buildQuery := func() *gorm.DB {
+		q := db.Model(&AiApiKeys{}).Where("created_by_ops_id = ?", authInfo.UserID)
+		if usernameFilter != "" {
+			q = q.Where("username LIKE ?", safeLikePattern(usernameFilter))
+		}
+		switch activeFilter {
+		case "true", "1":
+			q = q.Where("active = ?", true)
+		case "false", "0":
+			q = q.Where("active = ?", false)
+		}
+		if keyword != "" {
+			p := safeLikePattern(keyword)
+			q = q.Where("(username LIKE ? OR remark LIKE ? OR api_key LIKE ?)", p, p, p)
+		}
+		return q
+	}
+
+	// Count total API keys (with filters) created by this OPS user
 	var total int64
-	if err := db.Model(&schema.AiApiKeys{}).Where("created_by_ops_id = ?", authInfo.UserID).Count(&total).Error; err != nil {
+	if err := buildQuery().Count(&total).Error; err != nil {
 		c.logError("Failed to count OPS user API keys: %v", err)
 		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]string{
 			"error": "Failed to retrieve API keys",
@@ -1084,9 +1147,9 @@ func (c *ServerConfig) handleOpsGetMyKeys(conn net.Conn, request *http.Request, 
 	// Calculate offset
 	offset := (page - 1) * pageSize
 
-	// Get API keys created by this OPS user with pagination
-	var apiKeys []schema.AiApiKeys
-	if err := db.Where("created_by_ops_id = ?", authInfo.UserID).Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&apiKeys).Error; err != nil {
+	// Get API keys (with filters) created by this OPS user with pagination
+	var apiKeys []AiApiKeys
+	if err := buildQuery().Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&apiKeys).Error; err != nil {
 		c.logError("Failed to get OPS user API keys: %v", err)
 		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]string{
 			"error": "Failed to retrieve API keys",
@@ -1101,16 +1164,36 @@ func (c *ServerConfig) handleOpsGetMyKeys(conn net.Conn, request *http.Request, 
 		models := strings.Split(key.AllowedModels, ",")
 		sort.Strings(models)
 
-		keys = append(keys, map[string]interface{}{
+		entry := map[string]interface{}{
 			"id":                   key.ID,
 			"api_key":              key.APIKey,
 			"allowed_models":       models,
 			"traffic_used":         key.TrafficUsed,
 			"traffic_limit":        key.TrafficLimit,
 			"traffic_limit_enable": key.TrafficLimitEnable,
-			"active":               key.Active,
-			"created_at":           key.CreatedAt.Format("2006-01-02 15:04:05"),
-		})
+			// 关键词: OPS my-keys 接口暴露 Token 维度限额字段, 推荐使用 token 替代 traffic
+			"token_used":         key.TokenUsed,
+			"token_limit":        key.TokenLimit,
+			"token_limit_enable": key.TokenLimitEnable,
+			"active":             key.Active,
+			"created_at":         key.CreatedAt.Format("2006-01-02 15:04:05"),
+			// 关键词: OPS my-keys 暴露 Username Remark MetaInfo 绑定信息
+			"username": key.Username,
+			"remark":   key.Remark,
+			"metainfo": key.MetaInfo,
+			// 关键词: OPS my-keys 暴露完整用量统计字段, 完善"查"覆盖
+			"usage_count":         key.UsageCount,
+			"success_count":       key.SuccessCount,
+			"failure_count":       key.FailureCount,
+			"input_bytes":         key.InputBytes,
+			"output_bytes":        key.OutputBytes,
+			"web_search_count":    key.WebSearchCount,
+			"created_by_ops_name": key.CreatedByOpsName,
+		}
+		if !key.LastUsedTime.IsZero() {
+			entry["last_used_time"] = key.LastUsedTime.Format("2006-01-02 15:04:05")
+		}
+		keys = append(keys, entry)
 	}
 
 	// Calculate total pages
@@ -1180,7 +1263,7 @@ func (c *ServerConfig) handleOpsDeleteApiKey(conn net.Conn, request *http.Reques
 	}
 
 	// Find the API key and verify ownership
-	var apiKey schema.AiApiKeys
+	var apiKey AiApiKeys
 	if err := db.Where("api_key = ?", reqBody.ApiKey).First(&apiKey).Error; err != nil {
 		c.writeJSONResponse(conn, http.StatusNotFound, map[string]string{
 			"error": "API key not found",
@@ -1245,11 +1328,32 @@ func (c *ServerConfig) handleOpsUpdateApiKey(conn net.Conn, request *http.Reques
 	}
 	defer request.Body.Close()
 
+	// 关键词: handleOpsUpdateApiKey 支持 Token 维度限额, OPS 修改 API Key 同时支持 token 字段
+	// 字段语义：
+	//   - Unlimited=true            -> 关闭流量限额；
+	//   - TrafficLimit>0            -> 启用并设置流量限额；
+	//   - 两者都未提供              -> 流量限额保持不变（向后兼容旧前端）。
+	// Token 维度同理：
+	//   - TokenUnlimited=true       -> 关闭 token 限额；
+	//   - TokenLimit>0              -> 启用并设置 token 限额；
+	//   - 两者都未提供              -> token 限额保持不变。
+	// 使用 *int64 / *bool 让"未提供"可被区分；JSON 中字段缺省即为 nil。
+	// 关键词: handleOpsUpdateApiKey username remark metainfo, OPS 更新绑定用户信息
+	// Username/Remark/MetaInfo 用 *string 区分"未提供"(nil=保持不变) 与"显式置空"。
+	// 关键词: handleOpsUpdateApiKey active 启用禁用, OPS 停用/恢复自己创建的 API Key
+	// Active 用 *bool 区分"未提供"(nil=保持不变) 与"显式启用/禁用"，
+	// 这样前端的"快速启用/禁用"按钮只需发送 {api_key, active} 即可，不会误改其它字段。
 	var reqBody struct {
-		ApiKey        string   `json:"api_key"`
-		AllowedModels []string `json:"allowed_models"`
-		TrafficLimit  int64    `json:"traffic_limit"`
-		Unlimited     bool     `json:"unlimited"`
+		ApiKey         string   `json:"api_key"`
+		AllowedModels  []string `json:"allowed_models"`
+		TrafficLimit   int64    `json:"traffic_limit"`
+		Unlimited      bool     `json:"unlimited"`
+		TokenLimit     *int64   `json:"token_limit,omitempty"`
+		TokenUnlimited *bool    `json:"token_unlimited,omitempty"`
+		Username       *string  `json:"username,omitempty"`
+		Remark         *string  `json:"remark,omitempty"`
+		MetaInfo       *string  `json:"metainfo,omitempty"`
+		Active         *bool    `json:"active,omitempty"`
 	}
 
 	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
@@ -1276,7 +1380,7 @@ func (c *ServerConfig) handleOpsUpdateApiKey(conn net.Conn, request *http.Reques
 	}
 
 	// Find the API key and verify ownership
-	var apiKey schema.AiApiKeys
+	var apiKey AiApiKeys
 	if err := db.Where("api_key = ?", reqBody.ApiKey).First(&apiKey).Error; err != nil {
 		c.writeJSONResponse(conn, http.StatusNotFound, map[string]string{
 			"error": "API key not found",
@@ -1308,6 +1412,36 @@ func (c *ServerConfig) handleOpsUpdateApiKey(conn net.Conn, request *http.Reques
 		apiKey.TrafficLimit = reqBody.TrafficLimit
 	}
 
+	// Update Token settings (推荐使用，独立于流量维度)
+	if reqBody.TokenUnlimited != nil && *reqBody.TokenUnlimited {
+		apiKey.TokenLimitEnable = false
+		apiKey.TokenLimit = 0
+	} else if reqBody.TokenLimit != nil && *reqBody.TokenLimit > 0 {
+		apiKey.TokenLimitEnable = true
+		apiKey.TokenLimit = *reqBody.TokenLimit
+	} else if reqBody.TokenLimit != nil && *reqBody.TokenLimit == 0 && (reqBody.TokenUnlimited == nil || !*reqBody.TokenUnlimited) {
+		// 显式传 0 但 unlimited 没设 -> 等同关闭
+		apiKey.TokenLimitEnable = false
+		apiKey.TokenLimit = 0
+	}
+
+	// Update 绑定用户信息（仅当字段被显式提供时更新）
+	if reqBody.Username != nil {
+		apiKey.Username = strings.TrimSpace(*reqBody.Username)
+	}
+	if reqBody.Remark != nil {
+		apiKey.Remark = *reqBody.Remark
+	}
+	if reqBody.MetaInfo != nil {
+		apiKey.MetaInfo = *reqBody.MetaInfo
+	}
+
+	// Update 启用/禁用状态（仅当字段被显式提供时更新）
+	// 关键词: OPS update-api-key active 启用禁用落库, 停用后该 Key 立即不可用
+	if reqBody.Active != nil {
+		apiKey.Active = *reqBody.Active
+	}
+
 	// Save changes
 	if err := db.Save(&apiKey).Error; err != nil {
 		c.logError("Failed to update API key: %v", err)
@@ -1322,6 +1456,9 @@ func (c *ServerConfig) handleOpsUpdateApiKey(conn net.Conn, request *http.Reques
 		"allowed_models":       reqBody.AllowedModels,
 		"traffic_limit":        apiKey.TrafficLimit,
 		"traffic_limit_enable": apiKey.TrafficLimitEnable,
+		"token_limit":          apiKey.TokenLimit,
+		"token_limit_enable":   apiKey.TokenLimitEnable,
+		"active":               apiKey.Active,
 	})
 	LogOpsAction(authInfo.UserID, authInfo.Username, "update_api_key", "api_key", fmt.Sprintf("%d", apiKey.ID), string(detailJSON), request)
 
@@ -1337,7 +1474,13 @@ func (c *ServerConfig) handleOpsUpdateApiKey(conn net.Conn, request *http.Reques
 		"message":              "API key updated successfully",
 		"traffic_limit":        apiKey.TrafficLimit,
 		"traffic_limit_enable": apiKey.TrafficLimitEnable,
+		"token_limit":          apiKey.TokenLimit,
+		"token_limit_enable":   apiKey.TokenLimitEnable,
 		"allowed_models":       reqBody.AllowedModels,
+		"username":             apiKey.Username,
+		"remark":               apiKey.Remark,
+		"metainfo":             apiKey.MetaInfo,
+		"active":               apiKey.Active,
 	})
 }
 
@@ -1393,7 +1536,7 @@ func (c *ServerConfig) handleOpsResetApiKeyTraffic(conn net.Conn, request *http.
 	}
 
 	// Find the API key and verify ownership
-	var apiKey schema.AiApiKeys
+	var apiKey AiApiKeys
 	if err := db.Where("api_key = ?", reqBody.ApiKey).First(&apiKey).Error; err != nil {
 		c.writeJSONResponse(conn, http.StatusNotFound, map[string]string{
 			"error": "API key not found",
@@ -1427,6 +1570,91 @@ func (c *ServerConfig) handleOpsResetApiKeyTraffic(conn net.Conn, request *http.
 	c.writeJSONResponse(conn, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Traffic reset successfully",
+	})
+}
+
+// handleOpsResetApiKeyToken handles POST /ops/api/reset-token
+// 关键词: handleOpsResetApiKeyToken, OPS 用户重置自己 API Key 的 Token 用量
+//
+// 权限: 仅允许 OPS 用户重置自己创建的 API Key 的 TokenUsed 计数。
+func (c *ServerConfig) handleOpsResetApiKeyToken(conn net.Conn, request *http.Request, authInfo *AuthInfo) {
+	c.logInfo("Handling OPS reset API key token request")
+
+	if !authInfo.IsOps() {
+		c.writeJSONResponse(conn, http.StatusForbidden, map[string]string{
+			"error": "OPS user access required",
+		})
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(request.Body)
+	if err != nil {
+		c.logError("Failed to read request body: %v", err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]string{
+			"error": "Failed to read request body",
+		})
+		return
+	}
+	defer request.Body.Close()
+
+	var reqBody struct {
+		ApiKey string `json:"api_key"`
+	}
+	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+		c.logError("Failed to parse request body: %v", err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]string{
+			"error": "Invalid request format",
+		})
+		return
+	}
+
+	if reqBody.ApiKey == "" {
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]string{
+			"error": "API key is required",
+		})
+		return
+	}
+
+	db := GetDB()
+	if db == nil {
+		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]string{
+			"error": "Database not initialized",
+		})
+		return
+	}
+
+	var apiKey AiApiKeys
+	if err := db.Where("api_key = ?", reqBody.ApiKey).First(&apiKey).Error; err != nil {
+		c.writeJSONResponse(conn, http.StatusNotFound, map[string]string{
+			"error": "API key not found",
+		})
+		return
+	}
+
+	// 越权防护: 必须是本人创建的 Key
+	if apiKey.CreatedByOpsID != authInfo.UserID {
+		c.writeJSONResponse(conn, http.StatusForbidden, map[string]string{
+			"error": "You can only reset token for API keys you created",
+		})
+		return
+	}
+
+	apiKey.TokenUsed = 0
+	if err := db.Save(&apiKey).Error; err != nil {
+		c.logError("Failed to reset API key token used: %v", err)
+		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]string{
+			"error": "Failed to reset token",
+		})
+		return
+	}
+
+	LogOpsAction(authInfo.UserID, authInfo.Username, "reset_api_key_token", "api_key", fmt.Sprintf("%d", apiKey.ID), "", request)
+
+	log.Infof("OPS user %s reset token used for API key: %s", authInfo.Username, reqBody.ApiKey[:20]+"...")
+
+	c.writeJSONResponse(conn, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Token usage reset successfully",
 	})
 }
 
@@ -1475,7 +1703,7 @@ func (c *ServerConfig) handleGetOpsLogs(conn net.Conn, request *http.Request) {
 	}
 
 	// Build query with safe LIKE pattern to prevent SQL injection
-	dbQuery := db.Model(&schema.OpsActionLog{})
+	dbQuery := db.Model(&OpsActionLog{})
 	if operatorName != "" {
 		// Use safeLikePattern to escape special characters in LIKE queries
 		dbQuery = dbQuery.Where("operator_name LIKE ?", safeLikePattern(operatorName))
@@ -1489,7 +1717,7 @@ func (c *ServerConfig) handleGetOpsLogs(conn net.Conn, request *http.Request) {
 	dbQuery.Count(&total)
 
 	// Get logs with pagination
-	var logs []schema.OpsActionLog
+	var logs []OpsActionLog
 	offset := (page - 1) * pageSize
 	if err := dbQuery.Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&logs).Error; err != nil {
 		c.logError("Failed to get OPS logs: %v", err)
@@ -1568,12 +1796,14 @@ func (c *ServerConfig) handleGetOpsStats(conn net.Conn, request *http.Request) {
 		return
 	}
 
+	// 关键词: OPS user stats 计费(Token)视图, total_token_used 聚合
 	type UserStats struct {
 		UserID           uint   `json:"user_id"`
 		Username         string `json:"username"`
 		Active           bool   `json:"active"`
 		ApiKeysCreated   int64  `json:"api_keys_created"`
-		TotalTrafficUsed int64  `json:"total_traffic_used"`
+		TotalTrafficUsed int64  `json:"total_traffic_used"` // legacy 字节用量（仅统计展示，已不计费）
+		TotalTokenUsed   int64  `json:"total_token_used"`   // 计费 Token 加权用量（计费体系唯一口径）
 		LastActivity     string `json:"last_activity"`
 	}
 
@@ -1586,20 +1816,30 @@ func (c *ServerConfig) handleGetOpsStats(conn net.Conn, request *http.Request) {
 
 		// Count API keys created by this user
 		var keyCount int64
-		db.Model(&schema.AiApiKeys{}).Where("created_by_ops_id = ?", u.ID).Count(&keyCount)
+		db.Model(&AiApiKeys{}).Where("created_by_ops_id = ?", u.ID).Count(&keyCount)
 		totalApiKeys += keyCount
 
-		// Calculate total traffic used by keys created by this user
+		// Calculate total traffic used by keys created by this user (legacy 字节，仅展示)
 		var trafficSum struct {
 			Total int64
 		}
-		db.Model(&schema.AiApiKeys{}).
+		db.Model(&AiApiKeys{}).
 			Where("created_by_ops_id = ?", u.ID).
 			Select("COALESCE(SUM(traffic_used), 0) as total").
 			Scan(&trafficSum)
 
+		// Calculate total token (billing) used by keys created by this user
+		// 关键词: OPS user stats SUM(token_used) 计费 Token 聚合
+		var tokenSum struct {
+			Total int64
+		}
+		db.Model(&AiApiKeys{}).
+			Where("created_by_ops_id = ?", u.ID).
+			Select("COALESCE(SUM(token_used), 0) as total").
+			Scan(&tokenSum)
+
 		// Get last activity from logs
-		var lastLog schema.OpsActionLog
+		var lastLog OpsActionLog
 		lastActivity := ""
 		if err := db.Where("operator_id = ?", u.ID).Order("created_at DESC").First(&lastLog).Error; err == nil {
 			lastActivity = lastLog.CreatedAt.Format("2006-01-02 15:04:05")
@@ -1611,6 +1851,7 @@ func (c *ServerConfig) handleGetOpsStats(conn net.Conn, request *http.Request) {
 			Active:           u.Active,
 			ApiKeysCreated:   keyCount,
 			TotalTrafficUsed: trafficSum.Total,
+			TotalTokenUsed:   tokenSum.Total,
 			LastActivity:     lastActivity,
 		})
 	}

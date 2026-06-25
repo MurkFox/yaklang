@@ -297,6 +297,8 @@ func (f *FunctionBuilder) EmitLoop(body, exit *BasicBlock, cond Value) *Loop {
 	}
 	l := NewLoop(cond)
 	f.emit(l)
+	f.CurrentBlock.SetConditionInstID(l.GetId())
+	f.CurrentBlock.SetConditionFromValue(cond, "loop")
 	l.Body = body.GetId()
 	l.Exit = exit.GetId()
 	f.CurrentBlock.AddSucc(body)
@@ -311,6 +313,8 @@ func (f *FunctionBuilder) EmitSwitch(cond Value, defaultb *BasicBlock, label []S
 	}
 	sw := NewSwitch(cond, defaultb, label)
 	f.emit(sw)
+	f.CurrentBlock.SetConditionInstID(sw.GetId())
+	f.CurrentBlock.SetConditionFromValue(cond, "switch")
 	f.CurrentBlock.finish = true
 	return sw
 }
@@ -585,6 +589,10 @@ func (f *FunctionBuilder) EmitPhi(name string, vs Values) *Phi {
 		f.CurrentBlock.Phis = append(f.CurrentBlock.Phis, p.GetId())
 	})
 	for _, v := range vs {
+		// if _, ok := ToFunction(v); ok {
+		// 	continue
+		// }
+		// Point(p, v)
 		v.AddOccultation(p)
 	}
 	return p
@@ -647,13 +655,24 @@ func (f *FunctionBuilder) SwitchFreevalueInSideEffect(name string, se *SideEffec
 				if !ok || callSide == nil {
 					return
 				}
-				if bindId, ok := callSide.(*Call).Binding[name]; ok {
+				callInst, ok := ToCall(callSide)
+				if !ok || callInst == nil || callInst.Binding == nil {
+					return
+				}
+				if bindId, ok := callInst.Binding[name]; ok {
 					bind, ok := f.GetValueById(bindId)
 					if !ok || bind == nil {
 						return
 					}
-					bindVariableId = bind.GetLastVariable().GetCaptured().GetId()
-					_ = bindVariableId
+					lastVariable := bind.GetLastVariable()
+					if lastVariable == nil {
+						return
+					}
+					captured := lastVariable.GetCaptured()
+					if captured == nil {
+						return
+					}
+					bindVariableId = captured.GetId()
 				}
 			}
 		}

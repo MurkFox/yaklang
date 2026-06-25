@@ -2,13 +2,13 @@ package aihttp
 
 import (
 	"net/http"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+	"google.golang.org/protobuf/proto"
 )
 
 func (gw *AIAgentHTTPGateway) handleCreateSession(w http.ResponseWriter, r *http.Request) {
@@ -23,89 +23,98 @@ func (gw *AIAgentHTTPGateway) handleCreateSession(w http.ResponseWriter, r *http
 		runID = uuid.NewString()
 	}
 
-	if exist, ok := gw.runManager.Get(runID); ok {
-		writeJSON(w, http.StatusOK, CreateSessionResponse{
-			RunID:  exist.RunID,
-			Status: exist.Status,
-		})
-		return
-	}
-
-	setting, err := gw.GetSettingFromDB()
+	session, created, err := gw.ensureReusableSession(runID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "load setting failed: "+err.Error())
 		return
 	}
-	params := mergeParams(req.Params, setting)
 
-	session := gw.runManager.Create(runID, params)
-	if db := gw.getDB(); db != nil {
-		if _, err := yakit.EnsureAISessionMeta(db, runID); err != nil {
-			log.Warnf("ensure ai session meta failed for %s: %v", runID, err)
-		}
+	statusCode := http.StatusCreated
+	if !created {
+		statusCode = http.StatusOK
 	}
 
-	writeJSON(w, http.StatusCreated, CreateSessionResponse{
+	writeJSON(w, statusCode, CreateSessionResponse{
 		RunID:  session.RunID,
 		Status: session.Status,
 	})
 }
 
 func (gw *AIAgentHTTPGateway) handleRun(w http.ResponseWriter, r *http.Request) {
+	gw.handleStreamInput(w, r, true)
+}
+
+func (gw *AIAgentHTTPGateway) handleStreamInput(w http.ResponseWriter, r *http.Request, allowStart bool) {
 	runID := mux.Vars(r)["run_id"]
 	if runID == "" {
 		writeError(w, http.StatusBadRequest, "run_id is required")
 		return
 	}
 
-	session, ok := gw.runManager.Get(runID)
-	if !ok {
-		writeError(w, http.StatusNotFound, "run not found: "+runID)
-		return
-	}
-
-	if session.Status == RunStatusCompleted || session.Status == RunStatusFailed || session.Status == RunStatusCancelled {
-		writeError(w, http.StatusConflict, "run is not active, current status: "+string(session.Status))
-		return
-	}
-
-	var req PushEventRequest
-	if err := readJSON(r, &req); err != nil {
+	event, err := readAIInputEventRequest(r)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
 
-	if req.Params != nil {
+	startOnly := allowStart && event.GetIsStart() && !hasInputPayload(event)
+
+	if !startOnly && !hasInputPayload(event) {
+		writeError(w, http.StatusBadRequest, "input event is empty")
+		return
+	}
+
+	session, ok := gw.runManager.Get(runID)
+	if !ok {
+		if !allowStart {
+			writeError(w, http.StatusNotFound, "run not found: "+runID)
+			return
+		}
+		session, _, err = gw.ensureReusableSession(runID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "load setting failed: "+err.Error())
+			return
+		}
+	}
+
+	if allowStart {
 		setting, err := gw.GetSettingFromDB()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "load setting failed: "+err.Error())
 			return
 		}
-		session.Params = mergeParams(*req.Params, setting)
+		session.StartParams = mergeStartInputEvent(event, mergeStartParams(event.GetParams(), setting, runID), runID)
 	}
 
-	event := convertPushToInputEvent(req, runID)
-	if !hasInputPayload(event) {
-		writeError(w, http.StatusBadRequest, "input event is empty")
-		return
+	if allowStart && session.MarkStreamStarted() {
+		go gw.runGRPCStream(session)
 	}
 
-	if session.MarkStreamStarted() {
-		go gw.runGRPCStream(session, session.Params)
+	if !startOnly {
+		if allowStart && event.GetIsStart() {
+			writeProtoJSON(w, http.StatusOK, newResultOutputEvent("accepted"))
+			return
+		}
+		if event.GetIsStart() {
+			cloned := proto.Clone(event).(*ypb.AIInputEvent)
+			cloned.IsStart = false
+			event = cloned
+		}
+		session.PushInput(event)
 	}
 
-	session.PushInput(event)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"run_id": runID,
-		"status": "accepted",
-	})
+	writeProtoJSON(w, http.StatusOK, newResultOutputEvent("accepted"))
 }
 
 func (gw *AIAgentHTTPGateway) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	runID := mux.Vars(r)["run_id"]
 	if runID == "" {
 		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+
+	if _, err := readOptionalAIInputEventRequest(r); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
 
@@ -116,86 +125,136 @@ func (gw *AIAgentHTTPGateway) handleCancelRun(w http.ResponseWriter, r *http.Req
 	}
 
 	session.Cancel()
+	gw.runManager.Remove(runID)
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"run_id": runID,
-		"status": "cancelled",
-	})
+	writeProtoJSON(w, http.StatusOK, newResultOutputEvent(string(RunStatusCancelled)))
 }
 
-func mergeParams(req AIParams, defaults aiAgentChatSettingPayload) AIParams {
-	if req.UseDefaultAI || defaults.UseDefaultAIConfig {
-		req.UseDefaultAI = true
-		if req.AIService == "" {
-			req.AIService = defaults.AIService
+func (gw *AIAgentHTTPGateway) ensureReusableSession(runID string) (*RunSession, bool, error) {
+	if session, ok := gw.runManager.Get(runID); ok {
+		if session.ctx.Err() == nil {
+			return session, false, nil
 		}
-		if req.AIModelName == "" {
-			req.AIModelName = defaults.AIModelName
-		}
-		if req.ForgeName == "" {
-			req.ForgeName = defaults.ForgeName
-		}
-		if req.ReviewPolicy == "" {
-			req.ReviewPolicy = defaults.ReviewPolicy
-		}
-		if req.ReActMaxIteration == 0 {
-			req.ReActMaxIteration = defaults.ReActMaxIteration
-		}
-		if req.MaxIteration == 0 {
-			if defaults.ReActMaxIteration > 0 {
-				req.MaxIteration = int32(defaults.ReActMaxIteration)
+		gw.runManager.Remove(runID)
+	}
+
+	setting, err := gw.GetSettingFromDB()
+	if err != nil {
+		return nil, false, err
+	}
+
+	session, created := gw.runManager.GetOrCreate(runID, func() *RunSession {
+		return NewRunSession(gw.runManager.ctx, runID, &ypb.AIInputEvent{
+			Params: cloneStartParams(mergeStartParams(nil, setting, runID), runID),
+		})
+	})
+
+	if created {
+		if db := gw.getDB(); db != nil {
+			if _, err := yakit.EnsureAISessionMeta(db, runID); err != nil {
+				log.Warnf("ensure ai session meta failed for %s: %v", runID, err)
 			}
 		}
-		if !req.DisableToolUse {
-			req.DisableToolUse = defaults.DisableToolUse
-		}
-		if !req.EnableSystemFileSystemOperator {
-			req.EnableSystemFileSystemOperator = defaults.EnableSystemFileSystemOperator
-		}
-		if !req.DisallowRequireForUserPrompt {
-			req.DisallowRequireForUserPrompt = defaults.DisallowRequireForUserPrompt
-		}
-		if req.AIReviewRiskControlScore == 0 {
-			req.AIReviewRiskControlScore = defaults.AIReviewRiskControlScore
-		}
-		if req.AICallAutoRetry == 0 {
-			req.AICallAutoRetry = defaults.AICallAutoRetry
-		}
-		if req.AITransactionRetry == 0 {
-			req.AITransactionRetry = defaults.AITransactionRetry
-		}
-		if !req.EnableAISearchTool {
-			req.EnableAISearchTool = defaults.EnableAISearchTool
-		}
-		if !req.EnableAISearchInternet {
-			req.EnableAISearchInternet = defaults.EnableAISearchInternet
-		}
-		if !req.EnableQwenNoThinkMode {
-			req.EnableQwenNoThinkMode = defaults.EnableQwenNoThinkMode
-		}
-		if !req.AllowPlanUserInteract {
-			req.AllowPlanUserInteract = defaults.AllowPlanUserInteract
-		}
-		if req.PlanUserInteractMaxCount == 0 {
-			req.PlanUserInteractMaxCount = defaults.PlanUserInteractMaxCount
-		}
-		if req.TimelineItemLimit == 0 {
-			req.TimelineItemLimit = defaults.TimelineItemLimit
-		}
-		if req.TimelineContentSizeLimit == 0 {
-			req.TimelineContentSizeLimit = defaults.TimelineContentSizeLimit
-		}
-		if req.UserInteractLimit == 0 {
-			req.UserInteractLimit = defaults.UserInteractLimit
-		}
-		if req.TimelineSessionID == "" {
-			req.TimelineSessionID = defaults.TimelineSessionID
-		}
 	}
-	return req
+
+	return session, created, nil
 }
 
-func (gw *AIAgentHTTPGateway) runGRPCStream(session *RunSession, startParams AIParams) {
+func mergeStartParams(req *ypb.AIStartParams, defaults aiAgentChatSettingPayload, runID string) *ypb.AIStartParams {
+	params := cloneStartParams(req, runID)
+	if params.GetUseDefaultAIConfig() || defaults.UseDefaultAIConfig {
+		params.UseDefaultAIConfig = true
+		if params.GetAIService() == "" {
+			params.AIService = defaults.AIService
+		}
+		if params.GetAIModelName() == "" {
+			params.AIModelName = defaults.AIModelName
+		}
+		if params.GetForgeName() == "" {
+			params.ForgeName = defaults.ForgeName
+		}
+		if params.GetReviewPolicy() == "" {
+			params.ReviewPolicy = defaults.ReviewPolicy
+		}
+		if params.GetReActMaxIteration() == 0 {
+			params.ReActMaxIteration = defaults.ReActMaxIteration
+		}
+		if !params.GetDisableToolUse() {
+			params.DisableToolUse = defaults.DisableToolUse
+		}
+		if !params.GetEnableSystemFileSystemOperator() {
+			params.EnableSystemFileSystemOperator = defaults.EnableSystemFileSystemOperator
+		}
+		if !params.GetDisallowRequireForUserPrompt() {
+			params.DisallowRequireForUserPrompt = defaults.DisallowRequireForUserPrompt
+		}
+		if params.GetAIReviewRiskControlScore() == 0 {
+			params.AIReviewRiskControlScore = defaults.AIReviewRiskControlScore
+		}
+		if params.GetAICallAutoRetry() == 0 {
+			params.AICallAutoRetry = defaults.AICallAutoRetry
+		}
+		if params.GetAITransactionRetry() == 0 {
+			params.AITransactionRetry = defaults.AITransactionRetry
+		}
+		if !params.GetEnableAISearchTool() {
+			params.EnableAISearchTool = defaults.EnableAISearchTool
+		}
+		if !params.GetEnableAISearchInternet() {
+			params.EnableAISearchInternet = defaults.EnableAISearchInternet
+		}
+		if !params.GetEnableQwenNoThinkMode() {
+			params.EnableQwenNoThinkMode = defaults.EnableQwenNoThinkMode
+		}
+		if !params.GetAllowPlanUserInteract() {
+			params.AllowPlanUserInteract = defaults.AllowPlanUserInteract
+		}
+		if params.GetPlanUserInteractMaxCount() == 0 {
+			params.PlanUserInteractMaxCount = defaults.PlanUserInteractMaxCount
+		}
+		if params.GetTimelineItemLimit() == 0 {
+			params.TimelineItemLimit = defaults.TimelineItemLimit
+		}
+		if params.GetTimelineContentSizeLimit() == 0 && defaults.TimelineContentSizeLimit > 0 {
+			params.TimelineContentSizeLimit = defaults.TimelineContentSizeLimit * 1024
+		}
+		if params.GetUserInteractLimit() == 0 {
+			params.UserInteractLimit = defaults.UserInteractLimit
+		}
+		if params.GetTimelineSessionID() == runID && defaults.TimelineSessionID != "" {
+			params.TimelineSessionID = defaults.TimelineSessionID
+		}
+	}
+	return params
+}
+
+func cloneStartParams(params *ypb.AIStartParams, runID string) *ypb.AIStartParams {
+	if params == nil {
+		return &ypb.AIStartParams{TimelineSessionID: runID}
+	}
+	cloned := proto.Clone(params).(*ypb.AIStartParams)
+	if cloned.GetTimelineSessionID() == "" {
+		cloned.TimelineSessionID = runID
+	}
+	return cloned
+}
+
+func cloneStartInputEvent(event *ypb.AIInputEvent, runID string) *ypb.AIInputEvent {
+	if event == nil {
+		return &ypb.AIInputEvent{Params: cloneStartParams(nil, runID)}
+	}
+	cloned := proto.Clone(event).(*ypb.AIInputEvent)
+	cloned.Params = cloneStartParams(cloned.GetParams(), runID)
+	return cloned
+}
+
+func mergeStartInputEvent(event *ypb.AIInputEvent, params *ypb.AIStartParams, runID string) *ypb.AIInputEvent {
+	cloned := cloneStartInputEvent(event, runID)
+	cloned.Params = cloneStartParams(params, runID)
+	return cloned
+}
+
+func (gw *AIAgentHTTPGateway) runGRPCStream(session *RunSession) {
 	session.Status = RunStatusRunning
 
 	stream, err := gw.yakClient.StartAIReAct(session.ctx)
@@ -205,12 +264,8 @@ func (gw *AIAgentHTTPGateway) runGRPCStream(session *RunSession, startParams AIP
 		return
 	}
 
-	grpcStartParams := ConvertAIParamsToYPB(startParams, session.RunID)
-	startMsg := &ypb.AIInputEvent{
-		IsStart:          true,
-		Params:           grpcStartParams,
-		AttachedFilePath: startParams.AttachedFiles,
-	}
+	startMsg := cloneStartInputEvent(session.StartParams, session.RunID)
+	startMsg.IsStart = true
 	if err := stream.Send(startMsg); err != nil {
 		log.Errorf("send start message failed for run %s: %v", session.RunID, err)
 		session.Complete(err)
@@ -251,78 +306,6 @@ func (gw *AIAgentHTTPGateway) runGRPCStream(session *RunSession, startParams AIP
 			return
 		}
 
-		event := convertOutputToRunEvent(resp)
-
-		session.AddEvent(event)
+		session.AddEvent(normalizeOutputEvent(resp))
 	}
-}
-
-func ConvertAIParamsToYPB(p AIParams, runID string) *ypb.AIStartParams {
-	params := &ypb.AIStartParams{
-		EnableSystemFileSystemOperator: p.EnableSystemFileSystemOperator,
-		UseDefaultAIConfig:             p.UseDefaultAI,
-		DisallowRequireForUserPrompt:   p.DisallowRequireForUserPrompt,
-		ReviewPolicy:                   p.ReviewPolicy,
-		AIReviewRiskControlScore:       p.AIReviewRiskControlScore,
-		DisableToolUse:                 p.DisableToolUse,
-		AICallAutoRetry:                p.AICallAutoRetry,
-		AITransactionRetry:             p.AITransactionRetry,
-		EnableAISearchTool:             p.EnableAISearchTool,
-		EnableAISearchInternet:         p.EnableAISearchInternet,
-		EnableQwenNoThinkMode:          p.EnableQwenNoThinkMode,
-		AllowPlanUserInteract:          p.AllowPlanUserInteract,
-		PlanUserInteractMaxCount:       p.PlanUserInteractMaxCount,
-		AIService:                      p.AIService,
-		AIModelName:                    p.AIModelName,
-		TimelineItemLimit:              p.TimelineItemLimit,
-		UserInteractLimit:              p.UserInteractLimit,
-		TimelineSessionID:              runID,
-	}
-
-	if p.ForgeName != "" {
-		params.ForgeName = p.ForgeName
-	}
-	if p.ReActMaxIteration > 0 {
-		params.ReActMaxIteration = p.ReActMaxIteration
-	} else if p.MaxIteration > 0 {
-		params.ReActMaxIteration = int64(p.MaxIteration)
-	}
-	if p.TimelineContentSizeLimit > 0 {
-		params.TimelineContentSizeLimit = p.TimelineContentSizeLimit * 1024
-	}
-	if p.TimelineSessionID != "" {
-		params.TimelineSessionID = p.TimelineSessionID
-	}
-	return params
-}
-
-func convertOutputToRunEvent(e *ypb.AIOutputEvent) RunEvent {
-	event := RunEvent{
-		ID:            uuid.New().String(),
-		Type:          e.Type,
-		CoordinatorID: e.CoordinatorId,
-		AIModelName:   e.AIModelName,
-		NodeID:        string(e.NodeId),
-		IsSystem:      e.IsSystem,
-		IsStream:      e.IsStream,
-		IsReason:      e.IsReason,
-		Timestamp:     e.Timestamp,
-		TaskIndex:     e.TaskIndex,
-		EventUUID:     e.EventUUID,
-		TaskUUID:      e.TaskUUID,
-	}
-
-	if len(e.StreamDelta) > 0 {
-		event.StreamDelta = string(e.StreamDelta)
-	}
-
-	if len(e.Content) > 0 {
-		event.Content = string(e.Content)
-	}
-
-	if event.Timestamp <= 0 {
-		event.Timestamp = time.Now().Unix()
-	}
-
-	return event
 }

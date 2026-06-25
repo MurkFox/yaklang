@@ -193,6 +193,13 @@ jobs:
         run: |
           go build -o "$RUNNER_TEMP/yak" common/yak/cmd/yak.go
 
+      - name: Guard yak must not import aibalance
+        env:
+          GOCACHE: ${{ env.GOCACHE }}
+          GOMODCACHE: ${{ env.GOMODCACHE }}
+        run: |
+          bash ./scripts/ci/check-yak-no-aibalance.sh
+
       - name: Package yak artifact
         run: |
           ARTIFACT_COPY_LIST="$RUNNER_TEMP/yak|yak" \
@@ -273,11 +280,11 @@ jobs:
         env:
           GOCACHE: ${{ env.GOCACHE }}
           GOMODCACHE: ${{ env.GOMODCACHE }}
+          COMPILE_WORKERS: "2"
+          GO_TEST_P: "1"
         run: |
           export TEST_BIN_DIR="${{ runner.temp }}/test_binaries"
           export TEST_CONFIG="${{ runner.temp }}/prepare_yakgrpc_test_config.json"
-          export COMPILE_WORKERS=2
-          export GO_TEST_P=1
           ./scripts/ci/test-compile.sh
 
       - name: Package shared suite
@@ -346,11 +353,11 @@ jobs:
         env:
           GOCACHE: ${{ env.GOCACHE }}
           GOMODCACHE: ${{ env.GOMODCACHE }}
+          COMPILE_WORKERS: "1"
+          GO_TEST_P: "1"
         run: |
           export TEST_BIN_DIR="${{ runner.temp }}/test_binaries"
           export TEST_CONFIG="${{ runner.temp }}/prepare_coreplugin_test_config.json"
-          export COMPILE_WORKERS=1
-          export GO_TEST_P=1
           ./scripts/ci/test-compile.sh
 
       - name: Package shared suite
@@ -374,6 +381,7 @@ jobs:
     needs: prepare-yak
     if: needs.prepare-yak.result == 'success'
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -397,19 +405,10 @@ jobs:
           - name: "Test MustPass - full yak scripts"
             test_configs: |
               [
-                {"package": "./common/yak/yaktest/mustpass", "timeout": "5m"}
+                {"package": "./common/yak/yaktest/mustpass", "timeout": "5m"},
+                {"package": "./common/crep/...", "timeout": "5m"}
               ]
 
-          - name: "Test SFWeb / Integration SyntaxFlow / SFDB / SFVM / SFReport"
-            sync_rule: "1"
-            test_configs: |
-              [
-                {"package": "./common/sfweb/...", "timeout": "4m"},
-                {"package": "./common/syntaxflow/tests", "timeout": "20s"},
-                {"package": "./common/syntaxflow/sfdb/...", "timeout": "20s"},
-                {"package": "./common/syntaxflow/sfvm/...", "timeout": "20s"},
-                {"package": "./common/yak/ssaapi/sfreport/...", "timeout": "1m"}
-              ]
           - name: "Test Utils Infra / Parser / Net in 2min USE gRPC"
             test_configs: |
               [
@@ -418,7 +417,7 @@ jobs:
                 {"package": "./common/markdownextractor", "timeout": "20s"},
                 {"package": "./common/jsonpath", "timeout": "20s"},
                 {"package": "./common/domainextractor", "timeout": "20s"},
-                {"package": "./common/cve", "timeout": "20s", "run": "TestQueryCVEWithFixName"},
+                {"package": "./common/cve", "timeout": "20s", "run": "^TestQueryCVE.*$"},
                 {"package": "./common/sca/...", "timeout": "20s"},
                 {"package": "./common/openapi/...", "timeout": "30s"},
                 {"package": "./common/pcapx/pcaputil/...", "timeout": "15s"},
@@ -447,6 +446,7 @@ jobs:
                 {"package": "./common/yak/cartesian", "timeout": "20s"},
                 {"package": "./common/utils/omap/...", "timeout": "30s", "race": true},
                 {"package": "./common/utils", "timeout": "1m"},
+                {"package": "./common/utils/dbcache", "timeout": "1m"},
                 {"package": "./common/utils/imageutils/...", "timeout": "20s"},
                 {"package": "./common/utils/xml2", "timeout": "10s"},
                 {"package": "./common/utils/tlsutils/...", "timeout": "20s"},
@@ -459,6 +459,8 @@ jobs:
                 {"package": "./common/utils/memedit/.", "timeout": "15s"},
                 {"package": "./common/yak/yakurl/...", "timeout": "15s"},
                 {"package": "./common/utils/ziputil/...", "timeout": "20s"},
+                {"package": "./common/utils/zipx/...", "timeout": "30s"},
+                {"package": "./common/thirdparty_bin", "timeout": "1m", "skip": "^(TestFetchAllMD5|TestSingleURL|TestInstallMemoryUsage|TestMemoryUsageBaseline)$"},
                 {"package": "./common/utils/yakgit/..."},
                 {"package": "./common/utils/suspect"},
                 {"package": "./common/yak/antlr4nasl/tests/...", "timeout": "1m"},
@@ -474,51 +476,66 @@ jobs:
                 {"package": "./common/utils/bizhelper/...", "timeout": "20s"},
                 {"package": "./common/utils/cli", "timeout": "1m"},
                 {"package": "./common/mcp/yakcliconvert", "timeout": "1m"},
+                {"package": "./common/mcp", "timeout": "2m", "run": "^TestLegacy.*$"},
+                {"package": "./common/mcp/...", "timeout": "2m", "skip": "^TestLegacy.*$", "exclude_packages": ["./common/mcp"]},
                 {"package": "./common/yak/yakdoc/...", "timeout": "3m"},
                 {"package": "./common/utils/yakgit/yakdiff/...", "timeout": "20s"},
                 {"package": "./common/yak/ssaapi/ssaconfig", "timeout": "20s"}
               ]
 
-          - name: "Test SSA Frontend Java / JS(TS|ES)"
+          - name: "Test SSA Frontend Java / JS(TS|ES) / Yak / Python / Golang / C"
+            compile_workers: "3"
+            go_test_p: "1"
             test_configs: |
               [
-                {"package": "./common/yak/java/...", "timeout": "5m"},
-                {"package": "./common/yak/ssaapi/test/java/...", "timeout": "3m"},
+                {"package": "./common/yak/java/...", "timeout": "8m"},
+                {"package": "./common/yak/ssaapi/test/java/...", "timeout": "4m"},
                 {"package": "./common/yak/typescript/...", "timeout": "2m"},
-                {"package": "./common/yak/ssaapi/test/javascript/...", "timeout": "1m"}
-              ]
-
-          - name: "Test SSA Frontend Yak / PHP / Python / Golang / C / SSAAPI Other"
-            test_configs: |
-              [
+                {"package": "./common/yak/ssaapi/test/javascript/...", "timeout": "1m"},
                 {"package": "./common/yak/yak2ssa/test/...", "timeout": "20s"},
                 {"package": "./common/yak/ssaapi/test/yak/...", "timeout": "1m"},
                 {"package": "./common/yak/antlr4yak/lsp/...", "timeout": "20s"},
-                {"package": "./common/yak/php/...", "timeout": "2m"},
-                {"package": "./common/yak/ssaapi/test/php/...", "timeout": "2m"},
-                {"package": "./common/yak/python/...", "timeout": "2m"},
-                {"package": "./common/yak/ssaapi/test/python/...", "timeout": "1m"},
-                {"package": "./common/yak/go2ssa/...", "timeout": "30s"},
-                {"package": "./common/yak/antlr4go/...", "timeout": "30s"},
-                {"package": "./common/yak/ssaapi/test/golang/...", "timeout": "2m"},
+                {"package": "./common/yak/python/...", "timeout": "4m"},
+                {"package": "./common/yak/ssaapi/test/python/...", "timeout": "2m"},
+                {"package": "./common/yak/go2ssa/...", "timeout": "3m"},
+                {"package": "./common/yak/antlr4go/...", "timeout": "2m"},
+                {"package": "./common/yak/ssaapi/test/golang/...", "timeout": "3m"},
                 {"package": "./common/yak/c2ssa/...", "timeout": "30s"},
                 {"package": "./common/yak/antlr4c/...", "timeout": "30s"},
-                {"package": "./common/yak/ssaapi/test/c/...", "timeout": "2m"},
-                {"package": "./common/yak/ssaapi/test/...", "timeout": "2m", "exclude_packages": ["./common/yak/ssaapi/test/yak/...", "./common/yak/ssaapi/test/java/...", "./common/yak/ssaapi/test/javascript/...", "./common/yak/ssaapi/test/php/...", "./common/yak/ssaapi/test/python/...", "./common/yak/ssaapi/test/golang/...", "./common/yak/ssaapi/test/c/...", "./common/yak/ssaapi/test/syntaxflow/...", "./common/yak/ssaapi/test/ssatest/..."]}
+                {"package": "./common/yak/ssaapi/test/c/...", "timeout": "2m"}
               ]
 
-          - name: "Test StaticAnalyze / Builtin SyntaxFlow Rule / SSA / SSA-API / SF Scan"
+          - name: "Test SSA / SSAAPI Core / SyntaxFlow / StaticAnalyze / SFDB / SFVM"
+            sync_rule: "1"
+            compile_workers: "3"
+            go_test_p: "1"
             test_configs: |
               [
-                {"package": "./common/yak/static_analyzer/test/...", "timeout": "20s"},
-                {"package": "./common/syntaxflow/sfbuildin/...", "timeout": "5m"},
-                {"package": "./common/yak/ssaapi/test/syntaxflow/...", "timeout": "1m"},
-                {"package": "./common/syntaxflow/sfanalysis/...", "timeout": "20s"},
                 {"package": "./common/yak/ssa/...", "timeout": "20s"},
                 {"package": "./common/yak/ssaapi", "timeout": "1m"},
                 {"package": "./common/yak/ssaapi/ssareducer", "timeout": "1m"},
                 {"package": "./common/yak/ssaapi/test/ssatest/...", "timeout": "1m"},
+                {"package": "./common/yak/ssaapi/test/...", "timeout": "2m", "exclude_packages": ["./common/yak/ssaapi/test/yak/...", "./common/yak/ssaapi/test/java/...", "./common/yak/ssaapi/test/javascript/...", "./common/yak/ssaapi/test/php/...", "./common/yak/ssaapi/test/python/...", "./common/yak/ssaapi/test/golang/...", "./common/yak/ssaapi/test/c/...", "./common/yak/ssaapi/test/syntaxflow/...", "./common/yak/ssaapi/test/ssatest/..."]},
+                {"package": "./common/syntaxflow/tests", "timeout": "20s"},
+                {"package": "./common/syntaxflow/sfdb/...", "timeout": "20s"},
+                {"package": "./common/syntaxflow/sfvm/...", "timeout": "20s"},
+                {"package": "./common/syntaxflow/sfbuildin/...", "timeout": "5m"},
+                {"package": "./common/yak/ssaapi/test/syntaxflow/...", "timeout": "1m"},
+                {"package": "./common/syntaxflow/sfanalysis/...", "timeout": "20s"},
+                {"package": "./common/yak/static_analyzer/test/...", "timeout": "20s"},
                 {"package": "./common/yak/syntaxflow_scan/...", "timeout": "1m"}
+              ]
+
+          - name: "Test SSA PHP / SSAAPI PHP / SFWeb / SFReport"
+            sync_rule: "1"
+            compile_workers: "3"
+            go_test_p: "1"
+            test_configs: |
+              [
+                {"package": "./common/yak/php/...", "timeout": "5m"},
+                {"package": "./common/yak/ssaapi/test/php/...", "timeout": "3m"},
+                {"package": "./common/sfweb/...", "timeout": "4m"},
+                {"package": "./common/yak/ssaapi/sfreport/...", "timeout": "1m"}
               ]
 
           - name: "Test AI Aid / React"
@@ -544,13 +561,14 @@ jobs:
                 {"package": "./common/ai/rag", "timeout": "1m", "run": "^TestMUSTPASS.*$", "parallel": 1},
                 {"package": "./common/ai/rag/plugins_rag/...", "timeout": "1m", "run": "^TestMUSTPASS.*$", "parallel": 1},
                 {"package": "./common/ai/rag/ragtests/...", "timeout": "1m", "run": "^TestMUSTPASS.*$"},
-                {"package": "./common/ai/tests/...", "timeout": "60s", "parallel": 1},
+                {"package": "./common/ai/tests/...", "timeout": "2m", "parallel": 1},
                 {"package": "./common/ai/aispec/...", "timeout": "60s", "parallel": 1},
                 {"package": "./common/aireducer/...", "timeout": "60s", "parallel": 1},
                 {"package": "./common/aiforge/aibp", "timeout": "2m30s", "parallel": 1, "run": "^(TestBuildForgeFromYak|TestNewForgeExecutor)$"},
                 {"package": "./common/aiforge", "timeout": "3m", "parallel": 1},
-                {"package": "./common/aibalance/...", "timeout": "30s", "parallel": 1},
-                {"package": "./common/yakgrpc/aihttp/tests/...", "timeout": "1m"}
+                {"package": "./common/aibalance/...", "timeout": "2m", "parallel": 1},
+                {"package": "./common/yakgrpc/aihttp/tests/...", "timeout": "1m"},
+                {"package": "./common/yakgrpc/airaghttp/...", "timeout": "2m", "parallel": 1}
               ]
     steps:
       - name: Checkout
@@ -604,11 +622,11 @@ jobs:
         env:
           GOCACHE: ${{ env.GOCACHE }}
           GOMODCACHE: ${{ env.GOMODCACHE }}
+          COMPILE_WORKERS: ${{ matrix.compile_workers || '' }}
+          GO_TEST_P: ${{ matrix.go_test_p || '' }}
         run: |
           export TEST_BIN_DIR="${{ runner.temp }}/test_binaries"
           export TEST_CONFIG="${{ runner.temp }}/test_config.json"
-          export COMPILE_WORKERS=2
-          export GO_TEST_P=1
           ./scripts/ci/test-compile.sh
 
       - name: ${{ matrix.name }}
@@ -642,6 +660,7 @@ jobs:
     needs: [prepare-yak, prepare-yakgrpc]
     if: needs.prepare-yak.result == 'success' && needs.prepare-yakgrpc.result == 'success'
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -651,7 +670,7 @@ jobs:
             artifact_file: "essential-tests-yakgrpc.tar.gz"
             test_configs: |
               [
-                {"package": "./common/yakgrpc/yakit", "timeout": "1m", "run": "^TestMUSTPASS.*$"},
+                {"package": "./common/yakgrpc/yakit", "timeout": "1m", "run": "^TestMUSTPASS.*$", "skip": "^TestMUSTPASS_(UpdateMCPServer|SyncAndCache|McpServerEndpoint|MCPServerToolFullName|MigrateMCPServer|MigrateMCPClientBridge|DeleteMCPServer|MCPServerUserJourney|GetMCPServerToolConfigByFullName).*$"},
                 {"package": "./common/yakgrpc/...", "timeout": "5m", "run": "^TestGRPCMUSTPASS_MITM($|_.*|Filter.*)$"}
               ]
 
@@ -717,7 +736,9 @@ jobs:
             artifact_file: "essential-tests-yakgrpc.tar.gz"
             test_configs: |
               [
-                {"package": "./common/yakgrpc/...", "timeout": "10m", "skip": "^(TestGRPCMUSTPASS_PluginTrace.*|TestGRPCMUSTPASS_AnalyzeHTTPFlow.*|TestGRPCMUSTPASS_Fingerprint.*|TestGRPCMUSTPASS_HTTP_.*|TestGRPCMUSTPASS_HTTPFUZZER.*|TestGRPCMUSTPASS_HTTPFuzzer.*|TestAITaskWith.*|TestGRPCMUSTPASS_MITM.*|TestGRPCMUSTPASS_MITMV2.*|TestGRPCMUSTPASS_LANGUAGE.*|TestGRPCMUSTPASS_COMMON.*|TestLARGEGRPCMUSTPASS.*|TestGRPCMUSTPASS_SyntaxFlow.*|TestGRPCMUSTPASS_SSA.*|TestGRPCMUSTPASS_FuzzerConfig|TestGRPCMUSTPASS_MaxSize|TestPBTest|TestLargePayload|TestGRPCMUSTPASS_AIForge.*|TestGRPCMUSTPASS_RequestYakURL.*)$"}
+                {"package": "./common/yakgrpc/yakit", "timeout": "2m", "run": "^TestMUSTPASS_(UpdateMCPServer|SyncAndCache|McpServerEndpoint|MCPServerToolFullName|MigrateMCPServer|MigrateMCPClientBridge|DeleteMCPServer|MCPServerUserJourney|GetMCPServerToolConfigByFullName).*$"},
+                {"package": "./common/yakgrpc/...", "timeout": "4m", "run": "^TestGRPCMUSTPASS_StartMcpServer_.*$"},
+                {"package": "./common/yakgrpc/...", "timeout": "10m", "skip": "^(TestGRPCMUSTPASS_PluginTrace.*|TestGRPCMUSTPASS_AnalyzeHTTPFlow.*|TestGRPCMUSTPASS_Fingerprint.*|TestGRPCMUSTPASS_HTTP_.*|TestGRPCMUSTPASS_HTTPFUZZER.*|TestGRPCMUSTPASS_HTTPFuzzer.*|TestAITaskWith.*|TestGRPCMUSTPASS_MITM.*|TestGRPCMUSTPASS_MITMV2.*|TestGRPCMUSTPASS_LANGUAGE.*|TestGRPCMUSTPASS_COMMON.*|TestLARGEGRPCMUSTPASS.*|TestGRPCMUSTPASS_SyntaxFlow.*|TestGRPCMUSTPASS_SSA.*|TestGRPCMUSTPASS_FuzzerConfig|TestGRPCMUSTPASS_MaxSize|TestPBTest|TestLargePayload|TestGRPCMUSTPASS_AIForge.*|TestGRPCMUSTPASS_RequestYakURL.*|TestGRPCMUSTPASS_StartMcpServer_.*)$"}
               ]
     steps:
       - name: Checkout
@@ -821,6 +842,14 @@ jobs:
             test_configs: |
               [
                 {"package": "./common/coreplugin", "timeout": "6m", "run": "^(TestGRPCMUSTPASS_XSS.*|TestGRPCMUSTPASS_Shiro.*|TestGRPCMUSTPASS_SSRF.*|TestGRPCMUSTPASS_SSTI.*|TestGRPCMUSTPASS_Smuggle.*|TestGRPCMUSTPASS_Pipeline_Negative_Chunked.*|TestGRPCMUSTPASS_CSRF.*|TestGRPCMUSTPASS_OPEN_REDIRECT.*|TestGRPCMUSTPASS_SwaggerJson.*)$"}
+              ]
+
+          - name: "Test Coreplugin Other"
+            artifact_name: "essential-tests-coreplugin"
+            artifact_file: "essential-tests-coreplugin.tar.gz"
+            test_configs: |
+              [
+                {"package": "./common/coreplugin", "timeout": "6m", "skip": "^(TestAnalyzeMustPASSCorePlugin|TestAnalyzeMustPASSCorePlugin_Debug|TestGRPCMUSTPASS_MITM|TestGRPCMUSTPASS_Fastjson|TestGRPCMUSTPASS_SQL.*|TestGRPCMUSTPASS_XSS.*|TestGRPCMUSTPASS_Shiro.*|TestGRPCMUSTPASS_SSRF.*|TestGRPCMUSTPASS_SSTI.*|TestGRPCMUSTPASS_Smuggle.*|TestGRPCMUSTPASS_Pipeline_Negative_Chunked.*|TestGRPCMUSTPASS_CSRF.*|TestGRPCMUSTPASS_OPEN_REDIRECT.*|TestGRPCMUSTPASS_SwaggerJson.*|TestDEBUG_MITM|TestFastjson)$"}
               ]
     steps:
       - name: Checkout

@@ -124,6 +124,7 @@ func init() {
 				loopinfra.WithActionSuffix("code"),
 				loopinfra.WithAITagConfig("GEN_CODE", "yak_code", "yaklang-code", "code/yaklang"),
 				loopinfra.WithFileExtension(".yak"),
+				loopinfra.WithExitWhenSyntaxClean(true),
 				loopinfra.WithFileChanged(func(content string, op *reactloops.LoopActionHandlerOperator) (string, bool) {
 					return checkCodeAndFormatErrors(content)
 				}),
@@ -141,31 +142,39 @@ func init() {
 				reactloops.WithReflectionOutputExample(outputExample),
 				reactloops.WithReactiveDataBuilder(func(loop *reactloops.ReActLoop, feedbacker *bytes.Buffer, nonce string) (string, error) {
 					yakCode := loop.Get("full_code")
-					codeWithLine := utils.PrefixLinesWithLineNumbers(yakCode)
+					lineBase := loop.GetInt(loopinfra.LoopVarCodeLineBase)
+					codeWithLine := utils.PrefixLinesWithLineNumbersFrom(lineBase+1, yakCode)
+					editorFilePath := strings.TrimSpace(loop.Get("editor_file_path"))
+					hasCode := strings.TrimSpace(yakCode) != ""
 
 					feedbacks := feedbacker.String()
 					feedbacks = strings.TrimSpace(feedbacks)
 					renderMap := map[string]any{
-						"Code":                      yakCode,
-						"CurrentCodeWithLineNumber": codeWithLine,
-						"Nonce":                     nonce,
-						"FeedbackMessages":          feedbacks,
+						"Code":                        yakCode,
+						"CurrentCodeWithLineNumber":   codeWithLine,
+						"WorkspacePath":               loop.Get("workspace_path"),
+						"EditorFilePath":              editorFilePath,
+						"EditorFilePathWithoutCode":   editorFilePath != "" && !hasCode,
+						"IsCreateMode":                editorFilePath == "",
+						"Nonce":                       nonce,
+						"FeedbackMessages":            feedbacks,
 					}
 					return utils.RenderTemplate(reactiveData, renderMap)
 				}),
-				// queryDocumentAction(r, docSearcher), // DEPRECATED: 已被 grepYaklangSamplesAction 替代
 				grepYaklangSamplesAction(r, docSearcher),                // 快速 grep 代码样例（精确文本搜索）
 				semanticSearchYaklangSamplesAction(r, docSearcherByRag), // 语义搜索 Yaklang 代码样例（基于向量相似度）
 			}
+			preset = append(preset, yakdocActions(r)...)
 			// 添加工厂生成的 actions (write_code, modify_code, insert_code, delete_code)
 			preset = append(preset, modSuite.GetActions()...)
+			preset = append(preset, withYaklangDeferredEditorSync())
 			preset = append(preset, opts...)
 			return reactloops.NewReActLoop(schema.AI_REACT_LOOP_NAME_WRITE_YAKLANG, r, preset...)
 		},
 		// Register metadata for better AI understanding
 		reactloops.WithLoopDescription("Enter focused mode for Yaklang code generation and modification with access to code samples and syntax checking"),
 		reactloops.WithLoopDescriptionZh("Yaklang 代码生成模式：用于编写或修改 Yaklang 代码，支持样例检索与语法检查。"),
-		reactloops.WithLoopUsagePrompt("Use when user requests to write, modify, or debug Yaklang code. Provides specialized tools: grep_yaklang_samples, write_code, modify_code, insert_code, delete_code with real-time syntax validation"),
+		reactloops.WithLoopUsagePrompt("Use when user requests to write, modify, or debug Yaklang code. Provides specialized tools: grep_yaklang_samples, semantic_search_yaklang_samples, yakdoc_search, yakdoc_get_all_library_names, yakdoc_library_details, yakdoc_function_details, yakdoc_variable_details, write_code, modify_code, insert_code, delete_code with real-time syntax validation"),
 		reactloops.WithLoopOutputExample(`
 * When user requests to write Yaklang code:
   {"@action": "write_yaklang_code", "human_readable_thought": "I need to write Yaklang code with proper syntax and access to code examples"}

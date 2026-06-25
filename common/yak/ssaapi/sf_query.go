@@ -19,11 +19,15 @@ import (
 type SyntaxFlowQueryInstance interface {
 	SyntaxFlowWithError(i string, opts ...QueryOption) (*SyntaxFlowResult, error)
 	SyntaxFlowRule(rule *schema.SyntaxFlowRule, opts ...QueryOption) (*SyntaxFlowResult, error)
+	GetLanguage() ssaconfig.Language
+	IsIncrementalCompile() bool
+	IsBaseProgram() bool
+	GetBaseProgramName() string
+	Recompile(inputOpt ...ssaconfig.Option) error
 }
 
 var _ SyntaxFlowQueryInstance = (*Program)(nil)
 var _ SyntaxFlowQueryInstance = (*ProgramOverLay)(nil)
-var _ SyntaxFlowQueryInstance = (Programs)(nil)
 
 var DefaultInputVar = "input"
 
@@ -289,6 +293,18 @@ func QueryWithRuleDiagnosticsRecorder(recorder ...*diagnostics.Recorder) QueryOp
 	}
 }
 
+// QueryWithTaskID 为 SyntaxFlow 查询绑定扫描任务 ID（导出名为 syntaxflow.withExecTaskID）
+// 参数:
+//   - taskID: 关联的扫描任务 ID
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withExecTaskID("task-uuid")
+// println(opt)
+// ```
 func QueryWithTaskID(taskID string) QueryOption {
 	return func(c *queryConfig) {
 		c.taskID = taskID
@@ -337,6 +353,18 @@ func QueryWithInitInputValues(value sfvm.Values) QueryOption {
 	}
 }
 
+// QueryWithContext 为 SyntaxFlow 查询设置上下文（导出名为 syntaxflow.withContext）
+// 参数:
+//   - ctx: 上下文，用于控制查询的取消与超时
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withContext(context.Background())
+// println(opt)
+// ```
 func QueryWithContext(ctx context.Context) QueryOption {
 	return func(c *queryConfig) {
 		c.ctx = ctx
@@ -344,6 +372,18 @@ func QueryWithContext(ctx context.Context) QueryOption {
 	}
 }
 
+// QueryWithProcessCallback 为 SyntaxFlow 查询设置进度回调（导出名为 syntaxflow.withProcess）
+// 参数:
+//   - cb: 进度回调函数，参数为 (progress 浮点进度, message 进度消息)
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withProcess(func(progress, message) { println(message) })
+// println(opt)
+// ```
 func QueryWithProcessCallback(cb func(float64, string)) QueryOption {
 	return func(c *queryConfig) {
 		c.SetSyntaxFlowProcessCallback(cb)
@@ -362,6 +402,18 @@ func QueryWithFailFast(b ...bool) QueryOption {
 	}
 }
 
+// QueryWithUseCache 设置 SyntaxFlow 查询是否使用缓存（导出名为 syntaxflow.withCache）
+// 参数:
+//   - b: 是否使用缓存，缺省为 true
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withCache(true)
+// println(opt)
+// ```
 func QueryWithUseCache(b ...bool) QueryOption {
 	return func(c *queryConfig) {
 		if len(b) > 0 {
@@ -372,6 +424,18 @@ func QueryWithUseCache(b ...bool) QueryOption {
 	}
 }
 
+// QueryWithEnableDebug 设置 SyntaxFlow 查询是否开启调试输出（导出名为 syntaxflow.withExecDebug）
+// 参数:
+//   - b: 是否开启调试，缺省为 true
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withExecDebug(true)
+// println(opt)
+// ```
 func QueryWithEnableDebug(b ...bool) QueryOption {
 	return func(c *queryConfig) {
 		c.opts = append(c.opts, sfvm.WithEnableDebug(b...))

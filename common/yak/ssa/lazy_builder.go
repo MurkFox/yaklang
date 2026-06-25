@@ -64,6 +64,7 @@ func (l *LazyBuilder) Build() {
 
 	defer func() {
 		if r := recover(); r != nil {
+			log.Errorf("lazy builder panic: name=%s panic=%v", l._lazybuild_name, r)
 			utils.PrintCurrentGoroutineRuntimeStack()
 		}
 	}()
@@ -135,7 +136,7 @@ func (p *Program) LazyBuild() {
 	for _, key := range p.Blueprint.Keys() {
 		blueprint, ok := p.Blueprint.Get(key)
 		_ = ok
-		blueprint.Build()
+		p.runLazyBuilder(blueprint.LazyBuilder, blueprint.Range)
 	}
 	visited := make(map[*Function]struct{})
 	var stack []*Function
@@ -158,7 +159,7 @@ func (p *Program) LazyBuild() {
 			continue
 		}
 		visited[fun] = struct{}{}
-		fun.Build()
+		p.runLazyBuilder(fun.LazyBuilder, fun.GetRange())
 		for _, childID := range fun.ChildFuncs {
 			childValue, ok := fun.GetValueById(childID)
 			if !ok || childValue == nil {

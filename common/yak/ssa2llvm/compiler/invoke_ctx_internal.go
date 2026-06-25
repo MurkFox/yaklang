@@ -53,7 +53,7 @@ func (c *Compiler) storeContextReturn(val llvm.Value) error {
 }
 
 func (c *Compiler) getOrInsertRuntimeLoadPanicValue() (llvm.Value, llvm.Type) {
-	name := "yak_runtime_load_panic_value"
+	name := c.runtimeSymName(abi.RuntimeLoadPanicValueSymbol)
 	fn := c.Mod.NamedFunction(name)
 	i8Ptr := llvm.PointerType(c.LLVMCtx.Int8Type(), 0)
 	fnType := llvm.FunctionType(c.LLVMCtx.Int64Type(), []llvm.Type{i8Ptr}, false)
@@ -119,15 +119,7 @@ func (c *Compiler) bindParamsFromContext(fn *ssa.Function) error {
 		idx := llvm.ConstInt(i64, uint64(argBase+int64(i)), false)
 		elemPtr := c.Builder.CreateGEP(i64, ctxPtr, []llvm.Value{idx}, "")
 		val := c.Builder.CreateLoad(i64, elemPtr, fmt.Sprintf("arg_%d", paramID))
-		c.Values[paramID] = val
-	}
-
-	for i, memberID := range fn.ParameterMembers {
-		paramIndex := int64(len(fn.Params) + i)
-		idx := llvm.ConstInt(i64, uint64(argBase+paramIndex), false)
-		elemPtr := c.Builder.CreateGEP(i64, ctxPtr, []llvm.Value{idx}, "")
-		val := c.Builder.CreateLoad(i64, elemPtr, fmt.Sprintf("pm_%d", memberID))
-		c.Values[memberID] = val
+		c.cacheValue(paramID, val)
 	}
 
 	freeValueBase := int64(len(fn.Params) + len(fn.ParameterMembers))
@@ -135,8 +127,86 @@ func (c *Compiler) bindParamsFromContext(fn *ssa.Function) error {
 		idx := llvm.ConstInt(i64, uint64(argBase+freeValueBase+int64(i)), false)
 		elemPtr := c.Builder.CreateGEP(i64, ctxPtr, []llvm.Value{idx}, "")
 		val := c.Builder.CreateLoad(i64, elemPtr, fmt.Sprintf("fv_%d", binding.ValueID))
-		c.Values[binding.ValueID] = val
+		c.cacheValue(binding.ValueID, val)
+	}
+
+	for _, paramID := range fn.Params {
+		value, ok := fn.GetValueById(paramID)
+		if !ok || value == nil {
+			continue
+		}
+		ssaVal, ok := value.(ssa.Value)
+		if !ok {
+			continue
+		}
+		if err := c.maybeEmitMemberSet(nil, ssaVal, paramID); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+func (c *Compiler) loadBoundParameterValue(fn *ssa.Function, param *ssa.Parameter) (llvm.Value, bool) {
+	if c == nil || fn == nil || param == nil {
+		return llvm.Value{}, false
+	}
+	if val, ok := c.Values[param.GetId()]; ok {
+		return val, true
+	}
+	if c.function == nil || c.function.invokeCtx.IsNil() {
+		return llvm.Value{}, false
+	}
+
+	argBase := int64(abi.HeaderWords)
+	i64 := c.LLVMCtx.Int64Type()
+
+	for i, paramID := range fn.Params {
+		if paramID != param.GetId() {
+			continue
+		}
+		ctxPtr, err := c.ctxI64Ptr()
+		if err != nil {
+			return llvm.Value{}, false
+		}
+		idx := llvm.ConstInt(i64, uint64(argBase+int64(i)), false)
+		elemPtr := c.Builder.CreateGEP(i64, ctxPtr, []llvm.Value{idx}, "")
+		val := c.Builder.CreateLoad(i64, elemPtr, fmt.Sprintf("arg_lazy_%d", paramID))
+		c.cacheValue(paramID, val)
+		return val, true
+	}
+
+	for i, memberID := range fn.ParameterMembers {
+		if memberID != param.GetId() {
+			continue
+		}
+		ctxPtr, err := c.ctxI64Ptr()
+		if err != nil {
+			return llvm.Value{}, false
+		}
+		paramIndex := int64(len(fn.Params) + i)
+		idx := llvm.ConstInt(i64, uint64(argBase+paramIndex), false)
+		elemPtr := c.Builder.CreateGEP(i64, ctxPtr, []llvm.Value{idx}, "")
+		val := c.Builder.CreateLoad(i64, elemPtr, fmt.Sprintf("pm_lazy_%d", memberID))
+		c.cacheValue(memberID, val)
+		return val, true
+	}
+
+	freeValueBase := int64(len(fn.Params) + len(fn.ParameterMembers))
+	for i, binding := range callframe.OrderedFreeValueBindings(fn) {
+		if binding.ValueID != param.GetId() {
+			continue
+		}
+		ctxPtr, err := c.ctxI64Ptr()
+		if err != nil {
+			return llvm.Value{}, false
+		}
+		idx := llvm.ConstInt(i64, uint64(argBase+freeValueBase+int64(i)), false)
+		elemPtr := c.Builder.CreateGEP(i64, ctxPtr, []llvm.Value{idx}, "")
+		val := c.Builder.CreateLoad(i64, elemPtr, fmt.Sprintf("fv_lazy_%d", binding.ValueID))
+		c.cacheValue(binding.ValueID, val)
+		return val, true
+	}
+
+	return llvm.Value{}, false
 }

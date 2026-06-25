@@ -2,6 +2,7 @@ package aireact
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
+	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	_ "github.com/yaklang/yaklang/common/aiforge" // register liteforge callback
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/jsonpath"
@@ -76,6 +78,16 @@ func TestReAct_ExtraCapabilities_DeepIntent(t *testing.T) {
 		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := r.GetPrompt()
 
+			// 去 Exit 化后 directly_answer 只发答复并继续, 主循环收尾交给唯一终结器 finish.
+			// finish 会触发一次满意度校验, 这里统一放行.
+			// 关键词: directly_answer 永不 Exit, finish 唯一终结器, 满意度校验放行
+			if isVerifySatisfactionPrompt(prompt) {
+				rsp := i.NewAIResponse()
+				rsp.EmitOutputStream(bytes.NewBufferString(`{"@action":"verify-satisfaction","user_satisfied":true,"reasoning":"answer delivered"}`))
+				rsp.Close()
+				return rsp, nil
+			}
+
 			// Capability catalog match helper used by query_capabilities.
 			// Return the forge identifier so deep intent can continue normally.
 			if utils.MatchAllOfSubString(prompt, "capability matcher", "matched_identifiers") ||
@@ -110,7 +122,7 @@ func TestReAct_ExtraCapabilities_DeepIntent(t *testing.T) {
 			if utils.MatchAllOfSubString(prompt, "directly_answer") &&
 				!utils.MatchAllOfSubString(prompt, "finalize_enrichment", "query_capabilities") &&
 				!utils.MatchAllOfSubString(prompt, `"const": "capability-catalog-match"`, "matched_identifiers") {
-				atomic.AddInt32(&mainLoopCalled, 1)
+				n := atomic.AddInt32(&mainLoopCalled, 1)
 
 				// Check whether EXTRA_CAPABILITIES block appears in the prompt
 				if strings.Contains(prompt, "EXTRA_CAPABILITIES_") {
@@ -127,9 +139,18 @@ func TestReAct_ExtraCapabilities_DeepIntent(t *testing.T) {
 				}
 
 				rsp := i.NewAIResponse()
-				rsp.EmitOutputStream(bytes.NewBufferString(`
+				// 去 Exit 化: 第一轮主循环发 directly_answer (产出含 testNonce 的答复并写入
+				// timeline), 第二轮发唯一终结器 finish 收口整个任务.
+				// 关键词: directly_answer 永不 Exit, finish 唯一终结器, 答复后追加 finish
+				if n == 1 {
+					rsp.EmitOutputStream(bytes.NewBufferString(`
 {"@action": "directly_answer", "answer_payload": "Security assessment capabilities identified with ` + testNonce + `.", "human_readable_thought": "answering user query about security assessment", "cumulative_summary": "extra capabilities test completed"}
 `))
+				} else {
+					rsp.EmitOutputStream(bytes.NewBufferString(`
+{"@action": "object", "next_action": {"type": "finish"}, "human_readable_thought": "finish after answer delivered"}
+`))
+				}
 				rsp.Close()
 				return rsp, nil
 			}
@@ -290,6 +311,13 @@ func TestReAct_ExtraCapabilities_Render(t *testing.T) {
 		Description: "A test focus mode for rendering verification " + testNonce,
 	})
 
+	// Add a core/high-priority tool to verify title and section hint rendering
+	ecm.AddTools(aitool.NewWithoutCallback(
+		"test_core_tool_render_"+testNonce,
+		aitool.WithVerboseName("Core Tool / 核心工具 / High Priority"),
+		aitool.WithDescription("Core render tool with very high priority "+testNonce),
+	))
+
 	// Render and verify all sections present
 	rendered := ecm.Render("test_nonce_123")
 	if rendered == "" {
@@ -299,6 +327,12 @@ func TestReAct_ExtraCapabilities_Render(t *testing.T) {
 	// Verify header
 	if !strings.Contains(rendered, "Extra Capabilities") {
 		t.Fatal("rendered output should contain 'Extra Capabilities' header")
+	}
+	if !strings.Contains(rendered, "Core Tool / High Priority should be preferred") {
+		t.Fatal("rendered output should mention core/high-priority tool preference in tools title")
+	}
+	if !strings.Contains(rendered, "Core Tool / 核心工具 / High Priority") {
+		t.Fatal("rendered output should contain core tool title marker")
 	}
 
 	// Verify forge section
@@ -338,20 +372,54 @@ func TestReAct_ExtraCapabilities_Render(t *testing.T) {
 	if len(forges) != 1 {
 		t.Fatalf("expected 1 forge after dedup, got %d", len(forges))
 	}
+	if forges[0].VerboseName != "Duplicate" {
+		t.Fatalf("expected duplicate forge metadata to refresh, got %+v", forges[0])
+	}
 
-	// Test MaxExtraTools limit
+	// Test recency-based limit for forges
 	ecm2 := reactloops.NewExtraCapabilitiesManager()
-	ecm2.MaxExtraTools = 2
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 12; i++ {
 		ecm2.AddForges(reactloops.ExtraForgeInfo{
-			Name:        utils.RandStringBytes(10),
+			Name:        fmt.Sprintf("forge_%02d", i),
 			Description: "forge",
 		})
 	}
-	// Forges don't have a limit (only tools do), so all 5 should be added
-	if len(ecm2.ListForges()) != 5 {
-		t.Fatalf("expected 5 forges (no limit on forges), got %d", len(ecm2.ListForges()))
+	forges2 := ecm2.ListForges()
+	if len(forges2) != 10 {
+		t.Fatalf("expected 10 forges after limit eviction, got %d", len(forges2))
+	}
+	if forges2[0].Name != "forge_02" || forges2[9].Name != "forge_11" {
+		t.Fatalf("expected oldest forges evicted and newest kept, got first=%s last=%s", forges2[0].Name, forges2[9].Name)
+	}
+	ecm2.AddForges(reactloops.ExtraForgeInfo{Name: "forge_05", Description: "refreshed"})
+	forges2 = ecm2.ListForges()
+	if forges2[9].Name != "forge_05" {
+		t.Fatalf("expected duplicate forge to move to newest position, got last=%s", forges2[9].Name)
 	}
 
-	t.Log("ExtraCapabilities render test passed: all sections and deduplication verified")
+	// Test recency-based limit for tools
+	ecm3 := reactloops.NewExtraCapabilitiesManager()
+	for i := 0; i < 12; i++ {
+		ecm3.AddTools(aitool.NewWithoutCallback(
+			fmt.Sprintf("tool_%02d", i),
+			aitool.WithDescription("tool"),
+		))
+	}
+	tools3 := ecm3.ListTools()
+	if len(tools3) != 10 {
+		t.Fatalf("expected 10 tools after limit eviction, got %d", len(tools3))
+	}
+	if tools3[0].Name != "tool_02" || tools3[9].Name != "tool_11" {
+		t.Fatalf("expected oldest tools evicted and newest kept, got first=%s last=%s", tools3[0].Name, tools3[9].Name)
+	}
+	ecm3.AddTools(aitool.NewWithoutCallback(
+		"tool_05",
+		aitool.WithDescription("refreshed tool"),
+	))
+	tools3 = ecm3.ListTools()
+	if tools3[9].Name != "tool_05" {
+		t.Fatalf("expected duplicate tool to move to newest position, got last=%s", tools3[9].Name)
+	}
+
+	t.Log("ExtraCapabilities render test passed: sections, recency ordering, and eviction verified")
 }

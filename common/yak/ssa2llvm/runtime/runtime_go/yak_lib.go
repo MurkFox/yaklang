@@ -12,7 +12,6 @@ void yak_finalizer_proxy(void* obj, void* client_data);
 import "C"
 import (
 	"fmt"
-	"os"
 	"reflect"
 	"runtime"
 	"runtime/cgo"
@@ -20,6 +19,8 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/yaklang/yaklang/common/yak/ssa2llvm/runtime/abi"
 )
 
 func main() {}
@@ -83,6 +84,29 @@ func yak_internal_malloc(size int64) (ret uintptr) {
 	return uintptr(C.GC_malloc(C.size_t(size)))
 }
 
+//export yak_runtime_make_object
+func yak_runtime_make_object() int64 {
+	defer recoverRuntimePanic()
+	return int64(uintptr(newStdlibShadow(newRuntimeOrderedMap())))
+}
+
+//export yak_runtime_make_callable
+func yak_runtime_make_callable(fn uintptr, paramMemberCount int64, freeCount int64, freeValues unsafe.Pointer) int64 {
+	defer recoverRuntimePanic()
+	if fn == 0 {
+		return 0
+	}
+	var captures []uint64
+	if freeCount > 0 && freeValues != nil {
+		captures = append(captures, unsafe.Slice((*uint64)(freeValues), int(freeCount))...)
+	}
+	return int64(uintptr(newRuntimeShadow(runtimeCallableClosure{
+		fn:               uint64(fn),
+		paramMemberCount: int(paramMemberCount),
+		freeValues:       captures,
+	})))
+}
+
 //export yak_runtime_to_cstring
 func yak_runtime_to_cstring(ptr unsafe.Pointer) *C.char {
 	defer recoverRuntimePanic()
@@ -102,8 +126,8 @@ func yak_runtime_to_cstring(ptr unsafe.Pointer) *C.char {
 func yak_host_release_handle(id C.uintptr_t) {
 	defer recoverRuntimePanic()
 	h := cgo.Handle(id)
-	if gcLogEnabled() {
-		fmt.Printf("[Go] Releasing handle %d\n", id)
+	if runtimeGCLogEnabled() {
+		runtimeDiagPrintf("[Go] Releasing handle %d\n", id)
 	}
 	h.Delete()
 }
@@ -126,9 +150,9 @@ func yak_internal_release_shadow(ptr unsafe.Pointer) {
 	}
 	handleID := C.uintptr_t(handleRaw)
 
-	if gcLogEnabled() {
-		fmt.Printf("[Yak GC] Finalizer triggered\n")
-		fmt.Printf("[Yak GC] Releasing shadow %p -> Handle %d\n", ptr, handleID)
+	if runtimeGCLogEnabled() {
+		runtimeDiagPrintf("[Yak GC] Finalizer triggered\n")
+		runtimeDiagPrintf("[Yak GC] Releasing shadow %p -> Handle %d\n", ptr, handleID)
 	}
 
 	// Release the Go handle
@@ -157,8 +181,8 @@ func yak_runtime_new_shadow(handleID C.uintptr_t) (ret unsafe.Pointer) {
 		nil, nil, nil,
 	)
 
-	if gcLogEnabled() {
-		fmt.Printf("[Yak] GC_malloc shadow %p for Handle %d\n", ptr, handleID)
+	if runtimeGCLogEnabled() {
+		runtimeDiagPrintf("[Yak] GC_malloc shadow %p for Handle %d\n", ptr, handleID)
 	}
 
 	return ptr
@@ -180,6 +204,14 @@ func handleFromShadow(objPtr unsafe.Pointer) (cgo.Handle, bool) {
 }
 
 func resolveField(obj any, name string) (reflect.Value, error) {
+	if om, ok := obj.(runtimeStringMap); ok {
+		value, exists := om.Get(name)
+		if !exists {
+			return reflect.Value{}, fmt.Errorf("ordered map key %q not found", name)
+		}
+		return reflect.ValueOf(value), nil
+	}
+
 	v := reflect.ValueOf(obj)
 	for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Ptr) {
 		if v.IsNil() {
@@ -248,7 +280,13 @@ func resolveMapKey(keyType reflect.Type, name string) (reflect.Value, bool) {
 
 func resolveCollectionIndex(length int, name string) (int, bool) {
 	idx, err := strconv.Atoi(name)
-	if err != nil || idx < 0 || idx >= length {
+	if err != nil {
+		return 0, false
+	}
+	if idx < 0 {
+		idx = length + idx
+	}
+	if idx < 0 || idx >= length {
 		return 0, false
 	}
 	return idx, true
@@ -323,6 +361,12 @@ func setReflectValue(v reflect.Value, val int64) bool {
 }
 
 func valueForSet(targetType reflect.Type, val int64) (reflect.Value, bool) {
+	if targetType == nil {
+		return reflect.Value{}, false
+	}
+	if decoded, ok := decodedValueForSet(targetType, val); ok {
+		return decoded, true
+	}
 	switch targetType.Kind() {
 	case reflect.Interface:
 		return reflect.ValueOf(val), true
@@ -347,7 +391,102 @@ func valueForSet(targetType reflect.Type, val int64) (reflect.Value, bool) {
 	}
 }
 
-func setRuntimeField(obj any, name string, val int64) error {
+func decodedValueForSet(targetType reflect.Type, val int64) (reflect.Value, bool) {
+	raw := uint64(val)
+	decoded := decodeTaggedArg(raw)
+	if decoded == nil {
+		return reflect.Zero(targetType), true
+	}
+
+	if intValue, ok := decoded.(int64); ok {
+		if shadowValue, ok := runtimeDecodeShadowArg(raw, targetType); ok {
+			return shadowValue, true
+		}
+		if (raw & yakTaggedPointerMask) == 0 {
+			return reflect.Value{}, false
+		}
+		decoded = intValue
+	}
+
+	value := reflect.ValueOf(decoded)
+	if !value.IsValid() {
+		return reflect.Zero(targetType), true
+	}
+	if value.Type().AssignableTo(targetType) {
+		return value, true
+	}
+	if value.Type().ConvertibleTo(targetType) {
+		return value.Convert(targetType), true
+	}
+	if targetType.Kind() == reflect.Interface && value.Type().Implements(targetType) {
+		return value, true
+	}
+	if targetType.Kind() == reflect.String {
+		ret := reflect.New(targetType).Elem()
+		ret.SetString(fmt.Sprint(decoded))
+		return ret, true
+	}
+	return reflect.Value{}, false
+}
+
+func orderedMapValueForSet(val int64, flags uint64) (any, bool) {
+	if flags&abi.FlagFieldBool != 0 {
+		return val != 0, true
+	}
+
+	raw := uint64(val)
+	if flags&abi.FlagFieldString != 0 {
+		if (raw & yakTaggedPointerMask) != 0 {
+			raw &^= yakTaggedPointerMask
+		}
+		ptr := unsafe.Pointer(uintptr(raw))
+		if ptr == nil {
+			return "", true
+		}
+		if h, ok := handleFromShadow(ptr); ok {
+			return fmt.Sprint(h.Value()), true
+		}
+		if !looksLikeCStringPointer(raw) {
+			return fmt.Sprint(int64(raw)), true
+		}
+		return runtimeCStringToGoString(ptr), true
+	}
+
+	if (raw & yakTaggedPointerMask) != 0 {
+		return decodeTaggedArg(raw), true
+	}
+	if h, ok := handleFromShadow(unsafe.Pointer(uintptr(raw))); ok {
+		return h.Value(), true
+	}
+	return val, true
+}
+
+func looksLikeCStringPointer(raw uint64) bool {
+	if raw < 4096 {
+		return false
+	}
+	sign := (raw >> 47) & 1
+	upper := raw >> 48
+	if sign == 0 {
+		return upper == 0
+	}
+	return upper == 0xffff
+}
+
+func setRuntimeField(obj any, name string, val int64, flags ...uint64) error {
+	fieldFlags := uint64(0)
+	if len(flags) > 0 {
+		fieldFlags = flags[0]
+	}
+	if om, ok := obj.(runtimeStringMap); ok {
+		mapVal, ok := orderedMapValueForSet(val, fieldFlags)
+		if !ok {
+			return fmt.Errorf("ordered map value for key %q is not assignable", name)
+		}
+		om.Set(name, mapVal)
+		return nil
+	}
+
 	v := reflect.ValueOf(obj)
 	if !v.IsValid() {
 		return fmt.Errorf("invalid object while setting %q", name)
@@ -394,9 +533,12 @@ func setRuntimeField(obj any, name string, val int64) error {
 		if !ok {
 			return fmt.Errorf("index %q out of range", name)
 		}
-		if !setReflectValue(v.Index(idx), val) {
+		target := v.Index(idx)
+		converted, ok := valueForSet(target.Type(), val)
+		if !ok {
 			return fmt.Errorf("index %q is not assignable from int64", name)
 		}
+		target.Set(converted)
 		return nil
 	default:
 		return fmt.Errorf("type %s does not support member write", v.Kind())
@@ -418,13 +560,13 @@ func yak_runtime_get_field(objPtr unsafe.Pointer, name *C.char) int64 {
 }
 
 //export yak_runtime_set_field
-func yak_runtime_set_field(objPtr unsafe.Pointer, name *C.char, val int64) {
+func yak_runtime_set_field(objPtr unsafe.Pointer, name *C.char, val int64, flags uint64) {
 	defer recoverRuntimePanic()
 	h, ok := handleFromShadow(objPtr)
 	if !ok || name == nil {
 		return
 	}
-	if err := setRuntimeField(h.Value(), C.GoString(name), val); err != nil {
+	if err := setRuntimeField(h.Value(), C.GoString(name), val, flags); err != nil {
 		panic(err)
 	}
 }
@@ -436,7 +578,7 @@ func yak_runtime_dump(objPtr unsafe.Pointer) {
 	if !ok {
 		return
 	}
-	fmt.Printf("[Go] Dump: %+v\n", h.Value())
+	runtimeDiagPrintf("[Go] Dump: %+v\n", h.Value())
 }
 
 //export yak_runtime_dump_handle
@@ -452,9 +594,4 @@ func yak_runtime_gc() {
 	C.GC_gcollect()
 	runtime.GC()
 	time.Sleep(10 * time.Millisecond)
-}
-
-func gcLogEnabled() bool {
-	v := os.Getenv("GCLOG")
-	return v != "" && v != "0"
 }

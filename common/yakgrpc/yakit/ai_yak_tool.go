@@ -12,7 +12,10 @@ import (
 
 func SaveAIYakTool(db *gorm.DB, tool *schema.AIYakTool) (int64, error) {
 	db = db.Model(&schema.AIYakTool{})
-	if db := db.Where("name = ?", tool.Name).Assign(tool).FirstOrCreate(&schema.AIYakTool{}); db.Error != nil {
+	if tool == nil {
+		return 0, utils.Error("ai tool is nil")
+	}
+	if db := db.Where("name = ?", tool.Name).Assign(tool.ToUpdateMap()).FirstOrCreate(tool); db.Error != nil {
 		return 0, utils.Errorf("create/update AIYakTool failed: %s", db.Error)
 	}
 	return db.RowsAffected, nil
@@ -27,15 +30,20 @@ func CreateAIYakTool(db *gorm.DB, tool *schema.AIYakTool) (int64, error) {
 }
 
 func UpdateAIYakToolByID(db *gorm.DB, tool *schema.AIYakTool) (int64, error) {
+	if tool == nil {
+		return 0, utils.Error("ai tool is nil")
+	}
+
 	// 先查询获取现有记录的 CreatedAt
 	var existing schema.AIYakTool
 	if err := db.Where("id = ?", tool.ID).First(&existing).Error; err != nil {
 		return 0, utils.Errorf("find AIYakTool failed: %s", err)
 	}
-	// 设置 CreatedAt 以确保执行 UPDATE 而不是 INSERT
+
 	tool.CreatedAt = existing.CreatedAt
+	tool.Author = existing.Author
 	tool.IsFavorite = existing.IsFavorite
-	if db := db.Save(tool); db.Error != nil {
+	if db := db.Model(&schema.AIYakTool{}).Where("id = ?", tool.ID).Updates(tool.ToUpdateMap()); db.Error != nil {
 		return 0, utils.Errorf("update AIYakTool failed: %s", db.Error)
 	}
 	return db.RowsAffected, nil
@@ -59,6 +67,25 @@ func GetAIYakToolByID(db *gorm.DB, id uint) (*schema.AIYakTool, error) {
 	return &tool, nil
 }
 
+func FilterAIYakTool(db *gorm.DB, filter *ypb.AIToolFilter) *gorm.DB {
+	db = db.Model(&schema.AIYakTool{})
+	if filter == nil {
+		return db
+	}
+	db = bizhelper.ExactQueryString(db, "name", filter.GetToolName())
+	db = bizhelper.ExactQueryStringArrayOr(db, "name", filter.GetToolNames())
+	if filter.GetID() > 0 {
+		db = bizhelper.ExactQueryInt64(db, "id", filter.GetID())
+	}
+	if filter.GetKeyword() != "" {
+		db = bizhelper.FuzzSearchEx(db, []string{"name", "keywords", "description", "path"}, filter.GetKeyword(), false)
+	}
+	if filter.GetOnlyFavorites() {
+		db = db.Where("is_favorite = ?", true)
+	}
+	return db
+}
+
 func SearchAIYakToolByPath(db *gorm.DB, path string) ([]*schema.AIYakTool, error) {
 	db = db.Model(&schema.AIYakTool{})
 	var tools []*schema.AIYakTool
@@ -79,6 +106,20 @@ func SearchAIYakTool(db *gorm.DB, keywords string) ([]*schema.AIYakTool, error) 
 		return nil, err
 	}
 	return tools, nil
+}
+
+func CountAIYakTools(db *gorm.DB, filter *ypb.AIToolFilter) (int64, error) {
+	db = FilterAIYakTool(db, filter)
+	var count int64
+	if db := db.Count(&count); db.Error != nil {
+		return 0, utils.Errorf("count AIYakTool failed: %s", db.Error)
+	}
+	return count, nil
+}
+
+func YieldAIYakTools(ctx context.Context, db *gorm.DB, filter *ypb.AIToolFilter) chan *schema.AIYakTool {
+	db = FilterAIYakTool(db, filter)
+	return bizhelper.YieldModel[*schema.AIYakTool](ctx, db)
 }
 
 func DeleteAIYakTools(db *gorm.DB, names ...string) (int64, error) {

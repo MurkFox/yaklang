@@ -69,6 +69,18 @@ func saveNodeIdI18nToDB(nodeId string, i18n *I18n) {
 }
 
 var nodeIdMapper = map[string]*I18n{
+	"adjust_todolist": {
+		Zh: "待办事项",
+		En: "TODO List",
+	},
+	"task-dependency": {
+		Zh: "任务依赖",
+		En: "Task Dependency",
+	},
+	"http_flow": {
+		Zh: "HTTP 数据包",
+		En: "HTTP Flow",
+	},
 	"directly_call_tool_params": {
 		Zh: "快速工具调用",
 		En: "Direct Tool Call",
@@ -100,6 +112,14 @@ var nodeIdMapper = map[string]*I18n{
 	"loading_skills_name": {
 		Zh: "加载技能",
 		En: "Loading Skills",
+	},
+	"perception": {
+		Zh: "意图感知",
+		En: "Perception",
+	},
+	"flow-findings": {
+		Zh: "流量分析发现",
+		En: "Flow Analysis Findings",
 	},
 	"intent": {
 		Zh: "意图识别",
@@ -178,7 +198,7 @@ var nodeIdMapper = map[string]*I18n{
 		En: "Tool Compose",
 	},
 	"knowledge-compress": {
-		Zh: "知识压缩",
+		Zh: "压缩精炼",
 		En: "Knowledge Compress",
 	},
 	"reference_material": {
@@ -201,9 +221,25 @@ var nodeIdMapper = map[string]*I18n{
 		Zh: "交付文件",
 		En: "Delivery Files",
 	},
+	"plan-facts": {
+		Zh: "事实",
+		En: "Plan Facts",
+	},
+	"plan-document": {
+		Zh: "任务执行指导文档",
+		En: "Guidance Document",
+	},
+	"plan-tasks": {
+		Zh: "任务计划",
+		En: "Task Plan",
+	},
+	"plan-evidence": {
+		Zh: "证据",
+		En: "Plan Evidence",
+	},
 	"self-reflection-suggestions": {
-		Zh: "自省建议",
-		En: "Self Reflection Suggestions",
+		Zh: "自我反思",
+		En: "Self-Reflection",
 	},
 	"semantic_questions": {
 		Zh: "语义搜索条件",
@@ -414,6 +450,38 @@ var nodeIdMapper = map[string]*I18n{
 		Zh: "AI 响应",
 		En: "AI Response",
 	},
+	"http-flow-analysis-evidence": {
+		Zh: "HTTP 流量分析证据",
+		En: "HTTP Flow Analysis Evidence",
+	},
+	"http-flow-query": {
+		Zh: "流量查询",
+		En: "Flow Query",
+	},
+	"http-flow-detail": {
+		Zh: "流量详情",
+		En: "Flow Detail",
+	},
+	"http-flow-match": {
+		Zh: "流量匹配",
+		En: "Flow Match",
+	},
+	"fuzz-test": {
+		Zh: "Fuzz 测试",
+		En: "Fuzz Test",
+	},
+	"set-http-request": {
+		Zh: "设置 HTTP 请求",
+		En: "Set HTTP Request",
+	},
+	"modify-http-request": {
+		Zh: "修改 HTTP 请求",
+		En: "Modify HTTP Request",
+	},
+	"generate-risk": {
+		Zh: "生成漏洞风险",
+		En: "Generate Risk",
+	},
 	"enhance-query": {
 		Zh: "知识增强",
 		En: "Knowledge Enhancement",
@@ -503,6 +571,26 @@ var nodeIdMapper = map[string]*I18n{
 	"query_document": {
 		Zh: "查询文档",
 		En: "Query Document",
+	},
+	"yakdoc_search": {
+		Zh: "搜索标准库 API",
+		En: "Search Yakdoc APIs",
+	},
+	"yakdoc_get_all_library_names": {
+		Zh: "列出标准库",
+		En: "List Yak Libraries",
+	},
+	"yakdoc_library_details": {
+		Zh: "查询库概览",
+		En: "Yakdoc Library Details",
+	},
+	"yakdoc_function_details": {
+		Zh: "查询函数文档",
+		En: "Yakdoc Function Details",
+	},
+	"yakdoc_variable_details": {
+		Zh: "查询变量文档",
+		En: "Yakdoc Variable Details",
 	},
 	"focus-on": {
 		Zh: "专注",
@@ -735,6 +823,10 @@ var nodeIdMapper = map[string]*I18n{
 		Zh: "报告内容",
 		En: "Report Content",
 	},
+	"report-finish": {
+		Zh: "报告已完成",
+		En: "Report Finished",
+	},
 	"python-script": {
 		Zh: "Python 脚本",
 		En: "Python Script",
@@ -770,6 +862,22 @@ var nodeIdMapper = map[string]*I18n{
 	"http_flow_analyze": {
 		Zh: "HTTP 流量分析",
 		En: "HTTP Flow Analyze",
+	},
+	"ai-error": {
+		Zh: "AI 调用错误",
+		En: "AI Invocation Error",
+	},
+	"rate-limit": {
+		Zh: "请求限频",
+		En: "Rate Limited",
+	},
+	"daily-token-exceeded": {
+		Zh: "日额度超限",
+		En: "Daily Token Exceeded",
+	},
+	"notify": {
+		Zh: "系统通知",
+		En: "System Notification",
 	},
 }
 

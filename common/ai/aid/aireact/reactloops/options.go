@@ -50,6 +50,12 @@ func WithAllowPlanAndExec(b ...bool) ReActLoopOption {
 	})
 }
 
+func WithPlanExecActionType(actionType string) ReActLoopOption {
+	return func(r *ReActLoop) {
+		r.planExecActionType = actionType
+	}
+}
+
 func WithAllowAIForge(b ...bool) ReActLoopOption {
 	if len(b) > 0 {
 		return WithAllowAIForgeGetter(func() bool {
@@ -98,6 +104,38 @@ func WithAllowToolCall(b ...bool) ReActLoopOption {
 func WithToolsGetter(getter func() []*aitool.Tool) ReActLoopOption {
 	return func(r *ReActLoop) {
 		r.toolsGetter = getter
+	}
+}
+
+// WithScenarioToolWhitelist 声明这个 loop 对 VisibilityScenario 工具的拉回
+// 名单. 命中名单的 scenario 工具会重新出现在默认 Tool Inventory 中, 并被
+// 视为高优先级 (置顶展示). 主要使用方:
+//   - yak focus mode 的 __SCENARIO_TOOLS__ dunder, 由 CollectFocusModeStaticOptions
+//     emit 出来.
+//   - 代码侧 (Go 内嵌 ReAct loop) 直接调用, 给特定 loop 默认带上某些 ssa-* 工具.
+//
+// 多次调用按 last-write-wins 覆盖 (保持与其他 With* 选项一致). 传入 nil /
+// 空 slice 等价于"不拉回任何 scenario 工具", 即与默认行为一致.
+//
+// 该选项不会让 VisibilityHidden 工具复活 (hidden 在 aicommon.FilterToolsByVisibility
+// 中永远丢弃, whitelist 不参与 hidden 决策).
+//
+// 关键词: WithScenarioToolWhitelist, focus mode pull back, scenario tools,
+//        last-write-wins, hidden never returns
+func WithScenarioToolWhitelist(names []string) ReActLoopOption {
+	return func(r *ReActLoop) {
+		if r == nil {
+			return
+		}
+		if len(names) == 0 {
+			r.scenarioToolWhitelist = nil
+			return
+		}
+		copied := make([]string, 0, len(names))
+		for _, n := range names {
+			copied = append(copied, n)
+		}
+		r.scenarioToolWhitelist = copied
 	}
 }
 
@@ -221,7 +259,7 @@ func WithPersistentContextProvider(provider ContextProviderFunc) ReActLoopOption
 
 func WithReflectionOutputExample(example string) ReActLoopOption {
 	return WithReflectionOutputExampleContextProvider(func(loop *ReActLoop, nonce string) (string, error) {
-		_, result, err := loop.getRenderInfo()
+		_, result, err := loop.getRenderValues()
 		if err != nil {
 			return "", utils.Errorf("get basic prompt info failed: %v", err)
 		}
@@ -258,7 +296,7 @@ func WithReflectionOutputExample(example string) ReActLoopOption {
 
 func WithPersistentInstruction(instruction string) ReActLoopOption {
 	return WithPersistentContextProvider(func(loop *ReActLoop, nonce string) (string, error) {
-		_, result, err := loop.getRenderInfo()
+		_, result, err := loop.getRenderValues()
 		if err != nil {
 			return "", utils.Errorf("get basic prompt info failed: %v", err)
 		}
@@ -300,6 +338,31 @@ func WithActionFactoryFromLoop(name string) ReActLoopOption {
 func WithOnAsyncTaskFinished(fn func(task aicommon.AIStatefulTask)) ReActLoopOption {
 	return func(r *ReActLoop) {
 		r.onAsyncTaskFinished = fn
+	}
+}
+
+// WithOnLoopRelease 注册一个 loop 释放阶段的清理回调，用于回收
+// 由 With* 选项注入的外部资源（例如 yak focus mode 的 caller 引擎）。
+// 多次调用会累积，按注册顺序执行。
+//
+// 关键词: loop release hook option, resource cleanup option
+func WithOnLoopRelease(fn func()) ReActLoopOption {
+	return func(r *ReActLoop) {
+		if fn == nil {
+			return
+		}
+		r.AddOnReleaseHook(fn)
+	}
+}
+
+// WithLoopEmitterProcesser pushes an event processor onto this loop's emitter only.
+// Returning nil from the processor drops the event before it reaches the global handler.
+func WithLoopEmitterProcesser(fn aicommon.EventProcesser) ReActLoopOption {
+	return func(r *ReActLoop) {
+		if r == nil || r.emitter == nil || fn == nil {
+			return
+		}
+		r.emitter = r.emitter.PushEventProcesser(fn)
 	}
 }
 
@@ -376,8 +439,8 @@ func WithEnableSelfReflection(enable ...bool) ReActLoopOption {
 }
 
 // WithSameActionTypeSpinThreshold 设置相同任务自旋阈值
-// 当连续执行相同 Action 类型的次数达到此阈值时，触发 SPIN 检测
-// 默认值为 3
+// 当连续执行"相同 ActionType + 相同 ToolName"的次数达到此阈值时,触发 SPIN 检测
+// 默认值为 8(从历史的 3 提到 8,降低误触发频率,只在长时间真的卡住时才介入)
 func WithSameActionTypeSpinThreshold(threshold int) ReActLoopOption {
 	return func(r *ReActLoop) {
 		if threshold > 0 {
@@ -387,8 +450,8 @@ func WithSameActionTypeSpinThreshold(threshold int) ReActLoopOption {
 }
 
 // WithSameLogicSpinThreshold 设置相同逻辑自旋阈值
-// 当连续执行相同 Action 类型的次数达到此阈值时，使用 AI 进行深度 SPIN 检测
-// 默认值为 3
+// 当连续执行"相同 ActionType + 相同 ToolName"次数达到此阈值时,使用 AI 进行深度 SPIN 检测
+// 默认值为 8(与简单检测阈值对齐)
 func WithSameLogicSpinThreshold(threshold int) ReActLoopOption {
 	return func(r *ReActLoop) {
 		if threshold > 0 {
@@ -471,3 +534,77 @@ func WithExtraCapabilities(ecm *ExtraCapabilitiesManager) ReActLoopOption {
 	}
 }
 
+// WithDisableTodoSnapshot disables the global TODO list block in loop prompts
+// for this loop instance. Plan and intent sub-loops should opt out so they do
+// not inherit the session todo snapshot from the main execution loop.
+func WithDisableTodoSnapshot(disable ...bool) ReActLoopOption {
+	return func(r *ReActLoop) {
+		if len(disable) > 0 && !disable[0] {
+			return
+		}
+		r.disableTodoSnapshot = true
+	}
+}
+
+// WithDisableLoopPerception disables the perception layer for this specific loop instance.
+// This is used by lightweight sub-loops (e.g. loop_intent) that should never run
+// perception evaluations regardless of the config-level setting.
+// For config-level (global) control, use aicommon.WithDisablePerception instead.
+func WithDisableLoopPerception(disable ...bool) ReActLoopOption {
+	return func(r *ReActLoop) {
+		if len(disable) > 0 && !disable[0] {
+			return
+		}
+		r.perception = nil
+	}
+}
+
+// WithDisablePeriodicVerification disables periodic verification checkpoints for this loop instance.
+// This is used by loops that should never run periodic verification regardless of the config-level setting.
+// For config-level (global) control, use aicommon.WithDisablePeriodicVerification instead.
+func WithDisablePeriodicVerification(disable ...bool) ReActLoopOption {
+	return func(r *ReActLoop) {
+		if len(disable) > 0 && !disable[0] {
+			return
+		}
+		r.DisablePeriodicVerification = true
+	}
+}
+
+// WithPeriodicVerificationInterval sets the  iteration interval used by
+// loop-level periodic checkpoint behaviors
+// auto-verification.
+func WithPeriodicVerificationInterval(interval int) ReActLoopOption {
+	return func(r *ReActLoop) {
+		if r == nil {
+			return
+		}
+		r.periodicVerificationInterval = interval
+	}
+}
+
+// WithToolCallIntervalReviewExtraPrompt injects extra instructions into the prompt
+// used by interval review while tools are running.
+func WithToolCallIntervalReviewExtraPrompt(prompt string) ReActLoopOption {
+	return func(r *ReActLoop) {
+		if r == nil || r.config == nil {
+			return
+		}
+		if cfg, ok := r.config.(*aicommon.Config); ok {
+			_ = aicommon.WithToolCallIntervalReviewExtraPrompt(prompt)(cfg)
+			return
+		}
+		r.config.SetConfig(aicommon.ConfigKeyToolCallIntervalReviewExtraPrompt, prompt)
+	}
+}
+
+func BasicAICommonConfigOption(c *aicommon.Config) []ReActLoopOption {
+	basicOptions := []ReActLoopOption{
+		WithMemoryTriage(c.MemoryTriage),
+		WithMemoryPool(c.MemoryPool),
+		WithPeriodicVerificationInterval(int(c.PeriodicVerificationInterval)),
+		WithMemorySizeLimit(int(c.MemoryPoolSize)),
+		WithEnableSelfReflection(c.EnableSelfReflection),
+	}
+	return basicOptions
+}

@@ -31,6 +31,13 @@ type JavaStruct struct {
 
 // GetGadgetNameByFun 从函数指针获取 gadget 名称，通过解析函数名来提取。
 // 函数名需要符合 "Get*JavaObject" 格式，返回中间的 * 部分作为 gadget 名称
+// 参数:
+//   - i: gadget 生成函数的函数指针
+//
+// 返回值:
+//   - 解析出的 gadget 名称
+//   - 错误信息，失败时非 nil
+//
 // Example:
 // ```
 // name, err := GetGadgetNameByFun(GetCommonsBeanutils1JavaObject)
@@ -567,10 +574,17 @@ func _WalkJavaSerializableObject(objSer yserx.JavaSerializable, replace func(new
 }
 
 // ToBcel 将 Java 类对象转换为 BCEL 编码格式的字符串
+// 参数:
+//   - i: Java 类对象(*javaclassparser.ClassObject)
+//
+// 返回值:
+//   - BCEL 编码格式的字符串
+//   - 错误信息，失败时非 nil
+//
 // Example:
 // ```
-// classObj := &javaclassparser.ClassObject{...}
-// bcelStr, err := yso.ToBcel(classObj)
+// classObj, _ = yso.GenerateTomcatEchoEvilClassObject(yso.useEchoBody(), yso.useParam("Body Echo Check"))
+// bcelStr, err = yso.ToBcel(classObj)
 // ```
 func ToBcel(i interface{}) (string, error) {
 	switch ret := i.(type) {
@@ -582,6 +596,14 @@ func ToBcel(i interface{}) (string, error) {
 }
 
 // ToBytes 将 Java 或反序列化对象转换为字节码
+// 参数:
+//   - i: Java 类对象或反序列化对象
+//   - opts: 可选的序列化配置项，例如 dirtyDataLength、twoBytesCharString 等
+//
+// 返回值:
+//   - 序列化后的字节码
+//   - 错误信息，失败时非 nil
+//
 // Example:
 // ```
 // gadgetObj,_ = yso.GetCommonsBeanutils1JavaObject(yso.useBytesEvilClass(bytesCode),yso.obfuscationClassConstantPool(),yso.evilClassName(className),yso.majorVersion(version))
@@ -605,7 +627,12 @@ func ToBytes(i interface{}, opts ...MarshalOptionFun) ([]byte, error) {
 type MarshalOptionFun func(ctx *yserx.MarshalContext)
 
 // SetToBytesDirtyDataLength 设置序列化数据中脏数据的长度
-// length: 要设置的脏数据长度
+// 参数:
+//   - length: 要设置的脏数据长度
+//
+// 返回值:
+//   - 用于配置序列化的选项函数
+//
 // Example:
 // ```
 // gadgetBytes,_ = yso.ToBytes(gadgetObj,yso.dirtyDataLength(10000))
@@ -642,28 +669,45 @@ func SetToBytesJRMPMarshaler() MarshalOptionFun {
 }
 
 // SetToBytesTwoBytesString 设置序列化时使用双字节字符串
+//
+// 返回值:
+//   - 用于配置序列化的选项函数
+//
 // Example:
 // ```
 // gadgetBytes,_ = yso.ToBytes(gadgetObj,yso.twoBytesCharString())
 // ```
 func SetToBytesTwoBytesString() MarshalOptionFun {
+	n := 2
 	return func(ctx *yserx.MarshalContext) {
-		ctx.StringCharLength = 2
+		ctx.StringCharLength = n
 	}
 }
 
 // SetToBytesThreeBytesString 设置序列化时使用三字节字符串
+//
+// 返回值:
+//   - 用于配置序列化的选项函数
+//
 // Example:
 // ```
 // gadgetBytes,_ = yso.ToBytes(gadgetObj,yso.threeBytesCharString())
 // ```
 func SetToBytesThreeBytesString() MarshalOptionFun {
+	n := 3
 	return func(ctx *yserx.MarshalContext) {
-		ctx.StringCharLength = 3
+		ctx.StringCharLength = n
 	}
 }
 
 // ToJson 将 Java 或反序列化对象转换为 json 字符串
+// 参数:
+//   - i: Java 类对象或反序列化对象
+//
+// 返回值:
+//   - json 字符串
+//   - 错误信息，失败时非 nil
+//
 // Example:
 // ```
 // gadgetObj,_ = yso.GetCommonsBeanutils1JavaObject(yso.useBytesEvilClass(bytesCode),yso.obfuscationClassConstantPool(),yso.evilClassName(className),yso.majorVersion(version))
@@ -685,6 +729,13 @@ func ToJson(i interface{}) (string, error) {
 }
 
 // dump 将Java 对象转换为类 Java 代码
+// 参数:
+//   - i: Java 类对象或反序列化对象
+//
+// 返回值:
+//   - 类 Java 代码字符串
+//   - 错误信息，失败时非 nil
+//
 // Example:
 // ```
 // gadgetObj,_ = yso.GetCommonsBeanutils1JavaObject(yso.useBytesEvilClass(bytesCode),yso.obfuscationClassConstantPool(),yso.evilClassName(className),yso.majorVersion(version))

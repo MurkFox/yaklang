@@ -3,7 +3,9 @@ package yakgrpc
 import (
 	"context"
 	"github.com/google/uuid"
+	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"math/rand"
 	"testing"
 	"time"
@@ -30,6 +32,10 @@ func TestConvertYPBAIStartParamsToReActConfig(t *testing.T) {
 	includeKeywords := []string{uuid.New().String(), uuid.New().String()}
 	aiService := uuid.NewString()
 	presetPrompt := uuid.New().String()
+	userPlanPrompt := uuid.New().String()
+	disableToolIntervalReview := rand.Intn(2) == 1
+	syncPerceptionTrigger := rand.Intn(2) == 1
+	enableDetachedPlan := rand.Intn(2) == 1
 
 	start := &ypb.AIStartParams{
 		DisallowRequireForUserPrompt: disallowRequire,
@@ -41,9 +47,17 @@ func TestConvertYPBAIStartParamsToReActConfig(t *testing.T) {
 		DisableToolUse:               disableToolUse,
 		IncludeSuggestedToolKeywords: includeKeywords,
 		AIService:                    aiService,
+		EnablePlan:                   true, // explicit: default proto false would disable PE/blueprint actions
 		DisableAISearchForge:         true, // just to test that this field is ignored, not start embedding server in ci test
 		AICallTokenLimit:             100 * 1024,
 		UserPresetPrompt:             presetPrompt,
+		UserPlanPrompt:               userPlanPrompt,
+		DisableToolIntervalReview:    disableToolIntervalReview,
+		SyncPerceptionTrigger:  syncPerceptionTrigger,
+		EnableDetachedPlan:     enableDetachedPlan,
+		EnabledCapabilities: []*ypb.AIEnabledCapability{
+			{Name: "read_file", Type: "tool"},
+		},
 	}
 
 	opts := ConvertYPBAIStartParamsToReActConfig(start)
@@ -66,6 +80,63 @@ func TestConvertYPBAIStartParamsToReActConfig(t *testing.T) {
 	require.ElementsMatch(t, start.IncludeSuggestedToolKeywords, cfg.Keywords)
 	require.Equal(t, start.AICallTokenLimit, cfg.AiCallTokenLimit)
 	require.Equal(t, start.UserPresetPrompt, cfg.UserPresetPrompt)
+	require.Equal(t, start.UserPlanPrompt, cfg.PlanPrompt)
+	require.Equal(t, start.DisableToolIntervalReview, cfg.DisableIntervalReview)
+	require.Equal(t, start.SyncPerceptionTrigger, cfg.GetSyncPerceptionTrigger())
+	require.Equal(t, start.GetEnablePlan(), cfg.GetEnablePlanAndExec())
+	require.Equal(t, start.GetEnableDetachedPlan(), cfg.GetEnableDetachedPlan())
+	require.Equal(t, []aicommon.EnabledCapability{
+		{Name: "read_file", Type: aicommon.EnabledCapabilityTypeTool},
+	}, cfg.GetEnabledCapabilities())
 	// AiServerName is no longer set from frontend params (WithAIChatInfo deprecated),
 	// it is now auto-detected via ModelInfoCallback during actual AI gateway calls.
+}
+
+func TestConvertYPBAIStartParams_EnablePlanAppliedAfterDisableAISearchForge(t *testing.T) {
+	start := &ypb.AIStartParams{
+		DisableAISearchForge: false,
+		EnablePlan:           false,
+	}
+	opts := ConvertYPBAIStartParamsToReActConfig(start)
+	cfg := aicommon.NewConfig(context.Background(), append(opts,
+		aicommon.WithAICallback(func(aicommon.AICallerConfigIf, *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			return &aicommon.AIResponse{}, nil
+		}))...)
+	require.False(t, cfg.GetEnablePlanAndExec(), "EnablePlan=false must disable PE/blueprint regardless of DisableAISearchForge")
+}
+
+func TestResolveAISessionStartParams(t *testing.T) {
+	db, err := utils.CreateTempTestDatabaseInMemory()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&schema.AISession{}).Error)
+
+	request := &ypb.AIStartParams{
+		AIService:   "request-service",
+		AIModelName: "request-model",
+		UserQuery:   "hello",
+	}
+
+	got, err := resolveAISessionStartParams(db, "missing-session", request, true)
+	require.NoError(t, err)
+	require.Equal(t, "request-service", got.GetAIService())
+	require.Equal(t, "request-model", got.GetAIModelName())
+	require.Equal(t, "hello", got.GetUserQuery())
+
+	_, err = yakit.CreateOrUpdateAISessionMetaStartParams(db, "cached-session", &ypb.AIStartParams{
+		AIService:   "cached-service",
+		AIModelName: "cached-model",
+		ReviewPolicy: "ai",
+	})
+	require.NoError(t, err)
+
+	got, err = resolveAISessionStartParams(db, "cached-session", &ypb.AIStartParams{
+		AIService:   "request-service",
+		AIModelName: "request-model",
+		UserQuery:   "hello",
+	}, true)
+	require.NoError(t, err)
+	require.Equal(t, "cached-service", got.GetAIService())
+	require.Equal(t, "cached-model", got.GetAIModelName())
+	require.Equal(t, "ai", got.GetReviewPolicy())
+	require.Equal(t, "hello", got.GetUserQuery())
 }

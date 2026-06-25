@@ -136,12 +136,48 @@ type BrowserInfo struct {
 	ProxyPassword string `json:"proxy_password,omitempty"`
 }
 
+// saveToDB 设置爬虫是否将抓取到的请求结果保存到数据库
+// 在 yak 中通过 crawlerx.saveToDB 调用
+// 参数:
+//   - b: 是否保存到数据库
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：抓取结果保存到数据库
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.saveToDB(true))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithSaveToDB(b bool) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.saveToDB = b
 	}
 }
 
+// runtimeId 设置本次爬虫任务的运行时 ID，便于将结果与特定任务关联
+// 在 yak 中通过 crawlerx.runtimeId 或 crawlerx.runtimeID 调用
+// 参数:
+//   - id: 运行时 ID 字符串
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：指定运行时 ID
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.runtimeId("task-001"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithRuntimeID(id string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.runtimeId = id
@@ -149,8 +185,13 @@ func WithRuntimeID(id string) ConfigOpt {
 }
 
 // browserInfo 是一个请求选项 用于配制浏览器参数
+// 参数:
+//   - data: 浏览器配置 JSON 字符串，包含 ws_address、exe_path、proxy_address 等字段
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -203,8 +244,13 @@ func WithBrowserData(browserConfig *BrowserConfig) ConfigOpt {
 }
 
 // maxUrl 是一个请求选项 用于设置最大爬取url数量
+// 参数:
+//   - maxUrl: 最大爬取 URL 数量
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -219,8 +265,13 @@ func WithMaxUrl(maxUrl int) ConfigOpt {
 }
 
 // maxDepth 是一个请求选项 用于设置网站最大爬取深度
+// 参数:
+//   - depth: 网站最大爬取深度
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -235,8 +286,13 @@ func WithMaxDepth(depth int) ConfigOpt {
 }
 
 // concurrent 是一个请求选项 用于设置浏览器同时打开的最大页面数量
+// 参数:
+//   - concurrent: 浏览器同时打开的最大页面数量
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -251,8 +307,13 @@ func WithConcurrent(concurrent int) ConfigOpt {
 }
 
 // blacklist 是一个请求选项 用于设置不会被访问的url链接包含的关键词
+// 参数:
+//   - keywords: 一个或多个黑名单关键词，URL 中包含这些关键词时不会被访问
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -277,8 +338,13 @@ func WithBlackList(keywords ...string) ConfigOpt {
 }
 
 // whitelist 是一个请求选项 用于设置只会被访问的url链接中包含的关键词
+// 参数:
+//   - keywords: 一个或多个白名单关键词，只有 URL 中包含这些关键词时才会被访问
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -303,8 +369,13 @@ func WithWhiteList(keywords ...string) ConfigOpt {
 }
 
 // pageTimeout 是一个请求选项 用于设置单个页面超时时间
+// 参数:
+//   - timeout: 单个页面超时时间，单位为秒
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -319,8 +390,13 @@ func WithPageTimeout(timeout int) ConfigOpt {
 }
 
 // fullTimeout 是一个请求选项 用于设置爬虫任务总超时时间
+// 参数:
+//   - timeout: 爬虫任务总超时时间，单位为秒
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -338,7 +414,13 @@ func WithFullTimeout(timeout int) ConfigOpt {
 //
 // 防止加载vue网站页面时页面状态为加载完成 实际仍在加载中的情况
 //
-// Examples:
+// 参数:
+//   - extraWaitLoadTime: 页面加载的额外等待时间，单位为毫秒
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -353,8 +435,13 @@ func WithExtraWaitLoadTime(extraWaitLoadTime int) ConfigOpt {
 }
 
 // formFill 是一个请求选项 用于设置页面输入框填写内容
+// 参数:
+//   - formFills: 关键词到填写内容的映射，输入框匹配关键词时填写对应内容
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -374,8 +461,13 @@ func WithFormFill(formFills map[string]string) ConfigOpt {
 }
 
 // fileInput 是一个请求选项 用于设置页面遇到input submit时默认上传文件
+// 参数:
+//   - fileInput: 关键词到文件路径的映射，default 键表示默认上传文件
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -394,8 +486,13 @@ func WithFileInput(fileInput map[string]string) ConfigOpt {
 }
 
 // rawHeaders 是一个请求选项 用于设置爬虫发送请求时的headers
+// 参数:
+//   - headerInfo: 原生 headers 字符串，每行一个 header
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -419,8 +516,13 @@ func WithHeaderInfo(headerInfo string) ConfigOpt {
 }
 
 // headers 是一个请求选项 用于设置爬虫发送请求时的headers
+// 参数:
+//   - headersInfo: header 名称到值的映射
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -439,8 +541,14 @@ func WithHeaders(headersInfo map[string]string) ConfigOpt {
 }
 
 // rawCookie 是一个请求选项 用于设置爬虫发送请求时的cookie
+// 参数:
+//   - domain: cookie 所属域名
+//   - cookieInfo: 原生 cookie 字符串
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -456,8 +564,14 @@ func WithCookieInfo(domain, cookieInfo string) ConfigOpt {
 }
 
 // cookies 是一个请求选项 用于设置爬虫发送请求时的cookie
+// 参数:
+//   - domain: cookie 所属域名
+//   - cookiesInfo: cookie 名称到值的映射
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -477,8 +591,13 @@ func WithCookies(domain string, cookiesInfo map[string]string) ConfigOpt {
 }
 
 // scanRangeLevel 是一个请求选项 用于设置爬虫扫描范围
+// 参数:
+//   - scanRange: 扫描范围级别，可选 crawlerx.AllDomainScan、crawlerx.SubMenuScan、crawlerx.UnlimitedDomainScan
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -496,8 +615,13 @@ func WithScanRangeLevel(scanRange scanRangeLevel) ConfigOpt {
 }
 
 // scanRepeatLevel 是一个请求选项 用于设置爬虫去重强度
+// 参数:
+//   - scanRepeat: 去重强度级别，可选 crawlerx.UnLimitRepeat、LowRepeatLevel、MediumRepeatLevel、HighRepeatLevel、ExtremeRepeatLevel
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -517,8 +641,13 @@ func WithScanRepeatLevel(scanRepeat repeatLevel) ConfigOpt {
 }
 
 // ignoreQueryName 是一个请求选项 用于设置url中的query名称去重时忽略
+// 参数:
+//   - names: 一个或多个去重时需要忽略的 query 名称
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -533,8 +662,13 @@ func WithIgnoreQueryName(names ...string) ConfigOpt {
 }
 
 // sensitiveWords 是一个请求选项 用于设置页面按钮点击时的敏感词
+// 参数:
+//   - words: 敏感词列表，按钮所在元素包含这些关键词时不会被点击
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -551,12 +685,48 @@ func WithSensitiveWords(words []string) ConfigOpt {
 	}
 }
 
+// leakless 设置 leakless 模式，控制浏览器进程在异常退出时的清理行为
+// 在 yak 中通过 crawlerx.leakless 调用，取值可为 "default"、"true"、"false"
+// 参数:
+//   - leakless: leakless 模式开关字符串
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：设置 leakless 模式
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.leakless("default"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithLeakless(leakless string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.leakless = leakless
 	}
 }
 
+// localStorage 设置爬虫启动时注入浏览器的 localStorage 键值对
+// 在 yak 中通过 crawlerx.localStorage 调用
+// 参数:
+//   - storage: 需要注入的 localStorage 键值映射
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：注入 localStorage
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.localStorage({"token": "abc"}))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithLocalStorage(storage map[string]string) ConfigOpt {
 	return func(config *Config) {
 		for k, v := range storage {
@@ -565,6 +735,24 @@ func WithLocalStorage(storage map[string]string) ConfigOpt {
 	}
 }
 
+// sessionStorage 设置爬虫启动时注入浏览器的 sessionStorage 键值对
+// 在 yak 中通过 crawlerx.sessionStorage 调用
+// 参数:
+//   - storage: 需要注入的 sessionStorage 键值映射
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：注入 sessionStorage
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.sessionStorage({"sid": "xyz"}))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithSessionStorage(storage map[string]string) ConfigOpt {
 	return func(config *Config) {
 		for k, v := range storage {
@@ -573,6 +761,24 @@ func WithSessionStorage(storage map[string]string) ConfigOpt {
 	}
 }
 
+// invalidSuffix 设置爬虫需要忽略的 URL 后缀(如静态资源)，命中后缀的链接不会被访问
+// 在 yak 中通过 crawlerx.invalidSuffix 调用
+// 参数:
+//   - suffix: 需要忽略的后缀列表，如 [".png", ".css"]
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：忽略图片与样式表
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.invalidSuffix([".png", ".css"]))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithInvalidSuffix(suffix []string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.invalidSuffix = append(config.baseConfig.invalidSuffix, suffix...)
@@ -635,12 +841,49 @@ func WithStartWaitGroup(waitGroup *utils.SizedWaitGroup) ConfigOpt {
 	}
 }
 
+// stealth 设置爬虫是否启用 stealth(隐身)模式，规避部分浏览器自动化检测
+// 在 yak 中通过 crawlerx.stealth 调用
+// 参数:
+//   - stealth: 是否启用隐身模式
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：启用隐身模式
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.stealth(true))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithStealth(stealth bool) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.stealth = stealth
 	}
 }
 
+// evalJs 设置在指定页面注入并执行的 JavaScript 代码
+// 在 yak 中通过 crawlerx.evalJs 调用
+// 参数:
+//   - target: 目标页面 URL
+//   - evalJs: 要在该页面执行的 JavaScript 代码
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：在指定页面执行 JS
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.evalJs("http://testphp.vulnweb.com/", "console.log(1)"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithEvalJs(target string, evalJs string) ConfigOpt {
 	return func(config *Config) {
 		if item, ok := config.baseConfig.evalJs[target]; ok {
@@ -651,30 +894,121 @@ func WithEvalJs(target string, evalJs string) ConfigOpt {
 	}
 }
 
+// jsResultSend 设置接收注入 JS 执行结果的回调函数
+// 在 yak 中通过 crawlerx.jsResultSend 调用
+// 参数:
+//   - storage: 接收 JS 执行结果字符串的回调函数
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：接收 JS 执行结果
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.jsResultSend(func(s) { println(s) }))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithJsResultSave(storage func(s string)) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.jsResultSave = storage
 	}
 }
 
+// vue 设置是否针对 Vue 等单页应用(SPA)启用专门的爬取策略
+// 在 yak 中通过 crawlerx.vue 调用
+// 参数:
+//   - vue: 是否启用 SPA 爬取策略
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：针对 Vue 单页应用爬取
+// ch = crawlerx.StartCrawler("http://spa.example.com/", crawlerx.vue(true))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithVue(vue bool) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.vue = vue
 	}
 }
 
+// response 为指定 URL 预设响应内容，命中该 URL 时直接使用预设响应而不发起真实请求
+// 在 yak 中通过 crawlerx.response 调用
+// 参数:
+//   - targetUrl: 目标 URL
+//   - response: 预设的响应内容
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：为指定 URL 预设响应
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.response("http://testphp.vulnweb.com/", "HTTP/1.1 200 OK\r\n\r\nhello"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithResponse(targetUrl string, response string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.response[targetUrl] = response
 	}
 }
 
+// sourceType 设置爬虫的来源类型标记，用于区分结果数据的产生来源
+// 在 yak 中通过 crawlerx.sourceType 调用
+// 参数:
+//   - sourceType: 来源类型字符串
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：设置来源类型
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.sourceType("scan"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithSourceType(sourceType string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.sourceType = sourceType
 	}
 }
 
+// fromPlugin 设置标记爬虫任务来源的插件名称
+// 在 yak 中通过 crawlerx.fromPlugin 调用
+// 参数:
+//   - fromPlugin: 来源插件名称
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：标记来源插件
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.fromPlugin("my-plugin"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithFromPlugin(fromPlugin string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.fromPlugin = fromPlugin
@@ -682,8 +1016,13 @@ func WithFromPlugin(fromPlugin string) ConfigOpt {
 }
 
 // urlCheck 是一个请求选项 用于设置是否在爬虫前进行url存活检测
+// 参数:
+//   - check: 是否在爬虫前进行 URL 存活检测
 //
-// Examples:
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
 // ```
 //
 //	targetUrl = "http://testphp.vulnweb.com/"
@@ -697,18 +1036,72 @@ func WithUrlCheck(check bool) ConfigOpt {
 	}
 }
 
+// aiInputUrl 设置由 AI 辅助进行表单输入的目标页面 URL
+// 在 yak 中通过 crawlerx.aiInputUrl 调用
+// 参数:
+//   - url: 需要 AI 辅助输入的页面 URL
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：指定 AI 辅助输入页面
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.aiInputUrl("http://testphp.vulnweb.com/login.php"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithAIInputUrl(url string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.aiInputUrl = url
 	}
 }
 
+// aiInputInfo 设置提供给 AI 进行表单填充的背景信息(如业务上下文)
+// 在 yak 中通过 crawlerx.aiInputInfo 调用
+// 参数:
+//   - info: 提供给 AI 的背景信息文本
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：提供 AI 输入背景信息
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.aiInputInfo("use test account"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithAIInputInf(info string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.aiInputInfo = info
 	}
 }
 
+// loginUsername 设置自动登录时使用的用户名(设置后会启用登录流程)
+// 在 yak 中通过 crawlerx.loginUsername 调用
+// 参数:
+//   - username: 登录用户名
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：设置自动登录用户名
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.loginUsername("admin"), crawlerx.loginPassword("admin"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithLoginUsername(username string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.login = true
@@ -716,6 +1109,24 @@ func WithLoginUsername(username string) ConfigOpt {
 	}
 }
 
+// loginPassword 设置自动登录时使用的密码(设置后会启用登录流程)
+// 在 yak 中通过 crawlerx.loginPassword 调用
+// 参数:
+//   - password: 登录密码
+//
+// 返回值:
+//   - 一个 crawlerx.StartCrawler 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：设置自动登录密码
+// ch = crawlerx.StartCrawler("http://testphp.vulnweb.com/", crawlerx.loginUsername("admin"), crawlerx.loginPassword("admin"))~
+//
+//	for req = range ch {
+//	    println(req.UrlStr())
+//	}
+//
+// ```
 func WithLoginPassword(password string) ConfigOpt {
 	return func(config *Config) {
 		config.baseConfig.login = true

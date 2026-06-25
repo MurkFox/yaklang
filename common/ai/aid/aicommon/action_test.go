@@ -306,3 +306,162 @@ func TestSupperAction_TagToKeyStream(t *testing.T) {
 	action.WaitStream(ctx)
 	require.True(t, checkTagStream)
 }
+
+// TestActionMaker_ExtraNonces_LLMUsesStableLiteral 验证 LLM 照抄占位符字面量
+// nonce "[current-nonce]" 输出 AITAG 时, 由 ExtraNonces 注册的 callback 命中.
+//
+// 这是 CACHE_TOOL_CALL 双注册兜底的"LLM 字面照抄"分支:
+//   - prompt 中 TOOL_PARAM_command 用 "[current-nonce]" 渲染, USER_QUERY 用 turn nonce 渲染
+//   - LLM 没识破占位符, 直接照抄输出 <|TOOL_PARAM_command_[current-nonce]|>...
+//   - ActionMaker 通过 ExtraNonces 给 TOOL_PARAM_command 同时注册了 turn nonce
+//     和 "[current-nonce]" 两个 callback, 字面量分支命中
+//
+// 关键词: TestActionMaker, ExtraNonces, [current-nonce] 字面照抄,
+//        CACHE_TOOL_CALL, 双注册兜底
+func TestActionMaker_ExtraNonces_LLMUsesStableLiteral(t *testing.T) {
+	turnNonce := uuid.NewString()
+	stableNonce := "[current-nonce]"
+	queryData := uuid.NewString()
+	cmdData := uuid.NewString()
+
+	input := fmt.Sprintf(`
+	{ "@action": "directly_call_tool" }
+<|USER_QUERY_%s|>
+%s
+<|USER_QUERY_END_%s|>
+<|TOOL_PARAM_command_%s|>
+%s
+<|TOOL_PARAM_command_END_%s|>
+`, turnNonce, queryData, turnNonce, stableNonce, cmdData, stableNonce)
+
+	ctx := context.Background()
+	maker := NewActionMaker("directly_call_tool",
+		WithActionNonce(turnNonce),
+		WithActionTagToKey("USER_QUERY", "user_query"),
+		WithActionTagToKeyAndExtraNonces("TOOL_PARAM_command", "__aitag__command", stableNonce),
+	)
+	action := maker.ReadFromReader(ctx, strings.NewReader(input))
+	action.WaitParse(ctx)
+	require.Equal(t, queryData, action.GetString("user_query"))
+	require.Equal(t, cmdData, action.GetString("__aitag__command"))
+}
+
+// TestActionMaker_ExtraNonces_LLMUsesTurnNonce 验证 LLM 把占位符替换为 turn nonce
+// 输出 AITAG 时, 由 m.nonce 默认 callback 命中 (双注册的另一分支).
+//
+// 这是 CACHE_TOOL_CALL 双注册兜底的"LLM 识破占位符"分支:
+//   - ActionMaker 同时注册 (TOOL_PARAM_command, turnNonce) + (TOOL_PARAM_command, "[current-nonce]")
+//   - LLM 输出 <|TOOL_PARAM_command_<turnNonce>|>... 命中 turn nonce 分支
+//
+// 关键词: TestActionMaker, ExtraNonces, turn nonce 替换占位符, 双注册兜底
+func TestActionMaker_ExtraNonces_LLMUsesTurnNonce(t *testing.T) {
+	turnNonce := uuid.NewString()
+	stableNonce := "[current-nonce]"
+	cmdData := uuid.NewString()
+
+	input := fmt.Sprintf(`
+	{ "@action": "directly_call_tool" }
+<|TOOL_PARAM_command_%s|>
+%s
+<|TOOL_PARAM_command_END_%s|>
+`, turnNonce, cmdData, turnNonce)
+
+	ctx := context.Background()
+	maker := NewActionMaker("directly_call_tool",
+		WithActionNonce(turnNonce),
+		WithActionTagToKeyAndExtraNonces("TOOL_PARAM_command", "__aitag__command", stableNonce),
+	)
+	action := maker.ReadFromReader(ctx, strings.NewReader(input))
+	action.WaitParse(ctx)
+	require.Equal(t, cmdData, action.GetString("__aitag__command"))
+}
+
+// TestActionMaker_ExtraNonces_EmptyExtrasFallsBackToTurn 验证 ExtraNonces 全为空
+// 字符串时被忽略, 等价于 WithActionTagToKey 行为 (只注册 m.nonce 一份 callback).
+// 关键词: TestActionMaker, ExtraNonces 空字符串过滤, 向后兼容
+func TestActionMaker_ExtraNonces_EmptyExtrasFallsBackToTurn(t *testing.T) {
+	turnNonce := uuid.NewString()
+	tagData := uuid.NewString()
+	input := fmt.Sprintf(`
+	{ "@action": "plan" }
+<|FINAL_ANSWER_%s|>
+%s
+<|FINAL_ANSWER_END_%s|>
+`, turnNonce, tagData, turnNonce)
+
+	ctx := context.Background()
+	maker := NewActionMaker("plan",
+		WithActionNonce(turnNonce),
+		WithActionTagToKeyAndExtraNonces("FINAL_ANSWER", "answer", "", "  "),
+	)
+	action := maker.ReadFromReader(ctx, strings.NewReader(input))
+	action.WaitParse(ctx)
+	require.Equal(t, tagData, action.GetString("answer"))
+}
+
+// TestActionMaker_LiteralCurrentNoncePlaceholder_FactsCase 验证: 当 AI 把
+// prompt 示例里的 "CURRENT_NONCE" 占位符当字面量直接照抄输出时, ActionMaker
+// 通过 ExtraNonces 注册 LiteralCurrentNoncePlaceholder 仍能命中, 把 FACTS
+// 内容写入 action.params[facts]. 这是 reactloops/exec.go buildActionTagOption
+// 默认追加 LiteralCurrentNoncePlaceholder 后的端到端兜底验证.
+//
+// 这个 case 模拟生产中实际观察到的 AI 输出:
+//
+//	{"@action": "output_facts"}
+//	<|FACTS_CURRENT_NONCE|>
+//	## 目标
+//	- id.redhaze.top: 198.18.0.53
+//	<|FACTS_END_CURRENT_NONCE|>
+//
+// 旧实现下只注册 turn nonce, callback 永远命中不到, action.facts 为空,
+// verifier 触发 5 次重试黑洞 + [AI Transaction Failed] 致命中断. 新实现
+// 默认双注册 turn nonce + LiteralCurrentNoncePlaceholder, 两种 AI 输出
+// 行为都能正确抽出内容.
+//
+// 关键词: LiteralCurrentNoncePlaceholder, CURRENT_NONCE 字面量兼容,
+//
+//	output_facts FACTS 抽取, 5 次重试黑洞修复
+func TestActionMaker_LiteralCurrentNoncePlaceholder_FactsCase(t *testing.T) {
+	turnNonce := uuid.NewString()
+	factsBody := "## 目标\n- id.redhaze.top: 198.18.0.53"
+	input := fmt.Sprintf(`
+{ "@action": "output_facts" }
+<|FACTS_%s|>
+%s
+<|FACTS_END_%s|>
+`, LiteralCurrentNoncePlaceholder, factsBody, LiteralCurrentNoncePlaceholder)
+
+	ctx := context.Background()
+	maker := NewActionMaker("output_facts",
+		WithActionNonce(turnNonce),
+		WithActionTagToKeyAndExtraNonces("FACTS", "facts", LiteralCurrentNoncePlaceholder),
+	)
+	action := maker.ReadFromReader(ctx, strings.NewReader(input))
+	action.WaitParse(ctx)
+	require.Equal(t, factsBody, strings.TrimSpace(action.GetString("facts")),
+		"AI 把 CURRENT_NONCE 当字面量照抄时, ExtraNonces 双注册必须命中并把 FACTS 抽到 action.facts")
+}
+
+// TestActionMaker_ExtraNonces_DeprecatedSingleAlias 验证已 deprecated 的
+// WithActionTagToKeyAndNonce 选项被 redirect 到 ExtraNonces 之后, 旧调用路径
+// 仍然兼容 (单 nonce 作为额外候选追加, m.nonce 始终保留).
+//
+// 关键词: TestActionMaker, WithActionTagToKeyAndNonce deprecated 兼容, ExtraNonces
+func TestActionMaker_ExtraNonces_DeprecatedSingleAlias(t *testing.T) {
+	stableNonce := "[current-nonce]"
+	cmdData := uuid.NewString()
+	input := fmt.Sprintf(`
+	{ "@action": "directly_call_tool" }
+<|TOOL_PARAM_command_%s|>
+%s
+<|TOOL_PARAM_command_END_%s|>
+`, stableNonce, cmdData, stableNonce)
+
+	ctx := context.Background()
+	maker := NewActionMaker("directly_call_tool",
+		WithActionTagToKeyAndNonce("TOOL_PARAM_command", "__aitag__command", stableNonce),
+	)
+	action := maker.ReadFromReader(ctx, strings.NewReader(input))
+	action.WaitParse(ctx)
+	require.Equal(t, cmdData, action.GetString("__aitag__command"))
+}

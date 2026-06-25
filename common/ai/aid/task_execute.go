@@ -37,6 +37,10 @@ func (t *AiTask) execute() error {
 
 	// Record task start time for duration calculation
 	t.taskStartTime = time.Now()
+	if t.Config != nil {
+		t.Config.ResetSessionSnapshotExecution(t.Name, "processing", t.taskStartTime)
+		t.Config.NotifySessionSnapshotEmit(true)
+	}
 
 	// Record timeline baseline before task execution starts
 	// We use the global timeline differ to track changes during task execution
@@ -55,6 +59,23 @@ func (t *AiTask) execute() error {
 
 	// Emit task execution start status
 	t.planLoadingStatus(fmt.Sprintf("执行子任务 [%s] / Executing Subtask [%s]: %s", t.Index, t.Index, t.Name))
+
+	defer func() {
+		if t.Config == nil {
+			return
+		}
+		status := "processing"
+		switch {
+		case t.executed():
+			status = "completed"
+		case t.GetStatus() == aicommon.AITaskState_Aborted:
+			status = "aborted"
+		case t.skiped():
+			status = "skipped"
+		}
+		t.Config.FinalizeSessionSnapshotExecution(status, time.Now())
+		t.Config.NotifySessionSnapshotEmit(true)
+	}()
 
 	err := t.ExecuteLoopTask(
 		schema.AI_REACT_LOOP_NAME_PE_TASK,
@@ -80,10 +101,36 @@ func (t *AiTask) execute() error {
 			// This provides an additional mechanism to end tasks beyond just isDone
 			lastRecord := loop.GetLastSatisfactionRecordFull()
 			var summary, completedTaskIndex, nextMovements string
+			var outputFiles []string
 			if lastRecord != nil {
 				summary = lastRecord.Reason
 				completedTaskIndex = lastRecord.CompletedTaskIndex
 				nextMovements = aicommon.FormatVerifyNextMovementsSummary(lastRecord.NextMovements)
+				outputFiles = append(outputFiles, lastRecord.OutputFiles...)
+
+				var allOps []aicommon.EvidenceOperation
+				allOps = append(allOps, lastRecord.EvidenceOps...)
+				allOps = append(allOps, buildVerificationCarryoverEvidenceOps(t, summary, outputFiles)...)
+				if len(allOps) > 0 {
+					// EVIDENCE 单写到 SessionPromptState (SESSION_EVIDENCE 段)。
+					// 历史曾把 EVIDENCE 块嵌入 root user input, 但这会让 PlanContext
+					// 跨子任务抖动并破坏多个 prompt cache 命中。现仅保留
+					// SESSION_EVIDENCE 单一渲染源, 其它 evidence 入口 (如
+					// output_evidence action) 写入的 task plan_evidence 不再被任何
+					// prompt 模板读取。
+					// 关键词: EVIDENCE 单写, ApplySessionEvidenceOps, PlanContext 抖动修复
+					log.Infof("task %s applying session evidence ops, count=%d", t.Index, len(allOps))
+					if incremental := aicommon.FormatEvidenceOpsLines(allOps, t.GetLanguage()); incremental != "" {
+						if _, emitErr := t.EmitTextMarkdownStreamEvent(
+							"plan-evidence",
+							strings.NewReader(incremental),
+							t.GetIndex(),
+						); emitErr != nil {
+							log.Warnf("failed to emit evidence incremental: %v", emitErr)
+						}
+					}
+					t.ApplySessionEvidenceOps(allOps)
+				}
 			}
 
 			// Check if current task index is in the completed_task_index list
@@ -184,7 +231,9 @@ func (t *AiTask) execute() error {
 ** 警告: 当前子任务已执行 {{ .CurrentIteration }} 次迭代，请认真评估：
   1. 任务目标是否实际上已经完成？如果工具已返回足够结果，请允许任务完成。
   2. 当前策略是否有效？如果反复失败，请更换工具或方法。
-  3. 不要重复执行相同的操作，这会浪费迭代次数。**
+  3. 不要重复执行相同的操作，这会浪费迭代次数。
+  4. 如果你当前执行的动作与 CURRENT_TASK 目标领域不相关（例如当前任务是 FTP 后门验证但你在做 Web 漏洞扫描），说明当前子任务实际已完成，应使用 directly_answer 输出任务总结并结束。
+  5. 安全测试中，"漏洞不存在"是有效的否定结论，不需要继续尝试——请直接总结结果并完成任务。**
 {{ end }}
 --- TASK_ITERATION_INFO_END ---
 
@@ -224,6 +273,7 @@ func (t *AiTask) execute() error {
 
 			return reactiveData, nil
 		}),
+		outputEvidenceAction(t),
 	)
 	if err != nil {
 		if t.GetStatus() == aicommon.AITaskState_Processing {
@@ -289,6 +339,8 @@ func (t *AiTask) executeTask() error {
 		t.EmitInfo("start to handle review task event: %v", ep.GetId())
 		err := t.handleReviewResult(reviewResult)
 		t.CallAfterReview(ep.GetSeq(), "请审查当前任务的执行结果", reviewResult)
+		// 价值评估 (review_decision): 监控任务审批通路, 区分人工与策略自动放行.
+		t.SubmitReviewValueFeedbackFromEndpoint(ep, aicommon.ReviewFocusModeTask, "请审查当前任务的执行结果")
 		if err != nil {
 			log.Warnf("error handling review result: %v", err)
 		}
@@ -318,6 +370,7 @@ func (t *AiTask) generateTaskSummary(summary, nextMovements string) error {
 	t.planLoadingStatus(fmt.Sprintf("任务 [%s] 等待 AI 生成总结 / Task [%s] Waiting AI Summary...", t.Index, t.Index))
 	extractStart := time.Now()
 	err = t.CallAITransaction(summaryPromptWellFormed, func(summaryReader *aicommon.AIResponse) error { // 异步过程 使用无 id的 原始ai callback
+		boundEmitter := summaryReader.BindEmitter(t.GetEmitter())
 		action, err := aicommon.ExtractValidActionFromStream(t.Ctx, summaryReader.GetUnboundStreamReader(false), "summary",
 			aicommon.WithActionFieldStreamHandler(
 				[]string{"task_long_summary"},
@@ -350,7 +403,7 @@ func (t *AiTask) generateTaskSummary(summary, nextMovements string) error {
 							referenceEmittedOnce.Do(func() {
 								streamId := event.GetContentJSONPath(`$.event_writer_id`)
 								if streamId != "" {
-									_, refErr := t.EmitTextReferenceMaterial(streamId, summaryPromptWellFormed)
+									_, refErr := boundEmitter.EmitTextReferenceMaterial(streamId, summaryPromptWellFormed)
 									if refErr != nil {
 										log.Warnf("emit reference material for summary field [%s] failed: %v", key, refErr)
 									}
@@ -360,7 +413,7 @@ func (t *AiTask) generateTaskSummary(summary, nextMovements string) error {
 					}
 
 					// Emit stream event with callback for reference material
-					event, emitErr = t.EmitTextMarkdownStreamEvent(nodeId, teeReader, t.GetIndex(), onEnd)
+					event, emitErr = boundEmitter.EmitTextMarkdownStreamEvent(nodeId, teeReader, t.GetIndex(), onEnd)
 
 					if emitErr != nil {
 						log.Errorf("failed to emit %s stream event: %v", key, emitErr)
@@ -385,7 +438,7 @@ func (t *AiTask) generateTaskSummary(summary, nextMovements string) error {
 			return utils.Errorf("error: short summary ,stats summary ,long summary are empty, retry it until summary finished")
 		}
 		return nil
-	})
+	}, aicommon.WithAIRequest_CallerLabel("task-summary"))
 	if longSummary == "" && taskSummary != "" {
 		var event *schema.AiOutputEvent
 		event, err = t.EmitTextMarkdownStreamEvent("summary-long", strings.NewReader(taskSummary), t.GetIndex())
@@ -417,6 +470,30 @@ func (t *AiTask) generateTaskSummary(summary, nextMovements string) error {
 		t.LongSummary = longSummary
 	} else if taskSummary != "" {
 		t.LongSummary = taskSummary
+	}
+
+	displaySummary := strings.TrimSpace(longSummary)
+	if displaySummary == "" {
+		displaySummary = strings.TrimSpace(taskSummary)
+	}
+	if displaySummary != "" {
+		summaryOps := buildSummaryEvidenceOps(t, displaySummary)
+		if len(summaryOps) > 0 {
+			// EVIDENCE 单写到 SessionPromptState (SESSION_EVIDENCE 段),
+			// 同上方 verify-stage 处理理由。
+			// 关键词: EVIDENCE 单写, ApplySessionEvidenceOps, PlanContext 抖动修复
+			log.Infof("task %s applying session summary evidence ops, count=%d", t.Index, len(summaryOps))
+			if incremental := aicommon.FormatEvidenceOpsLines(summaryOps, t.GetLanguage()); incremental != "" {
+				if _, emitErr := t.EmitTextMarkdownStreamEvent(
+					"plan-evidence",
+					strings.NewReader(incremental),
+					t.GetIndex(),
+				); emitErr != nil {
+					log.Warnf("failed to emit summary evidence incremental: %v", emitErr)
+				}
+			}
+			t.ApplySessionEvidenceOps(summaryOps)
+		}
 	}
 
 	t.planLoadingStatus(fmt.Sprintf("任务 [%s] 总结完成 / Task [%s] Summary Completed", t.Index, t.Index))
@@ -721,13 +798,40 @@ func formatDuration(d time.Duration) string {
 }
 
 func (t *AiTask) GenerateTaskSummaryPrompt() (string, error) {
-	results, err := utils.RenderTemplate(__prompt_TaskSummary, map[string]any{
-		"ContextProvider": t.Coordinator.ContextProvider,
-	})
-	if err != nil {
-		return "", err
+	if t == nil || t.Coordinator == nil || t.Coordinator.ContextProvider == nil {
+		return "", fmt.Errorf("context provider is nil")
 	}
-	return results, nil
+	cp := clonePromptContextForTask(t.ContextProvider, t)
+	return assembleTaskSummaryPrompt(
+		t.Coordinator.Config,
+		cp.Schema()["TaskSummarySchema"],
+		cp.CurrentTaskInfo(),
+	)
+}
+
+type taskSummaryDynamicData struct {
+	CurrentTaskInfo string
+}
+
+func assembleTaskSummaryPrompt(config *aicommon.Config, schema string, currentTaskInfo string) (string, error) {
+	materials := &aicommon.PromptMaterials{
+		TaskInstruction: strings.TrimSpace(__prompt_TaskSummaryInstruction),
+		Schema:          strings.TrimSpace(schema),
+		OutputExample:   strings.TrimSpace(__prompt_TaskSummaryOutputExample),
+	}
+	aicommon.ApplyPromptFrozenOpenMaterials(materials, aicommon.BuildPromptFrozenOpenMaterials(config))
+	if err := aicommon.PopulateToolInventoryFromConfig(materials, config); err != nil {
+		return "", fmt.Errorf("populate task summary tool inventory failed: %w", err)
+	}
+	return aicommon.NewDefaultPromptPrefixBuilder().AssemblePromptWithDynamicSection(
+		materials,
+		"aid-task-summary-dynamic",
+		__prompt_TaskSummary,
+		taskSummaryDynamicData{
+			CurrentTaskInfo: strings.TrimSpace(currentTaskInfo),
+		},
+		utils.RandStringBytes(6),
+	)
 }
 
 func SelectSummary(task *AiTask, callResult *aitool.ToolResult) string {

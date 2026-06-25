@@ -91,7 +91,7 @@ phpBlock
     ;
 
 importStatement
-    : Import Namespace namespaceNameList SemiColon
+    : Import Namespace namespaceUseDeclaration SemiColon
     ;
 
 topStatement
@@ -109,7 +109,7 @@ useDeclaration
     ;
 
 useDeclarationContentList
-    : '\\'? namespaceNameList (',' '\\'? namespaceNameList)*
+    : namespaceUseDeclaration (',' namespaceUseDeclaration)*
     ;
 
 namespacePath
@@ -123,16 +123,29 @@ namespaceDeclaration
     )
     ;
 
+namespaceDeclarationSemi
+    : Namespace namespacePath SemiColon namespaceStatement*
+    ;
+
 namespaceStatement
     : useDeclaration
     | functionDeclaration
     | classDeclaration
     | globalConstantDeclaration
+    | enumDeclaration
     | statement
     ;
 
+namespaceDeclarationBody
+    : namespaceStatement*
+    ;
+
+namespaceUseDeclarations
+    : useDeclaration+
+    ;
+
 functionDeclaration
-    : attributes? Function_ '&'? identifier /*typeParameterListInBrackets?*/ '(' formalParameterList ')' (
+    : attributes? Function_ '&'? callableIdentifier /*typeParameterListInBrackets?*/ '(' formalParameterList ')' (
         ':' QuestionMark? typeHint
     )? blockStatement
     ;
@@ -175,6 +188,12 @@ typeParameterDecl
 
 typeParameterWithDefaultDecl
     : attributes? identifier Eq (qualifiedStaticTypeRef | primitiveType)
+    ;
+
+callableIdentifier
+    : identifier
+    | Require
+    | RequireOnce
     ;
 
 //genericDynamicArgs
@@ -329,7 +348,9 @@ foreachStatement
     : Foreach (
         '(' expression As arrayDestructuring ')'
         | '(' chain As '&'? assignable ('=>' '&'? chain)? ')'
-        | '(' expression As assignable ('=>' '&'? chain)? ')'
+        | '(' expression As '&'? assignable ('=>' '&'? chain)? ')'
+        | '(' expression As List '(' assignmentList ')' ')'
+        | '(' expression As '&'? assignable '=>' List '(' assignmentList ')' ')'
         | '(' chain As List '(' assignmentList ')' ')'
     ) (statement | ':' innerStatementList EndForeach SemiColon)
     ;
@@ -381,10 +402,23 @@ formalParameter
     ;
 
 typeHint
+    : typeHintAtom
+    | typeHintIntersection
+    | typeHintUnion
+    ;
+
+typeHintAtom
     : Callable
     | primitiveType
     | qualifiedStaticTypeRef
-    | typeHint '|' typeHint
+    ;
+
+typeHintIntersection
+    : typeHintAtom ('&' typeHintAtom)+
+    ;
+
+typeHintUnion
+    : typeHintAtom ('|' typeHintAtom)+
     ;
 
 globalStatement
@@ -407,7 +441,7 @@ classStatement
     | attributes? memberModifiers? Const typeHint? identifierInitializer (
         ',' identifierInitializer
     )* SemiColon # Const
-    | attributes? memberModifiers? Function_ '&'? identifier /*typeParameterListInBrackets?*/ '(' formalParameterList ')' (
+    | attributes? memberModifiers? Function_ '&'? callableIdentifier /*typeParameterListInBrackets?*/ '(' formalParameterList ')' (
         baseCtorCall
         | returnTypeDecl
     )? methodBody # Function
@@ -475,6 +509,9 @@ enumDeclaration
 
 enumItem
     : Case identifier (Eq expression)? SemiColon
+    | attributes? memberModifiers? Const typeHint? identifierInitializer (
+        ',' identifierInitializer
+    )* SemiColon
     | memberModifiers? functionDeclaration
     | Use qualifiedNamespaceNameList traitAdaptations
     ;
@@ -497,12 +534,11 @@ staticClassExpr
     ;
 
 staticClassExprFunctionMember
-    : staticClass '::' identifier
+    : staticClass '::' memberCallKey
     ;
 
 staticClassExprVariableMember
     : staticClass '::' variable
-    | staticClass '::' variable OpenSquareBracket expression? CloseSquareBracket
     ;
 
 staticClass
@@ -514,6 +550,8 @@ staticClass
 
 memberCallKey
     : identifier
+    | Require
+    | RequireOnce
     | string
     | variable
     | OpenCurlyBracket expression CloseCurlyBracket
@@ -525,14 +563,39 @@ indexMemberCallKey
     | expression
     ;
 
+dynamicStaticClassExpr
+    : dynamicStaticReceiver '::' memberCallKey
+    | dynamicStaticReceiver '::' variable
+    ;
+
+dynamicStaticReceiver
+    : staticClassExpr
+    | dynamicStaticReceiverBase dynamicStaticReceiverAccess*
+    ;
+
+dynamicStaticReceiverBase
+    : functionCall
+    | parentheses
+    | flexiVariable
+    ;
+
+dynamicStaticReceiverAccess
+    : ObjectOperator memberCallKey arguments?
+    | NullsafeObjectOperator memberCallKey arguments?
+    | squareCurlyExpression
+    ;
+
 // Expressions
 // Grouped by priorities: http://php.net/manual/en/language.operators.precedence.php
 expression
     : Clone expression                                                                  # CloneExpression
     | newExpr                                                                           # KeywordNewExpression
+    | functionCall                                                                      # DirectFunctionCallExpression
     | fullyQualifiedNamespaceExpr                                                       # FullyQualifiedNamespaceExpression
     | Parent_ DoubleColon memberCallKey                                                 # ParentExpression
+    | dynamicStaticClassExpr                                                            # DynamicStaticClassAccessExpression
     | expression ObjectOperator memberCallKey                                           # MemberCallExpression
+    | expression NullsafeObjectOperator memberCallKey                                   # MemberCallExpression
     | expression '[' indexMemberCallKey ']'                                             # IndexCallExpression
     | expression ObjectOperator? OpenCurlyBracket indexMemberCallKey? CloseCurlyBracket # IndexLegacyCallExpression
     | '\\'? staticClassExpr                                                             # StaticClassAccessExpression
@@ -556,12 +619,10 @@ expression
     | matchExpr                                                                         # MatchExpression
     | '(' castOperation ')' expression                                                  # CastExpression
     | expression arguments                                                              # FunctionCallExpression
-    | staticClassExprVariableMember Eq '&' expression                                   # StaticClassReferenceAssignmentExpression
-    | staticClassExprVariableMember assignmentOperator expression                       # StaticClassMemberCallAssignmentExpression
     | ('~' | '@') expression                                                            # UnaryOperatorExpression
     | ('!' | '+' | '-') expression                                                      # UnaryOperatorExpression
-    | ('++' | '--') flexiVariable                                                       # PrefixIncDecExpression
-    | flexiVariable ('++' | '--')                                                       # PostfixIncDecExpression
+    | ('++' | '--') assignableChain                                                     # PrefixIncDecExpression
+    | assignableChain ('++' | '--')                                                     # PostfixIncDecExpression
     | <assoc = right> expression op = '**' expression                                   # ArithmeticExpression
     | expression InstanceOf expression                                                  # InstanceOfExpression
     | expression op = ('*' | Divide | '%') expression                                   # ArithmeticExpression
@@ -578,8 +639,10 @@ expression
     | expression op = '??' expression                                                   # NullCoalescingExpression
     | expression op = '<=>' expression                                                  # SpaceshipExpression
     | leftArrayCreation Eq expression                                                   # ArrayCreationUnpackExpression
-    | flexiVariable Eq '&' expression                                                   # ReferenceAssignmentExpression
-    | flexiVariable assignmentOperator expression                                       # OrdinaryAssignmentExpression
+    | functionCallAssignable Eq '&' expression                                          # FunctionCallAssignableReferenceAssignmentExpression
+    | functionCallAssignable assignmentOperator expression                              # FunctionCallAssignableAssignmentExpression
+    | assignableChain Eq '&' expression                                                 # ReferenceAssignmentExpression
+    | assignableChain assignmentOperator expression                                     # OrdinaryAssignmentExpression
     | expression op = LogicalAnd expression                                             # LogicalExpression
     | expression op = LogicalXor expression                                             # LogicalExpression
     | expression op = LogicalOr expression                                              # LogicalExpression
@@ -591,8 +654,7 @@ flexiVariable
     : variable                                                             # CustomVariable
     | flexiVariable '[' indexMemberCallKey? ']'                            # IndexVariable
     | flexiVariable OpenCurlyBracket indexMemberCallKey? CloseCurlyBracket # IndexLegacyCallVariable
-    | flexiVariable ObjectOperator memberCallKey arguments                 # MemberFunction
-    | flexiVariable ObjectOperator memberCallKey                           # MemberVariable
+    | flexiVariable ObjectOperator memberCallKey arguments?                # FlexiMemberAccess
     ;
 
 defineExpr
@@ -601,9 +663,9 @@ defineExpr
     ;
 
 variable
-    : VarName                                               # NormalVariable     // $a=3
-    | Dollar+ VarName                                       # DynamicVariable    // $$a= 1; or $$$a=1;
-    | Dollar+ OpenCurlyBracket expression CloseCurlyBracket # MemberCallVariable // ${ expr }=3
+    : VarName squareCurlyExpression*                                               # NormalVariable     // $a=3
+    | Dollar+ VarName squareCurlyExpression*                                       # DynamicVariable    // $$a= 1; or $$$a=1;
+    | Dollar+ OpenCurlyBracket expression CloseCurlyBracket squareCurlyExpression* # MemberCallVariable // ${ expr }=3
     ;
 
 include
@@ -640,8 +702,8 @@ keyedDestructItem
     ;
 
 lambdaFunctionExpr
-    : Static? Function_ '&'? '(' formalParameterList ')' lambdaFunctionUseVars? (':' typeHint)? blockStatement
-    | LambdaFn '(' formalParameterList ')' '=>' expression
+    : Static? Function_ '&'? '(' formalParameterList ')' lambdaFunctionUseVars? (':' QuestionMark? typeHint)? blockStatement
+    | Static? LambdaFn '(' formalParameterList ')' (':' QuestionMark? typeHint)? '=>' expression
     ;
 
 matchExpr
@@ -649,7 +711,7 @@ matchExpr
     ;
 
 matchItem
-    : expression (',' expression)* '=>' expression
+    : expression (',' expression)* ','? '=>' expression
     ;
 
 newExpr
@@ -707,6 +769,7 @@ typeRef
     | primitiveType
     | Static
     | flexiVariable
+    | staticClassExprVariableMember
     | anonymousClass
     ;
 
@@ -724,17 +787,21 @@ indirectTypeRef
     ;
 
 qualifiedNamespaceName
-    : Namespace? '\\'? namespaceNameList
+    : Namespace? namespacePath
     ;
 
-namespaceNameList
-    : namespacePath (As identifier)?        # NamespaceIdentifier //这里
-    | namespacePath '\\'? namespaceNameTail # NamespaceListNameTail
-    ;
-
-namespaceNameTail
+namespaceUseDeclaration
     : namespacePath (As identifier)?
-    | OpenCurlyBracket namespaceNameTail (',' namespaceNameTail)* ','? CloseCurlyBracket
+    | namespacePath '\\' namespaceUseTail
+    ;
+
+namespaceUseTail
+    : OpenCurlyBracket namespaceUseClause (',' namespaceUseClause)* ','? CloseCurlyBracket
+    ;
+
+namespaceUseClause
+    : namespacePath (As identifier)?
+    | namespacePath '\\' namespaceUseTail
     ;
 
 qualifiedNamespaceNameList
@@ -742,7 +809,8 @@ qualifiedNamespaceNameList
     ;
 
 arguments
-    : '(' actualArgument? (',' actualArgument)* ','? ')'
+    : '(' Ellipsis ')'
+    | '(' actualArgument? (',' actualArgument)* ','? ')'
     ;
 
 actualArgument
@@ -825,6 +893,36 @@ chainList
 chain
     : flexiVariable
     | staticClassExprVariableMember
+    ;
+
+assignableChain
+    : flexiVariable
+    | staticClassExprVariableMember
+    | assignableChainOrigin assignableChainAccess+
+    ;
+
+functionCallAssignable
+    : functionCall functionCallAssignableAccess+
+    ;
+
+functionCallAssignableAccess
+    : memberAccess
+    | squareCurlyExpression
+    ;
+
+assignableChainOrigin
+    : staticMethodCall
+    | staticClassExprVariableMember
+    | parentheses
+    ;
+
+assignableChainAccess
+    : memberAccess
+    | squareCurlyExpression
+    ;
+
+staticMethodCall
+    : classConstant actualArguments
     ;
 
 chainOrigin
@@ -913,6 +1011,8 @@ key
     | Clone
     | Const
     | Continue
+    | Define
+    | Defined
     | Declare
     | Default
     | Do
@@ -969,8 +1069,6 @@ key
     | Protected
     | Public
     | Readonly
-    //    | Require
-    //    | RequireOnce
     | Resource
     | Return
     | Static
@@ -983,7 +1081,7 @@ key
     | UintCast
     | UnicodeCast
     | Unset
-    | Use
+    //    | Use
     | Var
     | While
     | Yield

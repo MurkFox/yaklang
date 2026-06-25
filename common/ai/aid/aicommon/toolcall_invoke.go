@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yaklang/yaklang/common/consts"
 	"io"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/yaklang/yaklang/common/log"
@@ -25,11 +28,44 @@ const (
 	ToolCallAction_Finish        = "finish"
 )
 
+type toolOutputBuffer struct {
+	mu  sync.RWMutex
+	buf bytes.Buffer
+}
+
+func (b *toolOutputBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *toolOutputBuffer) Snapshot() []byte {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return bytes.Clone(b.buf.Bytes())
+}
+
+func (b *toolOutputBuffer) Bytes() []byte {
+	return b.Snapshot()
+}
+
+func (b *toolOutputBuffer) Len() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.buf.Len()
+}
+
+func staticSnapshot(snapshot []byte) func() []byte {
+	return func() []byte {
+		return snapshot
+	}
+}
+
 func (a *ToolCaller) intervalReviewContext(
 	ctx context.Context, reviewCancel func(),
 	tool *aitool.Tool,
 	params aitool.InvokeParams,
-	stdoutSnapshot, stderrSnapshot []byte,
+	stdoutSnapshot, stderrSnapshot func() []byte,
 	onAICanceled func(any),
 ) {
 	defer func() {
@@ -38,6 +74,13 @@ func (a *ToolCaller) intervalReviewContext(
 			utils.PrintCurrentGoroutineRuntimeStack()
 		}
 	}()
+
+	if stdoutSnapshot == nil {
+		stdoutSnapshot = func() []byte { return nil }
+	}
+	if stderrSnapshot == nil {
+		stderrSnapshot = func() []byte { return nil }
+	}
 
 	if utils.IsNil(a.intervalReviewHandler) {
 		return
@@ -54,7 +97,7 @@ func (a *ToolCaller) intervalReviewContext(
 			case <-ctx.Done():
 				return
 			default:
-				shouldContinue, err := a.intervalReviewHandler(ctx, tool, params, stdoutSnapshot, stderrSnapshot, a.callExpectations)
+				shouldContinue, err := a.intervalReviewHandler(ctx, tool, params, stdoutSnapshot(), stderrSnapshot(), a.callExpectations)
 				if err != nil {
 					log.Errorf("interval review handler failed: %v", err)
 					continue
@@ -80,7 +123,13 @@ func (a *ToolCaller) IntervalReviewContext(
 	stdoutSnapshot, stderrSnapshot []byte,
 	onAICanceled func(any),
 ) {
-	a.intervalReviewContext(ctx, reviewCancel, tool, params, stdoutSnapshot, stderrSnapshot, onAICanceled)
+	a.intervalReviewContext(
+		ctx, reviewCancel,
+		tool, params,
+		staticSnapshot(stdoutSnapshot),
+		staticSnapshot(stderrSnapshot),
+		onAICanceled,
+	)
 }
 
 func (a *ToolCaller) GetCallExpectations() string {
@@ -93,7 +142,7 @@ func (a *ToolCaller) invoke(
 	userCancel func(reason any),
 	reportError func(err any),
 	stdoutWriter, stderrWriter io.Writer,
-	stdoutSnapshotBuffer, stderrSnapshotBuffer *bytes.Buffer,
+	stdoutSnapshotBuffer, stderrSnapshotBuffer *toolOutputBuffer,
 ) (*aitool.ToolResult, error) {
 	c := a.config
 	e := a.emitter
@@ -196,25 +245,52 @@ func (a *ToolCaller) invoke(
 			a.intervalReviewContext(
 				ctx, cancel,
 				tool, params,
-				stdoutSnapshotBuffer.Bytes(),
-				stderrSnapshotBuffer.Bytes(),
+				stdoutSnapshotBuffer.Snapshot,
+				stderrSnapshotBuffer.Snapshot,
 				userCancel,
 			)
 		}()
 		<-intervalStart
 	}
 
-	execResult, execErr := tool.InvokeWithParams(
-		params,
-		aitool.WithStdout(stdoutWriter),
-		aitool.WithStderr(stderrWriter),
-		aitool.WithContext(ctx),
-		aitool.WithErrorCallback(toolCallErr),
-		aitool.WithResultCallback(toolCallSuccess),
-		aitool.WithCancelCallback(toolCallCancel),
-		aitool.WithRuntimeConfig(&aitool.ToolRuntimeConfig{
-			RuntimeID: a.callToolId,
-			FeedBacker: func(result *ypb.ExecResult) error {
+	refreshHTTPFlowCount := func() {
+		count := yakit.CountHTTPFlowByRuntimeID(consts.GetGormProjectDatabase(), a.callToolId)
+		if count > 0 {
+			e.EmitYakitHTTPFlowCount(a.callToolId, count)
+		}
+	}
+
+	refreshRiskCount := func() {
+		count, _ := yakit.CountRiskByRuntimeId(consts.GetGormProjectDatabase(), a.callToolId)
+		if count > 0 {
+			e.EmitYakitRiskCount(a.callToolId, count)
+		}
+	}
+
+	unsubscribe := schema.SubscribeRuntimeScopedBroadcast(a.callToolId, func(event *schema.RuntimeScopedBroadcastEvent) {
+		if event.Type == schema.RuntimeScopedBroadcastTypeHTTPFlow {
+			refreshHTTPFlowCount()
+		}
+
+		if event.Type == schema.RuntimeScopedBroadcastTypeRisk {
+			refreshRiskCount()
+		}
+	})
+	defer func() {
+		unsubscribe()
+		refreshHTTPFlowCount()
+		refreshRiskCount()
+		NotifySessionSnapshotRuntimeRefresh(a.config, a.callToolId)
+	}()
+
+	var browserTracker interface{ TrackBrowserSession(id string) }
+	if c != nil {
+		browserTracker = c.GetBrowserSessionTracker()
+	}
+	runtimeCfg := &aitool.ToolRuntimeConfig{
+		RuntimeID:             a.callToolId,
+		BrowserSessionTracker: browserTracker,
+		FeedBacker: func(result *ypb.ExecResult) error {
 				// 处理 risk 消息
 				risk, _ := handleRiskMessage(result)
 				if risk != nil {
@@ -225,6 +301,9 @@ func (a *ToolCaller) invoke(
 					e.EmitYakitHTTPFlow(httpFlow.RuntimeId, httpFlow.HiddenIndex)
 					return nil
 				}
+				if path, ok := handleFileWriteMessage(result); ok {
+					NotifySessionSnapshotFileWrite(a.config, path)
+				}
 				// 过滤文件 Stat/Read 等高频消息，避免对前端造成压力
 				if shouldIgnoreExecResultForEmit(result) {
 					return nil
@@ -232,7 +311,16 @@ func (a *ToolCaller) invoke(
 				e.EmitYakitExecResult(result)
 				return nil
 			},
-		}),
+	}
+	execResult, execErr := tool.InvokeWithParams(
+		params,
+		aitool.WithStdout(stdoutWriter),
+		aitool.WithStderr(stderrWriter),
+		aitool.WithContext(ctx),
+		aitool.WithErrorCallback(toolCallErr),
+		aitool.WithResultCallback(toolCallSuccess),
+		aitool.WithCancelCallback(toolCallCancel),
+		aitool.WithRuntimeConfig(runtimeCfg),
 	)
 	ep.ActiveWithParams(ctx, map[string]any{"suggestion": "finish"})
 	reqs := map[string]any{"suggestion": "finish"}
@@ -254,48 +342,57 @@ func (a *ToolCaller) invoke(
 // to reduce gRPC pressure on the frontend.
 // It filters out high-frequency file STATUS (Stat) messages.
 func shouldIgnoreExecResultForEmit(result *ypb.ExecResult) bool {
-	if result == nil || !result.IsMessage || len(result.Message) == 0 {
+	fileData, ok := parseYakitFileExecResult(result)
+	if !ok {
 		return false
+	}
+	action := utils.InterfaceToString(fileData["action"])
+	return action == yaklib.Status_Action || action == "STATUS"
+}
+
+func parseYakitFileExecResult(result *ypb.ExecResult) (map[string]any, bool) {
+	if result == nil || !result.IsMessage || len(result.Message) == 0 {
+		return nil, false
 	}
 
 	var yakitMsg yaklib.YakitMessage
 	if err := json.Unmarshal(result.Message, &yakitMsg); err != nil {
-		return false
+		return nil, false
 	}
-
-	if yakitMsg.Type != "log" {
-		return false
-	}
-
-	if len(yakitMsg.Content) == 0 {
-		return false
+	if yakitMsg.Type != "log" || len(yakitMsg.Content) == 0 {
+		return nil, false
 	}
 
 	var logInfo yaklib.YakitLog
 	if err := json.Unmarshal(yakitMsg.Content, &logInfo); err != nil {
-		return false
+		return nil, false
+	}
+	if logInfo.Level != "file" || strings.TrimSpace(logInfo.Data) == "" {
+		return nil, false
 	}
 
-	// filter out file level logs with STATUS action (yakit.fileStatusAction)
-	// STATUS is called for every file during traversal in find_file.yak, grep.yak etc.
-	// This causes massive gRPC messages when scanning large directories
-	//
-	// Message structure (from YakitClient.YakitDraw -> YakitFile):
-	// YakitMessage{Type: "log", Content: YakitLog{Level: "file", Data: `{"action":"STATUS",...}`}}
-	if logInfo.Level == "file" && logInfo.Data != "" {
-		var fileData = make(map[string]any)
-		if err := json.Unmarshal([]byte(logInfo.Data), &fileData); err != nil {
-			// cannot parse Data as JSON, don't filter (safe default)
-			return false
-		}
-
-		action := utils.InterfaceToString(fileData["action"])
-		if action == "STATUS" {
-			return true
-		}
+	var fileData map[string]any
+	if err := json.Unmarshal([]byte(logInfo.Data), &fileData); err != nil {
+		return nil, false
 	}
+	return fileData, true
+}
 
-	return false
+// handleFileWriteMessage detects yakit.File fileWriteAction telemetry (action=WRITE).
+func handleFileWriteMessage(result *ypb.ExecResult) (path string, ok bool) {
+	fileData, parsed := parseYakitFileExecResult(result)
+	if !parsed {
+		return "", false
+	}
+	action := strings.ToUpper(strings.TrimSpace(utils.InterfaceToString(fileData["action"])))
+	if action != yaklib.Write_Action {
+		return "", false
+	}
+	path = strings.TrimSpace(utils.InterfaceToString(fileData["path"]))
+	if path == "" {
+		return "", false
+	}
+	return path, true
 }
 
 func handleRiskMessage(result *ypb.ExecResult) (*schema.Risk, error) {

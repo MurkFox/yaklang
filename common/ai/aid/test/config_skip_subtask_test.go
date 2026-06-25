@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"github.com/yaklang/yaklang/common/ai/aid/aicache"
 	"regexp"
 	"strings"
 	"sync"
@@ -26,6 +27,16 @@ import (
 // extractCurrentTaskContent 从 prompt 中提取 <|CURRENT_TASK_{{nonce}}|> 和 <|CURRENT_TASK_END_{{nonce}}|> 之间的内容
 // 返回提取的内容，如果未找到则返回空字符串
 func extractCurrentTaskContent(prompt string) string {
+	splitRes := aicache.Split(prompt)
+	for _, chunk := range splitRes.Chunks {
+		if chunk.Section == aicache.SectionDynamic {
+			re := regexp.MustCompile(`(?s)<\|CURRENT_TASK(?:_[a-z0-9]+)?\|>(.*?)<\|CURRENT_TASK_END(?:_[a-z0-9]+)?\|>`)
+			matches := re.FindStringSubmatch(chunk.Content)
+			if len(matches) >= 2 {
+				return matches[1]
+			}
+		}
+	}
 	re := regexp.MustCompile(`(?s)<\|CURRENT_TASK(?:_[a-z0-9]+)?\|>(.*?)<\|CURRENT_TASK_END(?:_[a-z0-9]+)?\|>`)
 	matches := re.FindStringSubmatch(prompt)
 	if len(matches) >= 2 {
@@ -76,17 +87,9 @@ func TestCoordinator_SkipSubtaskInPlan(t *testing.T) {
 		}),
 		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := request.GetPrompt()
-			rsp := config.NewAIResponse()
-			defer rsp.Close()
 
-			// 处理 plan 请求
-			isPlanRequest := (strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具")) &&
-				(strings.Contains(prompt, "PERSISTENT_") || strings.Contains(prompt, "任务设计输出要求") || strings.Contains(prompt, "```schema"))
-
-			if isPlanRequest {
-				rsp.EmitOutputStream(strings.NewReader(`{
-    "@action": "plan",
-    "query": "测试跳过子任务",
+			skipSubtaskPlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "测试跳过子任务功能",
     "main_task_goal": "验证 skip_subtask_in_plan 功能正常工作",
     "tasks": [
@@ -94,11 +97,14 @@ func TestCoordinator_SkipSubtaskInPlan(t *testing.T) {
         {"subtask_name": "第二个任务-需要跳过", "subtask_goal": "这个任务需要被跳过"},
         {"subtask_name": "第三个任务", "subtask_goal": "执行第三个任务"}
     ]
-}`))
-				return rsp, nil
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, skipSubtaskPlanJSON); rsp != nil {
+				return rsp, err
 			}
 
-			// 处理 summary 请求
+			rsp := config.NewAIResponse()
+			defer rsp.Close()
+
 			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
 				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "s", "task_short_summary": "s", "task_long_summary": "s"}`))
 				return rsp, nil
@@ -184,6 +190,168 @@ LOOP:
 	require.True(t, skipSuccess, "skip should succeed")
 }
 
+func TestCoordinator_SkipSubtaskInPlan_AlreadySkipped(t *testing.T) {
+	inputChan := chanx.NewUnlimitedChan[*ypb.AIInputEvent](context.Background(), 100)
+	outputChan := make(chan *schema.AiOutputEvent, 100)
+
+	task1Started := make(chan struct{}, 1)
+	firstSkipDone := make(chan struct{})
+
+	ins, err := aid.NewCoordinator(
+		"测试重复跳过已跳过的子任务",
+		aicommon.WithAgreeYOLO(),
+		aicommon.WithMemoryTriage(aimem.NewMockMemoryTriage()),
+		aicommon.WithDisableIntentRecognition(true),
+		aicommon.WithEnableSelfReflection(false),
+		aicommon.WithDisableAutoSkills(true),
+		aicommon.WithDisableSessionTitleGeneration(true),
+		aicommon.WithGenerateReport(false),
+		aicommon.WithEventInputChanx(inputChan),
+		aicommon.WithEventHandler(func(event *schema.AiOutputEvent) {
+			outputChan <- event
+		}),
+		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			prompt := request.GetPrompt()
+
+			skipPlanJSON := `{
+    "@action": "plan_from_document",
+    "main_task": "测试重复跳过",
+    "main_task_goal": "验证对已跳过子任务再次跳过时会返回错误",
+    "tasks": [
+        {"subtask_name": "第一个任务", "subtask_goal": "先被成功跳过"}
+    ]
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, skipPlanJSON); rsp != nil {
+				return rsp, err
+			}
+
+			rsp := config.NewAIResponse()
+			defer rsp.Close()
+
+			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
+				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "s", "task_short_summary": "s", "task_long_summary": "s"}`))
+				return rsp, nil
+			}
+
+			if utils.MatchAllOfSubString(prompt, "directly_answer", "require_tool") {
+				if isCurrentTask(prompt, "第一个任务") {
+					select {
+					case task1Started <- struct{}{}:
+					default:
+					}
+
+					select {
+					case <-firstSkipDone:
+					case <-time.After(3 * time.Second):
+					}
+				}
+				rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "finish", "answer_payload": "完成"}}`))
+				return rsp, nil
+			}
+
+			if utils.MatchAllOfSubString(prompt, "verify-satisfaction", "user_satisfied", "reasoning") {
+				rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "完成"}`))
+				return rsp, nil
+			}
+
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "finish"}`))
+			return rsp, nil
+		}),
+	)
+	require.NoError(t, err)
+
+	go func() {
+		ins.Run()
+	}()
+
+	firstSkipSent := false
+	secondSkipSent := false
+	firstSkipSuccess := false
+	secondSkipError := false
+	runFinished := false
+	firstSyncID := uuid.New().String()
+	secondSyncID := uuid.New().String()
+	ctx := utils.TimeoutContextSeconds(15)
+
+LOOP:
+	for {
+		select {
+		case <-task1Started:
+			if !firstSkipSent {
+				firstSkipSent = true
+				inputChan.SafeFeed(SyncInputEventWithJSON(
+					aicommon.SYNC_TYPE_SKIP_SUBTASK_IN_PLAN,
+					firstSyncID,
+					map[string]any{
+						"subtask_index": "1-1",
+						"reason":        "先正常跳过一次",
+					},
+				))
+			}
+
+		case result := <-outputChan:
+			if result.Type == schema.EVENT_TYPE_PLAN_REVIEW_REQUIRE {
+				inputChan.SafeFeed(ContinueSuggestionInputEvent(result.GetInteractiveId()))
+				continue
+			}
+
+			if result.Type == schema.EVENT_TYPE_TASK_REVIEW_REQUIRE || result.Type == schema.EVENT_TYPE_TOOL_USE_REVIEW_REQUIRE {
+				inputChan.SafeFeed(ContinueSuggestionInputEvent(result.GetInteractiveId()))
+				continue
+			}
+
+			if result.Type == schema.EVENT_TYPE_STRUCTURED && result.SyncID == firstSyncID {
+				var data map[string]any
+				if err := json.Unmarshal([]byte(result.Content), &data); err == nil {
+					if success, ok := data["success"].(bool); ok && success {
+						firstSkipSuccess = true
+						if !secondSkipSent {
+							secondSkipSent = true
+							inputChan.SafeFeed(SyncInputEventWithJSON(
+								aicommon.SYNC_TYPE_SKIP_SUBTASK_IN_PLAN,
+								secondSyncID,
+								map[string]any{
+									"subtask_index": "1-1",
+									"reason":        "再次跳过同一个子任务",
+								},
+							))
+						}
+					}
+				}
+			}
+
+			if result.Type == schema.EVENT_TYPE_STRUCTURED && result.SyncID == secondSyncID {
+				var data map[string]any
+				if err := json.Unmarshal([]byte(result.Content), &data); err == nil {
+					if success, ok := data["success"].(bool); ok && !success {
+						if errMsg, ok := data["error"].(string); ok {
+							require.Contains(t, errMsg, "subtask already skipped")
+							require.Contains(t, errMsg, "1-1")
+							secondSkipError = true
+							close(firstSkipDone)
+						}
+					}
+				}
+			}
+
+			if result.Type == schema.EVENT_TYPE_STRUCTURED && strings.Contains(string(result.Content), "coordinator run finished") {
+				runFinished = true
+				break LOOP
+			}
+
+		case <-ctx.Done():
+			t.Fatalf("timeout: firstSkipSent=%v, firstSkipSuccess=%v, secondSkipSent=%v, secondSkipError=%v",
+				firstSkipSent, firstSkipSuccess, secondSkipSent, secondSkipError)
+		}
+	}
+
+	require.True(t, firstSkipSent, "first skip request should be sent")
+	require.True(t, firstSkipSuccess, "first skip should succeed")
+	require.True(t, secondSkipSent, "second skip request should be sent")
+	require.True(t, secondSkipError, "second skip should fail with already skipped error")
+	require.True(t, runFinished, "coordinator should finish normally")
+}
+
 func TestCoordinator_SkipSubtaskInPlan_NotFound(t *testing.T) {
 	inputChan := chanx.NewUnlimitedChan[*ypb.AIInputEvent](context.Background(), 100)
 	outputChan := make(chan *schema.AiOutputEvent, 100)
@@ -203,22 +371,19 @@ func TestCoordinator_SkipSubtaskInPlan_NotFound(t *testing.T) {
 		}),
 		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := request.GetPrompt()
-			rsp := config.NewAIResponse()
-			defer rsp.Close()
 
-			isPlanRequest := (strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具")) &&
-				(strings.Contains(prompt, "PERSISTENT_") || strings.Contains(prompt, "任务设计输出要求") || strings.Contains(prompt, "```schema"))
-
-			if isPlanRequest {
-				rsp.EmitOutputStream(strings.NewReader(`{
-    "@action": "plan",
-    "query": "测试跳过不存在的子任务",
+			notFoundPlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "测试错误处理",
     "main_task_goal": "验证跳过不存在的子任务时的错误处理",
     "tasks": [{"subtask_name": "唯一任务", "subtask_goal": "执行唯一任务"}]
-}`))
-				return rsp, nil
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, notFoundPlanJSON); rsp != nil {
+				return rsp, err
 			}
+
+			rsp := config.NewAIResponse()
+			defer rsp.Close()
 
 			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
 				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "s", "task_short_summary": "s", "task_long_summary": "s"}`))
@@ -322,16 +487,9 @@ func TestCoordinator_FindSubtaskByIndex(t *testing.T) {
 		}),
 		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := request.GetPrompt()
-			rsp := config.NewAIResponse()
-			defer rsp.Close()
 
-			isPlanRequest := (strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具")) &&
-				(strings.Contains(prompt, "PERSISTENT_") || strings.Contains(prompt, "任务设计输出要求") || strings.Contains(prompt, "```schema"))
-
-			if isPlanRequest {
-				rsp.EmitOutputStream(strings.NewReader(`{
-    "@action": "plan",
-    "query": "测试查找子任务",
+			findSubtaskPlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "主任务",
     "main_task_goal": "测试 FindSubtaskByIndex",
     "tasks": [
@@ -339,9 +497,13 @@ func TestCoordinator_FindSubtaskByIndex(t *testing.T) {
         {"subtask_name": "子任务B", "subtask_goal": "目标B"},
         {"subtask_name": "子任务C", "subtask_goal": "目标C"}
     ]
-}`))
-				return rsp, nil
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, findSubtaskPlanJSON); rsp != nil {
+				return rsp, err
 			}
+
+			rsp := config.NewAIResponse()
+			defer rsp.Close()
 
 			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
 				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "s", "task_short_summary": "s", "task_long_summary": "s"}`))
@@ -449,25 +611,22 @@ func TestCoordinator_SkipSubtaskInPlan_WithReason(t *testing.T) {
 		}),
 		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := request.GetPrompt()
-			rsp := config.NewAIResponse()
-			defer rsp.Close()
 
-			isPlanRequest := (strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具")) &&
-				(strings.Contains(prompt, "PERSISTENT_") || strings.Contains(prompt, "任务设计输出要求") || strings.Contains(prompt, "```schema"))
-
-			if isPlanRequest {
-				rsp.EmitOutputStream(strings.NewReader(`{
-    "@action": "plan",
-    "query": "测试跳过子任务并提供理由",
+			withReasonPlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "测试理由功能",
     "main_task_goal": "验证跳过任务时理由被正确记录",
     "tasks": [
         {"subtask_name": "任务一", "subtask_goal": "目标一"},
         {"subtask_name": "任务二", "subtask_goal": "目标二"}
     ]
-}`))
-				return rsp, nil
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, withReasonPlanJSON); rsp != nil {
+				return rsp, err
 			}
+
+			rsp := config.NewAIResponse()
+			defer rsp.Close()
 
 			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
 				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "s", "task_short_summary": "s", "task_long_summary": "s"}`))
@@ -571,22 +730,19 @@ func TestCoordinator_SkipSubtaskInPlan_CancelSkipsReview(t *testing.T) {
 		}),
 		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := request.GetPrompt()
-			rsp := config.NewAIResponse()
-			defer rsp.Close()
 
-			isPlanRequest := (strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具")) &&
-				(strings.Contains(prompt, "PERSISTENT_") || strings.Contains(prompt, "任务设计输出要求") || strings.Contains(prompt, "```schema"))
-
-			if isPlanRequest {
-				rsp.EmitOutputStream(strings.NewReader(`{
-    "@action": "plan",
-    "query": "测试取消后跳过审查逻辑",
+			cancelSkipPlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "测试取消后跳过审查逻辑",
     "main_task_goal": "验证 cancel 后不会进入任务审查逻辑",
     "tasks": [{"subtask_name": "任务一", "subtask_goal": "这个任务会被取消并跳过审查"}]
-}`))
-				return rsp, nil
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, cancelSkipPlanJSON); rsp != nil {
+				return rsp, err
 			}
+
+			rsp := config.NewAIResponse()
+			defer rsp.Close()
 
 			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
 				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "s", "task_short_summary": "s", "task_long_summary": "s"}`))
@@ -769,25 +925,21 @@ func runSkipAndContinueTest(t *testing.T, useCurrentFlag bool) bool {
 		}),
 		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := request.GetPrompt()
-			rsp := config.NewAIResponse()
 
-			isPlanRequest := (strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具")) &&
-				(strings.Contains(prompt, "PERSISTENT_") || strings.Contains(prompt, "任务设计输出要求") || strings.Contains(prompt, "```schema"))
-
-			if isPlanRequest {
-				defer rsp.Close()
-				rsp.EmitOutputStream(strings.NewReader(`{
-    "@action": "plan",
-    "query": "测试跳过后继续",
+			skipContinuePlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "测试跳过子任务后立即执行下一个任务",
     "main_task_goal": "验证 skip 1-1 后 1-2 立即开始执行",
     "tasks": [
         {"subtask_name": "任务1-1", "subtask_goal": "这个任务会被跳过"},
         {"subtask_name": "任务1-2", "subtask_goal": "这个任务应该在1-1被跳过后立即执行"}
     ]
-}`))
-				return rsp, nil
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, skipContinuePlanJSON); rsp != nil {
+				return rsp, err
 			}
+
+			rsp := config.NewAIResponse()
 
 			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
 				defer rsp.Close()
@@ -972,22 +1124,19 @@ func TestCoordinator_RedoSubtaskInPlan_MissingUserMessage(t *testing.T) {
 		}),
 		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := request.GetPrompt()
-			rsp := config.NewAIResponse()
-			defer rsp.Close()
 
-			isPlanRequest := (strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具")) &&
-				(strings.Contains(prompt, "PERSISTENT_") || strings.Contains(prompt, "任务设计输出要求") || strings.Contains(prompt, "```schema"))
-
-			if isPlanRequest {
-				rsp.EmitOutputStream(strings.NewReader(`{
-    "@action": "plan",
-    "query": "测试",
+			redoPlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "测试",
     "main_task_goal": "测试",
     "tasks": [{"subtask_name": "任务", "subtask_goal": "目标"}]
-}`))
-				return rsp, nil
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, redoPlanJSON); rsp != nil {
+				return rsp, err
 			}
+
+			rsp := config.NewAIResponse()
+			defer rsp.Close()
 
 			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") {
 				rsp.EmitOutputStream(strings.NewReader(`{"@action": "summary", "status_summary": "s", "task_short_summary": "s", "task_long_summary": "s"}`))

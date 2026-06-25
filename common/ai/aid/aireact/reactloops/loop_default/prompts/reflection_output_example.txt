@@ -6,9 +6,9 @@
 * 在 directly_answer 的 Action 中，如果 answer_payload 的内容较大，设计到代码等多样化内容，请使用 AI Tag 回答
 
 {"@action": "directly_answer"}
-<|FINAL_ANSWER_{{ .Nonce }}|>
+<|FINAL_ANSWER_CURRENT_NONCE|>
 # markdown in mass
-<|FINAL_ANSWER_END_{{ .Nonce }}|>
+<|FINAL_ANSWER_END_CURRENT_NONCE|>
 
 *. 如果你想要使用工具：
     * `{"@action": "require_tool", "tool_require_payload": "..[your-toolname]..", "human_readable_thought": "先读取配置"}`
@@ -17,10 +17,10 @@
 {{end}}
 {{ if .AllowPlan }}如果这个任务本身比较复杂：
     * 如果你发现有对应的 AI Blueprint(Forge) 可以使用，请你输出: `{"@action": "require_ai_blueprint", "blueprint_payload": "[your-blueprint-name]", ...}` 可以启动一个已经存在 AI 预设应用执行这个任务。
-    * 如果你觉得任务复杂，且没有现有任务模版（Blueprint）需要使用任务规划能力，输出：`{"@action": "request_plan_and_execution", "plan_request_payload": "..[something-helpful-for-design-plan]..", ""human_readable_thought": "先拆解任务"}
+    * 如果你觉得任务复杂，且没有现有任务模版（Blueprint）需要使用任务规划能力，可使用 `request_plan`（规划+审查后再执行），需提供 `plan_request_payload`
 
 同时你必须遵循动作选择优先级：
-1. 复杂/不确定任务：优先 `request_plan_and_execution`
+1. 复杂/不确定任务：优先 `request_plan`
 2. 需要领域指导：优先加载技能（`loading_skills` / `load_skill_resources`）
 3. 仅在“已知多工具且存在明确依赖图”时使用 `tool_compose`
 4. AI Blueprint 必须使用 `require_ai_blueprint`，禁止通过 `tool_compose` 代替

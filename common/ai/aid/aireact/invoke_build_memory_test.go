@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,20 +114,20 @@ func (m *MockMemoryTriageForBuildMemory) HandleMemory(i any) error {
 	return err
 }
 
-func (m *MockMemoryTriageForBuildMemory) SearchMemory(origin any, bytesLimit int) (*aicommon.SearchMemoryResult, error) {
+func (m *MockMemoryTriageForBuildMemory) SearchMemory(origin any, tokenLimit int) (*aicommon.SearchMemoryResult, error) {
 	return &aicommon.SearchMemoryResult{
 		Memories:      []*aicommon.MemoryEntity{},
 		TotalContent:  "",
-		ContentBytes:  0,
+		ContentTokens: 0,
 		SearchSummary: "Mock search completed",
 	}, nil
 }
 
-func (m *MockMemoryTriageForBuildMemory) SearchMemoryWithoutAI(origin any, bytesLimit int) (*aicommon.SearchMemoryResult, error) {
+func (m *MockMemoryTriageForBuildMemory) SearchMemoryWithoutAI(origin any, tokenLimit int) (*aicommon.SearchMemoryResult, error) {
 	return &aicommon.SearchMemoryResult{
 		Memories:      []*aicommon.MemoryEntity{},
 		TotalContent:  "",
-		ContentBytes:  0,
+		ContentTokens: 0,
 		SearchSummary: "Mock keyword search completed",
 	}, nil
 }
@@ -160,9 +161,23 @@ func TestReAct_BuildMemoryFromPersistentSession(t *testing.T) {
 	in := make(chan *ypb.AIInputEvent, 10)
 	out := make(chan *ypb.AIOutputEvent, 100)
 
+	// 去 Exit 化后 directly_answer 只发答复并继续, 真正收尾交给唯一终结器 finish.
+	// 第一轮决策发 directly_answer (产出带 testFlag 的 result), 第二轮发 finish 收口.
+	// 关键词: directly_answer 永不 Exit, finish 唯一终结器, 答复后追加 finish
+	var decisionCount int32
 	// 创建 ReAct 实例，使用 persistent session 和 mock memory triage
 	ins, err := NewTestReAct(
 		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			prompt := r.GetPrompt()
+			if isVerifySatisfactionPrompt(prompt) {
+				return mockedLoopDirectlyAnswerOutput(i, `{"@action":"verify-satisfaction","user_satisfied":true,"reasoning":"answer delivered"}`)
+			}
+			if isPrimaryDecisionPrompt(prompt) {
+				if atomic.AddInt32(&decisionCount, 1) == 1 {
+					return mockedDirectlyAnswerWithTimelineDiff(i, testFlag)
+				}
+				return mockedFinishOutput(i)
+			}
 			return mockedDirectlyAnswerWithTimelineDiff(i, testFlag)
 		}),
 		aicommon.WithDebug(true),
@@ -471,6 +486,15 @@ func (m *mockInvokerForMemoryTest) GetBasicPromptInfo(tools []*aitool.Tool) (str
 	return "Basic system prompt for testing", map[string]any{}, nil
 }
 
+func (m *mockInvokerForMemoryTest) AssembleLoopPrompt(tools []*aitool.Tool, input *aicommon.LoopPromptAssemblyInput) (*aicommon.LoopPromptAssemblyResult, error) {
+	_ = tools
+	_ = input
+	return &aicommon.LoopPromptAssemblyResult{
+		Prompt:   "memory test loop prompt",
+		Sections: nil,
+	}, nil
+}
+
 func (m *mockInvokerForMemoryTest) InvokeSpeedPriorityLiteForge(ctx context.Context, name string, prompt string, params []aitool.ToolOption, opts ...aicommon.GeneralKVConfigOption) (*aicommon.Action, error) {
 	return m.InvokeLiteForge(ctx, name, prompt, params, opts...)
 }
@@ -542,6 +566,10 @@ func (m *mockInvokerForMemoryTest) EnhanceKnowledgeGetterEx(ctx context.Context,
 	return "", nil
 }
 
+func (m *mockInvokerForMemoryTest) QuickKnowledgeSearch(ctx context.Context, query string, keywords []string, collections ...string) (string, error) {
+	return "", nil
+}
+
 func (m *mockInvokerForMemoryTest) EnhanceKnowledgeGetRandomN(ctx context.Context, n int, collections ...string) (string, error) {
 	return "", nil
 }
@@ -553,8 +581,33 @@ func (m *mockInvokerForMemoryTest) RequireAIForgeAndAsyncExecute(ctx context.Con
 	// no-op
 }
 
+func (m *mockInvokerForMemoryTest) AsyncPlanOnly(ctx context.Context, planPayload string, onFinish func(error)) {
+}
+
 func (m *mockInvokerForMemoryTest) AsyncPlanAndExecute(ctx context.Context, planPayload string, onFinish func(error)) {
 	// no-op
+}
+
+func (m *mockInvokerForMemoryTest) ReviewExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput) (*aicommon.ExecutePlanInput, error) {
+	return input, nil
+}
+
+func (m *mockInvokerForMemoryTest) ForceReviewExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput) (*aicommon.ExecutePlanInput, error) {
+	return input, nil
+}
+
+func (m *mockInvokerForMemoryTest) BeginPlanCoordinatorSession(ctx context.Context, input *aicommon.ExecutePlanInput, forceManualReview bool) (aicommon.PlanCoordinatorSession, error) {
+	return nil, nil
+}
+
+func (m *mockInvokerForMemoryTest) PublishDetachedPlan(ctx context.Context, input *aicommon.ExecutePlanInput, reactTaskID string) (string, error) {
+	return "", nil
+}
+
+func (m *mockInvokerForMemoryTest) AsyncExecutePlan(ctx context.Context, input *aicommon.ExecutePlanInput, onFinish func(error)) {
+}
+
+func (m *mockInvokerForMemoryTest) AsyncExecuteCod(ctx context.Context, coordinatorID string, onFinish func(error)) {
 }
 
 func (m *mockInvokerForMemoryTest) AddToTimeline(entry, content string) {

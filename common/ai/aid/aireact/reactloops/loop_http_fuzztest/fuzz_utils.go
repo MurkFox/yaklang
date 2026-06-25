@@ -1,20 +1,957 @@
 package loop_http_fuzztest
 
 import (
+	"context"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/yaklang/yaklang/common/log"
+
+	"github.com/google/uuid"
+	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/mutate"
+	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/lowhttp"
+	"github.com/yaklang/yaklang/common/utils/yakgit/yakdiff"
 )
 
-// getFuzzRequest retrieves the FuzzHTTPRequest from loop context
+const (
+	loopHTTPFuzzCompressionThreshold  = 40 * 1024
+	loopHTTPFuzzCompressionTarget     = 20 * 1024
+	loopHTTPFuzzReportSummaryMaxBytes = 5 * 1024
+	loopHTTPFuzzTimelinePreviewSize   = 8 * 1024
+	loopHTTPFuzzDetailedResultLimit   = 12
+	loopHTTPFuzzFrontendDetailLimit   = 6
+	loopHTTPFuzzInterestingTopN       = 6
+	loopHTTPFuzzProgressEmitInterval  = 2 * time.Second
+	modifiedPacketContentField        = "modified_packet_content"
+	loopHTTPFuzzStatusEventNode       = "http_flow_fuzz_status"
+	loopHTTPFuzzStatusStart           = "start"
+	loopHTTPFuzzStatusWorking         = "working"
+	loopHTTPFuzzStatusFinish          = "finish"
+
+	// EmitActionLog nodeId：同类动作共用，具体手段差异写在日志正文里。
+	loopHTTPFuzzActionLogNodeSetRequest    = "set-http-request"
+	loopHTTPFuzzActionLogNodeModifyRequest = "modify-http-request" // patch_http_request + modify_http_request
+	loopHTTPFuzzActionLogNodeFuzz          = "fuzz-test"           // 各类 fuzz_* / generate_and_send_packet
+	loopHTTPFuzzActionLogNodeGenerateRisk  = "generate-risk"
+
+	loopHTTPFuzzActionLogValuePreviewLimit  = 3
+	loopHTTPFuzzActionLogValuePreviewChars  = 120
+	loopHTTPFuzzActionLogParamFallbackChars = 160
+)
+
+type loopHTTPFuzzInterestingSample struct {
+	Index           int
+	Score           int
+	StatusCode      int
+	DurationMs      int64
+	BodyLength      int
+	HiddenIndex     string
+	Payloads        []string
+	RequestSummary  string
+	ResponseSummary string
+	RequestDiff     string
+	ResponsePreview string
+	ResponseRaw     string
+	ResponseDiff    string
+}
+
+type loopHTTPFuzzResponseLengthGroup struct {
+	BodyLength    int
+	Count         int
+	StatusCounts  map[int]int
+	Sample        loopHTTPFuzzInterestingSample
+	HasSample     bool
+	BestScore     int
+	IsBaseline    bool
+	BaselineLabel string
+}
+
+type loopHTTPFuzzProcessedResult struct {
+	RequestRaw      string
+	ResponseRaw     string
+	RequestSummary  string
+	ResponseSummary string
+	RequestDiff     string
+	ResponsePreview string
+	HiddenIndex     string
+	StatusCode      int
+	BodyLength      int
+	DurationMs      int64
+	Payloads        []string
+	Sample          loopHTTPFuzzInterestingSample
+}
+
+// loopHTTPFuzzDetailRecord 表示少量结果场景下需要保留的一条详细记录。
+// Error 非空时表示该条执行失败；否则使用 Processed 渲染完整请求/响应详情。
+type loopHTTPFuzzDetailRecord struct {
+	Index     int
+	Error     string
+	Processed loopHTTPFuzzProcessedResult
+}
+
+// loopHTTPFuzzReportData 只保存渲染报告所需的结构化数据。
+// 为了控制内存与最终输出体积，详细记录只保留限制内的前几条。
+type loopHTTPFuzzReportData struct {
+	DetailRecords []loopHTTPFuzzDetailRecord
+}
+
+// loopHTTPFuzzOverviewStats 保存固定 overview 需要的聚合统计，
+// 以及大样本场景下的分组样本和可疑样本摘要。
+type loopHTTPFuzzOverviewStats struct {
+	TotalRequests        int
+	FailedRequests       int
+	SavedHTTPFlowCount   int
+	SuccessfulResponses  int
+	TotalDurationMs      int64
+	MinDurationMs        int64
+	MaxDurationMs        int64
+	TotalBodyLength      int64
+	MinBodyLength        int
+	MaxBodyLength        int
+	BaselineBodyLength   int
+	StatusCounts         map[int]int
+	ResponseLengthGroups map[int]*loopHTTPFuzzResponseLengthGroup
+	InterestingSamples   []loopHTTPFuzzInterestingSample
+}
+
+type loopHTTPFuzzStatusCodeCount struct {
+	Code  int `json:"code"`
+	Count int `json:"count"`
+}
+
+type loopHTTPFuzzResponseLengthCount struct {
+	BodyLength int `json:"body_length"`
+	Count      int `json:"count"`
+}
+
+type loopHTTPFuzzStatusProgress struct {
+	TotalRequests        int                               `json:"total_requests"`
+	SuccessfulResponses  int                               `json:"successful_responses"`
+	FailedRequests       int                               `json:"failed_requests"`
+	SavedHTTPFlowCount   int                               `json:"saved_httpflow_count"`
+	LastStatusCode       int                               `json:"last_status_code,omitempty"`
+	AverageResponseMs    int64                             `json:"average_response_ms,omitempty"`
+	InterestingSampleNum int                               `json:"interesting_sample_num"`
+	StatusCounts         []loopHTTPFuzzStatusCodeCount     `json:"status_counts,omitempty"`
+	ResponseLengthGroups []loopHTTPFuzzResponseLengthCount `json:"response_length_groups,omitempty"`
+}
+
+type loopHTTPFuzzStatusEvent struct {
+	Status       string                      `json:"status"`
+	FuzzID       string                      `json:"fuzz_id"`
+	RuntimeID    string                      `json:"runtime_id"`
+	ActionName   string                      `json:"action_name,omitempty"`
+	Reason       string                      `json:"reason,omitempty"`
+	ParamSummary string                      `json:"param_summary,omitempty"`
+	Progress     *loopHTTPFuzzStatusProgress `json:"progress,omitempty"`
+}
+
+func newLoopHTTPFuzzOverviewStats() *loopHTTPFuzzOverviewStats {
+	return &loopHTTPFuzzOverviewStats{
+		MinDurationMs:        -1,
+		MinBodyLength:        -1,
+		BaselineBodyLength:   -1,
+		StatusCounts:         make(map[int]int),
+		ResponseLengthGroups: make(map[int]*loopHTTPFuzzResponseLengthGroup),
+	}
+}
+
+// observeError 只维护总量和失败数，不负责保留详细失败文本。
+func (s *loopHTTPFuzzOverviewStats) observeError() {
+	if s == nil {
+		return
+	}
+	s.TotalRequests++
+	s.FailedRequests++
+}
+
+// observeSuccess 更新固定 overview 所需的统计信息。
+func (s *loopHTTPFuzzOverviewStats) observeSuccess(statusCode int, durationMs int64, bodyLength int, saved bool) {
+	if s == nil {
+		return
+	}
+	s.TotalRequests++
+	s.SuccessfulResponses++
+	if saved {
+		s.SavedHTTPFlowCount++
+	}
+	s.StatusCounts[statusCode]++
+	s.TotalDurationMs += durationMs
+	if s.MinDurationMs < 0 || durationMs < s.MinDurationMs {
+		s.MinDurationMs = durationMs
+	}
+	if durationMs > s.MaxDurationMs {
+		s.MaxDurationMs = durationMs
+	}
+	s.TotalBodyLength += int64(bodyLength)
+	if s.MinBodyLength < 0 || bodyLength < s.MinBodyLength {
+		s.MinBodyLength = bodyLength
+	}
+	if bodyLength > s.MaxBodyLength {
+		s.MaxBodyLength = bodyLength
+	}
+	if s.BaselineBodyLength < 0 {
+		s.BaselineBodyLength = bodyLength
+	}
+}
+
+// considerInterestingSample 保留 topN 可疑样本，供大数据量分析段渲染。
+func (s *loopHTTPFuzzOverviewStats) considerInterestingSample(sample loopHTTPFuzzInterestingSample) {
+	if s == nil {
+		return
+	}
+	if sample.Score <= 0 {
+		return
+	}
+	s.InterestingSamples = append(s.InterestingSamples, sample)
+	sort.SliceStable(s.InterestingSamples, func(i, j int) bool {
+		if s.InterestingSamples[i].Score == s.InterestingSamples[j].Score {
+			return s.InterestingSamples[i].Index < s.InterestingSamples[j].Index
+		}
+		return s.InterestingSamples[i].Score > s.InterestingSamples[j].Score
+	})
+	if len(s.InterestingSamples) > loopHTTPFuzzInterestingTopN {
+		s.InterestingSamples = s.InterestingSamples[:loopHTTPFuzzInterestingTopN]
+	}
+}
+
+// observeResponseLengthGroup 维护响应长度分组及其代表样本。
+func (s *loopHTTPFuzzOverviewStats) observeResponseLengthGroup(sample loopHTTPFuzzInterestingSample) {
+	if s == nil {
+		return
+	}
+	group, ok := s.ResponseLengthGroups[sample.BodyLength]
+	if !ok {
+		group = &loopHTTPFuzzResponseLengthGroup{
+			BodyLength:   sample.BodyLength,
+			StatusCounts: make(map[int]int),
+			BestScore:    -1,
+		}
+		s.ResponseLengthGroups[sample.BodyLength] = group
+	}
+	group.Count++
+	group.StatusCounts[sample.StatusCode]++
+	if !group.HasSample || sample.Score > group.BestScore || (sample.Score == group.BestScore && group.Sample.HiddenIndex == "" && sample.HiddenIndex != "") {
+		group.Sample = sample
+		group.HasSample = true
+		group.BestScore = sample.Score
+	}
+}
+
+func newLoopHTTPFuzzReportData() *loopHTTPFuzzReportData {
+	return &loopHTTPFuzzReportData{}
+}
+
+// observeError 只在详细结果上限内记录失败详情，避免大批量错误撑爆报告。
+func (r *loopHTTPFuzzReportData) observeError(index int, resultErr error) {
+	if r == nil || resultErr == nil || index <= 0 || index > loopHTTPFuzzDetailedResultLimit {
+		return
+	}
+	r.DetailRecords = append(r.DetailRecords, loopHTTPFuzzDetailRecord{
+		Index: index,
+		Error: resultErr.Error(),
+	})
+}
+
+// observeDetailedResult 只在详细结果上限内保留完整请求/响应详情。
+func (r *loopHTTPFuzzReportData) observeDetailedResult(resultIndex int, processed loopHTTPFuzzProcessedResult) {
+	if r == nil || resultIndex <= 0 || resultIndex > loopHTTPFuzzDetailedResultLimit {
+		return
+	}
+	processed.Sample.Index = resultIndex
+	r.DetailRecords = append(r.DetailRecords, loopHTTPFuzzDetailRecord{
+		Index:     resultIndex,
+		Processed: processed,
+	})
+}
+
+// buildLoopHTTPFuzzOverviewReport 负责渲染固定概况段。
+// 这部分内容不会参与压缩，避免每次压缩都重复处理稳定的概况信息。
+// 除了固定统计外，这里也补充本轮 fuzz 的关键参数，方便直接看出“测了谁、怎么测的”。
+func buildLoopHTTPFuzzOverviewReport(actionName string, paramSummary string, stats *loopHTTPFuzzOverviewStats) string {
+	if stats == nil {
+		return ""
+	}
+
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf("=== Fuzz Overview for %s ===\n", actionName))
+	if strings.TrimSpace(paramSummary) != "" {
+		out.WriteString("Fuzz Parameters:\n")
+		out.WriteString(utils.PrefixLines(utils.ShrinkTextBlock(strings.TrimSpace(paramSummary), 600), "- "))
+		out.WriteByte('\n')
+	}
+	out.WriteString(fmt.Sprintf("Total Requests: %d\n", stats.TotalRequests))
+	out.WriteString(fmt.Sprintf("Failed Requests: %d\n", stats.FailedRequests))
+	out.WriteString(fmt.Sprintf("Saved HTTPFlows: %d\n", stats.SavedHTTPFlowCount))
+
+	if len(stats.StatusCounts) > 0 {
+		out.WriteString("Status Distribution:\n")
+		statuses := make([]int, 0, len(stats.StatusCounts))
+		for statusCode := range stats.StatusCounts {
+			statuses = append(statuses, statusCode)
+		}
+		sort.SliceStable(statuses, func(i, j int) bool {
+			if stats.StatusCounts[statuses[i]] == stats.StatusCounts[statuses[j]] {
+				return statuses[i] < statuses[j]
+			}
+			return stats.StatusCounts[statuses[i]] > stats.StatusCounts[statuses[j]]
+		})
+		for _, statusCode := range statuses {
+			out.WriteString(fmt.Sprintf("- %s: %d\n", formatLoopHTTPFuzzStatusCode(statusCode), stats.StatusCounts[statusCode]))
+		}
+	}
+
+	if stats.SuccessfulResponses > 0 {
+		avgDuration := stats.TotalDurationMs / int64(stats.SuccessfulResponses)
+		avgBodyLength := stats.TotalBodyLength / int64(stats.SuccessfulResponses)
+		out.WriteString(fmt.Sprintf("Duration Stats: avg=%d ms min=%d ms max=%d ms\n", avgDuration, stats.MinDurationMs, stats.MaxDurationMs))
+		out.WriteString(fmt.Sprintf("Response Body Stats: avg=%d bytes min=%d bytes max=%d bytes\n", avgBodyLength, stats.MinBodyLength, stats.MaxBodyLength))
+	}
+
+	if lengthPreview := stats.responseLengthPreview(6); lengthPreview != "" {
+		out.WriteString(fmt.Sprintf("Response Length Overview: %s\n", lengthPreview))
+	}
+
+	return strings.TrimSpace(out.String())
+}
+
+// buildLoopHTTPFuzzLargeRunAnalysisReport 负责渲染大样本场景的分析段：
+// 主要包含长度分组代表样本，以及 topN 可疑样本摘要。
+func buildLoopHTTPFuzzLargeRunAnalysisReport(stats *loopHTTPFuzzOverviewStats) string {
+	if stats == nil {
+		return ""
+	}
+
+	var out strings.Builder
+	out.WriteString("=== Large-Run Analysis ===\n")
+	wroteContent := false
+	if len(stats.ResponseLengthGroups) > 0 {
+		wroteContent = true
+		out.WriteString("Response Length Groups:\n")
+		for _, group := range stats.sortedResponseLengthGroups() {
+			out.WriteString(fmt.Sprintf("- %d bytes: %d responses", group.BodyLength, group.Count))
+			if group.IsBaseline {
+				out.WriteString(" [baseline]")
+			}
+			if statusPreview := formatLoopHTTPFuzzTopStatusCounts(group.StatusCounts, 4); statusPreview != "" {
+				out.WriteString(fmt.Sprintf(" (statuses: %s)", statusPreview))
+			}
+			out.WriteByte('\n')
+			if group.HasSample {
+				if group.Sample.HiddenIndex != "" {
+					out.WriteString(fmt.Sprintf("  Sample HTTPFlow: %s\n", group.Sample.HiddenIndex))
+				}
+				if len(group.Sample.Payloads) > 0 {
+					out.WriteString(fmt.Sprintf("  Sample Payloads: %s\n", shrinkLoopHTTPFuzzList(group.Sample.Payloads, 4, 200)))
+				}
+				if group.Sample.RequestSummary != "" {
+					out.WriteString(fmt.Sprintf("  Sample Request Summary: %s\n", group.Sample.RequestSummary))
+				}
+				if group.IsBaseline && strings.TrimSpace(group.BaselineLabel) != "" {
+					out.WriteString(fmt.Sprintf("  %s\n", group.BaselineLabel))
+				}
+				if group.IsBaseline && strings.TrimSpace(group.Sample.ResponseRaw) != "" {
+					out.WriteString("  Baseline Response Packet:\n")
+					out.WriteString(utils.PrefixLines(utils.ShrinkTextBlock(group.Sample.ResponseRaw, 600), "    "))
+					out.WriteByte('\n')
+				}
+				if strings.TrimSpace(group.Sample.ResponseDiff) != "" {
+					if group.IsBaseline {
+						out.WriteString("  Baseline Representative Response:\n")
+					} else {
+						out.WriteString("  Sample Diff From Baseline:\n")
+					}
+					out.WriteString(utils.PrefixLines(utils.ShrinkTextBlock(group.Sample.ResponseDiff, 400), "    "))
+					out.WriteByte('\n')
+				}
+			}
+		}
+	}
+
+	if len(stats.InterestingSamples) > 0 {
+		if wroteContent {
+			out.WriteByte('\n')
+		}
+		wroteContent = true
+		out.WriteString("Interesting Samples:\n")
+		for idx, sample := range stats.InterestingSamples {
+			out.WriteString(fmt.Sprintf("%d. score=%d status=%s duration=%d ms body=%d bytes\n", idx+1, sample.Score, formatLoopHTTPFuzzStatusCode(sample.StatusCode), sample.DurationMs, sample.BodyLength))
+			if sample.HiddenIndex != "" {
+				out.WriteString(fmt.Sprintf("   HTTPFlow: %s\n", sample.HiddenIndex))
+			}
+			if len(sample.Payloads) > 0 {
+				out.WriteString(fmt.Sprintf("   Payloads: %s\n", shrinkLoopHTTPFuzzList(sample.Payloads, 4, 200)))
+			}
+			if sample.RequestSummary != "" {
+				out.WriteString(fmt.Sprintf("   Request Summary: %s\n", sample.RequestSummary))
+			}
+			if sample.ResponseSummary != "" {
+				out.WriteString(fmt.Sprintf("   Response Summary: %s\n", sample.ResponseSummary))
+			}
+			if sample.RequestDiff != "" {
+				out.WriteString("   Request Changes:\n")
+				out.WriteString(utils.PrefixLines(utils.ShrinkTextBlock(sample.RequestDiff, 240), "     "))
+				out.WriteByte('\n')
+			}
+			if sample.ResponsePreview != "" {
+				out.WriteString("   Response Digest:\n")
+				out.WriteString(utils.PrefixLines(utils.ShrinkTextBlock(sample.ResponsePreview, 240), "     "))
+				out.WriteByte('\n')
+			}
+		}
+	}
+
+	if !wroteContent {
+		return ""
+	}
+	return strings.TrimSpace(out.String())
+}
+
+// buildLoopHTTPFuzzDetailedPacketReport 负责渲染小样本场景的详细包结果。
+// 这里只读取循环中预先裁剪过的 detail records，不再额外扩容。
+func buildLoopHTTPFuzzDetailedPacketReport(reportData *loopHTTPFuzzReportData) string {
+	if reportData == nil || len(reportData.DetailRecords) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	out.WriteString("=== Detailed Packet Results ===\n")
+	for _, detail := range reportData.DetailRecords {
+		if strings.TrimSpace(detail.Error) != "" {
+			out.WriteString(fmt.Sprintf("\n--- Result %d ---\n", detail.Index))
+			out.WriteString(fmt.Sprintf("Error: %s\n", detail.Error))
+			continue
+		}
+		appendLoopHTTPFuzzRenderedDetailedResult(&out, detail.Index, detail.Processed)
+	}
+	return strings.TrimSpace(out.String())
+}
+
+// appendLoopHTTPFuzzRenderedDetailedResult 负责把一条结构化结果渲染成详细包文本。
+func appendLoopHTTPFuzzRenderedDetailedResult(out *strings.Builder, resultIndex int, processed loopHTTPFuzzProcessedResult) {
+	if out == nil {
+		return
+	}
+	out.WriteString(fmt.Sprintf("\n--- Result %d ---\n", resultIndex))
+	out.WriteString(fmt.Sprintf("Payload: %v\n", processed.Payloads))
+	out.WriteString(fmt.Sprintf("Duration: %d ms\n", processed.DurationMs))
+	out.WriteString(fmt.Sprintf("Status: %s\n", formatLoopHTTPFuzzStatusCode(processed.StatusCode)))
+	out.WriteString(fmt.Sprintf("Request Summary: %s\n", processed.RequestSummary))
+	out.WriteString(fmt.Sprintf("Response Summary: %s\n", processed.ResponseSummary))
+	if processed.HiddenIndex != "" {
+		out.WriteString(fmt.Sprintf("Saved HTTPFlow: %s\n", processed.HiddenIndex))
+	}
+	out.WriteString(fmt.Sprintf("Request Changes:\n%s\n", processed.RequestDiff))
+	out.WriteString(fmt.Sprintf("Response Summary:\n%s\n", processed.ResponsePreview))
+	out.WriteString("Request Packet:\n")
+	out.WriteString(sanitizeRequestTextForPrompt(processed.RequestRaw))
+	out.WriteString("\nResponse Packet:\n")
+	out.WriteString(processed.ResponseRaw)
+	out.WriteRune('\n')
+}
+
+// buildLoopHTTPFuzzAnalysisSection 根据本轮结果规模选择渲染详细包段或大样本分析段。
+func buildLoopHTTPFuzzAnalysisSection(stats *loopHTTPFuzzOverviewStats, reportData *loopHTTPFuzzReportData) string {
+	if stats == nil {
+		return ""
+	}
+	if stats.TotalRequests == 0 {
+		return "=== Detailed Packet Results ===\n(no results returned by the fuzz execution)"
+	}
+	if stats.TotalRequests <= loopHTTPFuzzDetailedResultLimit {
+		return buildLoopHTTPFuzzDetailedPacketReport(reportData)
+	}
+	return buildLoopHTTPFuzzLargeRunAnalysisReport(stats)
+}
+
+// joinLoopHTTPFuzzReportSections 把多个非空段落按空行拼接成最终文档。
+func joinLoopHTTPFuzzReportSections(sections ...string) string {
+	parts := make([]string, 0, len(sections))
+	for _, section := range sections {
+		if trimmed := strings.TrimSpace(section); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// buildLoopHTTPFuzzVerificationPayload 在最终反馈文档基础上补齐代表性 HTTPFlow，
+// 供 VerifyUserSatisfaction 使用，避免验证输入缺少定位样本。
+func buildLoopHTTPFuzzVerificationPayload(feedbackResult, representativeHiddenIndex string) string {
+	payload := strings.TrimSpace(feedbackResult)
+	if payload == "" {
+		if strings.TrimSpace(representativeHiddenIndex) == "" {
+			return ""
+		}
+		return fmt.Sprintf("Representative HTTPFlow: %s", strings.TrimSpace(representativeHiddenIndex))
+	}
+	if strings.TrimSpace(representativeHiddenIndex) != "" && !strings.Contains(payload, representativeHiddenIndex) {
+		payload += fmt.Sprintf("\n\nRepresentative HTTPFlow: %s", strings.TrimSpace(representativeHiddenIndex))
+	}
+	return payload
+}
+
+func (s *loopHTTPFuzzOverviewStats) sortedResponseLengthGroups() []*loopHTTPFuzzResponseLengthGroup {
+	if s == nil || len(s.ResponseLengthGroups) == 0 {
+		return nil
+	}
+	groups := make([]*loopHTTPFuzzResponseLengthGroup, 0, len(s.ResponseLengthGroups))
+	for _, group := range s.ResponseLengthGroups {
+		if group != nil {
+			groups = append(groups, group)
+		}
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		if groups[i].Count == groups[j].Count {
+			return groups[i].BodyLength < groups[j].BodyLength
+		}
+		return groups[i].Count > groups[j].Count
+	})
+	return groups
+}
+
+func (s *loopHTTPFuzzOverviewStats) shouldUseResponseLengthAnalysis() bool {
+	if s == nil || len(s.ResponseLengthGroups) < 2 {
+		return false
+	}
+	groups := s.sortedResponseLengthGroups()
+	if len(groups) < 2 {
+		return false
+	}
+
+	dominantCount := groups[0].Count
+	switch {
+	case s.TotalRequests > loopHTTPFuzzDetailedResultLimit:
+		return true
+	case s.SuccessfulResponses >= 15:
+		return true
+	case dominantCount >= 10:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *loopHTTPFuzzOverviewStats) finalizeResponseLengthGroups() {
+	if s == nil || len(s.ResponseLengthGroups) == 0 {
+		return
+	}
+	groups := s.sortedResponseLengthGroups()
+	if len(groups) == 0 {
+		return
+	}
+	baselineGroup := groups[0]
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		if group.Count > baselineGroup.Count {
+			baselineGroup = group
+			continue
+		}
+		if group.Count == baselineGroup.Count && group.BodyLength == s.BaselineBodyLength {
+			baselineGroup = group
+		}
+	}
+	if baselineGroup == nil {
+		return
+	}
+
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		group.IsBaseline = group.BodyLength == baselineGroup.BodyLength
+		group.BaselineLabel = ""
+		if group.IsBaseline {
+			group.BaselineLabel = fmt.Sprintf("Baseline group selected by dominant body length: %d bytes (%d responses).", group.BodyLength, group.Count)
+			s.BaselineBodyLength = group.BodyLength
+			group.Sample.ResponseDiff = "  (representative baseline response)"
+			continue
+		}
+		group.Sample.ResponseDiff = buildLoopHTTPFuzzResponseDiffFromBaseline(baselineGroup.Sample.ResponseRaw, group.Sample.ResponseRaw)
+	}
+}
+
+type loopHTTPFuzzThrottleEmitter struct {
+	loop         *reactloops.ReActLoop
+	taskID       string
+	fuzzID       string
+	runtimeID    string
+	actionName   string
+	reason       string
+	paramSummary string
+	throttle     func(func())
+}
+
+func (r *loopHTTPFuzzThrottleEmitter) allowEmitDetailHttpFlow(resultIndex int) bool {
+	return r != nil && resultIndex > 0 && resultIndex <= loopHTTPFuzzFrontendDetailLimit
+}
+
+func (r *loopHTTPFuzzThrottleEmitter) emitProgress(stats *loopHTTPFuzzOverviewStats, lastStatusCode int, force bool) {
+	if r == nil || r.loop == nil || strings.TrimSpace(r.fuzzID) == "" || stats == nil {
+		return
+	}
+	statusProgress := buildLoopHTTPFuzzStatusProgress(stats, lastStatusCode, 3)
+	emit := func() {
+		emitLoopHTTPFuzzStatusEvent(r.loop, loopHTTPFuzzStatusWorking, r.fuzzID, r.runtimeID, r.actionName, r.reason, r.paramSummary, statusProgress)
+		if stats.TotalRequests > 0 && (force || stats.TotalRequests%50 == 0) {
+			reactloops.EmitStatus(r.loop, fmt.Sprintf(
+				"已执行 %d 次测试 / Executed %d Tests",
+				stats.TotalRequests, stats.TotalRequests,
+			))
+		}
+	}
+	if force || r.throttle == nil {
+		emit()
+		return
+	}
+	r.throttle(emit)
+}
+
+func (s *loopHTTPFuzzOverviewStats) responseLengthPreview(maxItems int) string {
+	if s == nil || len(s.ResponseLengthGroups) == 0 || maxItems <= 0 {
+		return ""
+	}
+	groups := s.sortedResponseLengthGroups()
+	if len(groups) > maxItems {
+		groups = groups[:maxItems]
+	}
+	parts := make([]string, 0, len(groups))
+	for _, group := range groups {
+		parts = append(parts, fmt.Sprintf("%dB=%d", group.BodyLength, group.Count))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func buildLoopHTTPFuzzStatusProgress(stats *loopHTTPFuzzOverviewStats, lastStatusCode int, maxItems int) *loopHTTPFuzzStatusProgress {
+	if stats == nil || stats.TotalRequests <= 0 {
+		return nil
+	}
+	progress := &loopHTTPFuzzStatusProgress{
+		TotalRequests:        stats.TotalRequests,
+		SuccessfulResponses:  stats.SuccessfulResponses,
+		FailedRequests:       stats.FailedRequests,
+		SavedHTTPFlowCount:   stats.SavedHTTPFlowCount,
+		LastStatusCode:       lastStatusCode,
+		InterestingSampleNum: len(stats.InterestingSamples),
+		StatusCounts:         buildLoopHTTPFuzzStatusCounts(stats.StatusCounts, maxItems),
+		ResponseLengthGroups: buildLoopHTTPFuzzResponseLengthCounts(stats, maxItems),
+	}
+	if stats.SuccessfulResponses > 0 {
+		progress.AverageResponseMs = stats.TotalDurationMs / int64(stats.SuccessfulResponses)
+	}
+	return progress
+}
+
+func buildLoopHTTPFuzzStatusCounts(counts map[int]int, maxItems int) []loopHTTPFuzzStatusCodeCount {
+	if len(counts) == 0 || maxItems <= 0 {
+		return nil
+	}
+	statuses := make([]int, 0, len(counts))
+	for statusCode := range counts {
+		statuses = append(statuses, statusCode)
+	}
+	sort.SliceStable(statuses, func(i, j int) bool {
+		if counts[statuses[i]] == counts[statuses[j]] {
+			return statuses[i] < statuses[j]
+		}
+		return counts[statuses[i]] > counts[statuses[j]]
+	})
+	if len(statuses) > maxItems {
+		statuses = statuses[:maxItems]
+	}
+	ret := make([]loopHTTPFuzzStatusCodeCount, 0, len(statuses))
+	for _, statusCode := range statuses {
+		ret = append(ret, loopHTTPFuzzStatusCodeCount{
+			Code:  statusCode,
+			Count: counts[statusCode],
+		})
+	}
+	return ret
+}
+
+func buildLoopHTTPFuzzResponseLengthCounts(stats *loopHTTPFuzzOverviewStats, maxItems int) []loopHTTPFuzzResponseLengthCount {
+	if stats == nil || maxItems <= 0 {
+		return nil
+	}
+	groups := stats.sortedResponseLengthGroups()
+	if len(groups) == 0 {
+		return nil
+	}
+	if len(groups) > maxItems {
+		groups = groups[:maxItems]
+	}
+	ret := make([]loopHTTPFuzzResponseLengthCount, 0, len(groups))
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		ret = append(ret, loopHTTPFuzzResponseLengthCount{
+			BodyLength: group.BodyLength,
+			Count:      group.Count,
+		})
+	}
+	return ret
+}
+
+func buildLoopHTTPFuzzProcessedResult(resultIndex int, result *mutate.HttpResult, originalRequest string, baselineBodyLength int) loopHTTPFuzzProcessedResult {
+	requestRaw := string(result.RequestRaw)
+	responseRaw := string(result.ResponseRaw)
+	requestURL, requestSummary := buildHTTPRequestStreamSummary(requestRaw, result.Request.TLS != nil)
+	responseSummary := buildHTTPResponseStreamSummary(responseRaw, requestURL)
+	requestDiff := compareRequestsForPrompt(originalRequest, requestRaw)
+	responsePreview := summarizeResponse(responseRaw)
+	statusCode := getStatusFromResponse(responseRaw)
+	_, responseBody := lowhttp.SplitHTTPPacketFast([]byte(responseRaw))
+	bodyLength := len(responseBody)
+	hiddenIndex := ""
+	if result.LowhttpResponse != nil {
+		hiddenIndex = strings.TrimSpace(result.LowhttpResponse.HiddenIndex)
+	}
+	score := scoreLoopHTTPFuzzInterestingSample(statusCode, result.DurationMs, bodyLength, baselineBodyLength, responseRaw)
+
+	return loopHTTPFuzzProcessedResult{
+		RequestRaw:      requestRaw,
+		ResponseRaw:     responseRaw,
+		RequestSummary:  requestSummary,
+		ResponseSummary: responseSummary,
+		RequestDiff:     requestDiff,
+		ResponsePreview: responsePreview,
+		HiddenIndex:     hiddenIndex,
+		StatusCode:      statusCode,
+		BodyLength:      bodyLength,
+		DurationMs:      result.DurationMs,
+		Payloads:        append([]string(nil), result.Payloads...),
+		Sample: loopHTTPFuzzInterestingSample{
+			Index:           resultIndex,
+			Score:           score,
+			StatusCode:      statusCode,
+			DurationMs:      result.DurationMs,
+			BodyLength:      bodyLength,
+			HiddenIndex:     hiddenIndex,
+			Payloads:        append([]string(nil), result.Payloads...),
+			RequestSummary:  requestSummary,
+			ResponseSummary: responseSummary,
+			RequestDiff:     requestDiff,
+			ResponsePreview: responsePreview,
+			ResponseRaw:     responseRaw,
+		},
+	}
+}
+
+func syncLoopHTTPFuzzLastResultState(loop *reactloops.ReActLoop, processed loopHTTPFuzzProcessedResult, runtimeID string, progressReporter *loopHTTPFuzzThrottleEmitter, resultIndex int) {
+	if loop == nil {
+		return
+	}
+	loop.Set("last_request", processed.RequestRaw)
+	loop.Set("last_request_summary", processed.RequestSummary)
+	loop.Set("last_response", processed.ResponseRaw)
+	loop.Set("last_response_summary", processed.ResponseSummary)
+	if strings.TrimSpace(processed.HiddenIndex) != "" {
+		loop.Set("last_httpflow_hidden_index", processed.HiddenIndex)
+	}
+
+	if progressReporter == nil || !progressReporter.allowEmitDetailHttpFlow(resultIndex) {
+		return
+	}
+	if runtimeID != "" && strings.TrimSpace(processed.HiddenIndex) != "" {
+		loop.GetEmitter().EmitYakitHTTPFlow(runtimeID, processed.HiddenIndex)
+	}
+}
+
+func shouldUpdateLoopHTTPFuzzRepresentative(processed loopHTTPFuzzProcessedResult, bestRepresentativeScore int, representativeHiddenIndex string, representativeRequest string) bool {
+	if representativeRequest == "" {
+		return true
+	}
+	if processed.Sample.Score > bestRepresentativeScore {
+		return true
+	}
+	return processed.Sample.Score == bestRepresentativeScore && representativeHiddenIndex == "" && processed.HiddenIndex != ""
+}
+
+func newLoopFuzzRequest(taskCtx context.Context, runtime aicommon.AIInvokeRuntime, rawPacket []byte, isHTTPS bool) (*mutate.FuzzHTTPRequest, error) {
+	opts := []mutate.BuildFuzzHTTPRequestOption{
+		mutate.OptHTTPS(isHTTPS),
+		mutate.OptSource(loopHTTPFuzztestHTTPSource),
+	}
+	if runtime != nil {
+		if cfg := runtime.GetConfig(); cfg != nil {
+			if runtimeID := cfg.GetRuntimeId(); runtimeID != "" {
+				opts = append(opts, mutate.OptRuntimeId(runtimeID))
+			}
+		}
+	}
+	if taskCtx != nil {
+		opts = append(opts, mutate.OptContext(taskCtx))
+	}
+	return mutate.NewFuzzHTTPRequest(rawPacket, opts...)
+}
+
+func storeLoopFuzzRequestState(loop *reactloops.ReActLoop, fuzzReq *mutate.FuzzHTTPRequest, requestRaw []byte, isHTTPS bool) {
+	_, originalSummary := buildHTTPRequestStreamSummary(string(requestRaw), isHTTPS)
+	state := loopHTTPFuzzRequestState{
+		RawRequest: string(requestRaw),
+		IsHTTPS:    isHTTPS,
+		Summary:    originalSummary,
+		Version:    1,
+	}
+	loop.Set("fuzz_request", fuzzReq)
+	loop.Set(loopHTTPFuzzRequestStateKey, state)
+	loop.Set(loopHTTPFuzzRequestVersionKey, state.Version)
+	loop.Set(loopHTTPFuzzRequestSourceActionKey, "")
+	loop.Set(loopHTTPFuzzRequestChangeReasonKey, "")
+	loop.Set("original_request", string(requestRaw))
+	loop.Set("original_request_summary", originalSummary)
+	loop.Set("current_request", string(requestRaw))
+	loop.Set("current_request_summary", originalSummary)
+	loop.Set("previous_request", "")
+	loop.Set("previous_request_summary", "")
+	loop.Set("request_change_summary", "")
+	loop.Set("request_modification_reason", "")
+	loop.Set("request_review_decision", "")
+	loop.Set("is_https", utils.InterfaceToString(isHTTPS))
+	loop.Set("bootstrap_source", "")
+	resetLoopHTTPFuzzExecutionState(loop)
+	syncLoopHTTPUploadContext(loop, requestRaw, isHTTPS, true)
+}
+
+func getCurrentRequestRaw(loop *reactloops.ReActLoop) string {
+	if loop == nil {
+		return ""
+	}
+	if state := getLoopHTTPFuzzRequestState(loop); state != nil && strings.TrimSpace(state.RawRequest) != "" {
+		return state.RawRequest
+	}
+	currentRequest := strings.TrimSpace(loop.Get("current_request"))
+	if currentRequest != "" {
+		return currentRequest
+	}
+	return strings.TrimSpace(loop.Get("original_request"))
+}
+
+func getCurrentRequestSummary(loop *reactloops.ReActLoop) string {
+	if loop == nil {
+		return ""
+	}
+	if state := getLoopHTTPFuzzRequestState(loop); state != nil && strings.TrimSpace(state.Summary) != "" {
+		return state.Summary
+	}
+	summary := strings.TrimSpace(loop.Get("current_request_summary"))
+	if summary != "" {
+		return summary
+	}
+	return strings.TrimSpace(loop.Get("original_request_summary"))
+}
+
+func setLoopCurrentRequestState(loop *reactloops.ReActLoop, fuzzReq *mutate.FuzzHTTPRequest, requestRaw []byte, isHTTPS bool) {
+	if loop == nil {
+		return
+	}
+	_, summary := buildHTTPRequestStreamSummary(string(requestRaw), isHTTPS)
+	version := 1
+	if currentState := getLoopHTTPFuzzRequestState(loop); currentState != nil {
+		version = max(currentState.Version, 1)
+	}
+	loop.Set("fuzz_request", fuzzReq)
+	state := loopHTTPFuzzRequestState{
+		RawRequest:   string(requestRaw),
+		IsHTTPS:      isHTTPS,
+		Summary:      summary,
+		Version:      version,
+		SourceAction: loop.Get(loopHTTPFuzzRequestSourceActionKey),
+		ChangeReason: loop.Get(loopHTTPFuzzRequestChangeReasonKey),
+	}
+	loop.Set(loopHTTPFuzzRequestStateKey, state)
+	loop.Set(loopHTTPFuzzRequestVersionKey, state.Version)
+	loop.Set("current_request", string(requestRaw))
+	loop.Set("current_request_summary", summary)
+	loop.Set("is_https", utils.InterfaceToString(isHTTPS))
+}
+
+func buildRequestModificationFeedback(previousRequest, modifiedRequest []byte, isHTTPS bool, reason, reviewDecision string) string {
+	previousSummary := "(none)"
+	modifiedSummary := "(none)"
+	if len(previousRequest) > 0 {
+		_, previousSummary = buildHTTPRequestStreamSummary(string(previousRequest), isHTTPS)
+	}
+	if len(modifiedRequest) > 0 {
+		_, modifiedSummary = buildHTTPRequestStreamSummary(string(modifiedRequest), isHTTPS)
+	}
+
+	var out strings.Builder
+	out.WriteString("HTTP 数据包修改完成。\n\n")
+	if strings.TrimSpace(reason) != "" {
+		out.WriteString("=== 修改原因 ===\n")
+		out.WriteString(strings.TrimSpace(reason))
+		out.WriteString("\n\n")
+	}
+	out.WriteString("=== 审核结果 ===\n")
+	if strings.TrimSpace(reviewDecision) == "" {
+		reviewDecision = "auto_applied"
+	}
+	out.WriteString(reviewDecision)
+	out.WriteString("\n\n")
+	out.WriteString("=== 修改前摘要 ===\n")
+	out.WriteString(previousSummary)
+	out.WriteString("\n\n")
+	out.WriteString("=== 修改后摘要 ===\n")
+	out.WriteString(modifiedSummary)
+	out.WriteString("\n\n")
+	out.WriteString("=== Merge 变化 ===\n")
+	out.WriteString(compareRequestsForPrompt(string(previousRequest), string(modifiedRequest)))
+	out.WriteString("\n")
+	out.WriteString("\n=== 当前生效数据包 ===\n")
+	out.WriteString(sanitizeRequestTextForPrompt(string(modifiedRequest)))
+	out.WriteString("\n")
+	return out.String()
+}
+
+func buildReviewDecisionLabel(decision string) string {
+	switch strings.TrimSpace(strings.ToLower(decision)) {
+	case "approved_by_user":
+		return "已人工确认并应用新数据包"
+	case "rejected_by_user":
+		return "人工审核拒绝，保留旧数据包"
+	default:
+		return "无需人工审核，已直接应用新数据包"
+	}
+}
+
+func reviewSuggestionApproved(suggestion string) bool {
+	s := strings.TrimSpace(strings.ToLower(suggestion))
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, "reject") || strings.Contains(s, "拒绝") || strings.Contains(s, "保留旧") {
+		return false
+	}
+	return strings.Contains(s, "accept") || strings.Contains(s, "approve") || strings.Contains(s, "同意") || strings.Contains(s, "确认") || strings.Contains(s, "使用新") || strings.Contains(s, "应用新")
+}
+
+func getLoopTaskContext(loop *reactloops.ReActLoop) context.Context {
+	if loop == nil {
+		return nil
+	}
+	task := loop.GetCurrentTask()
+	if task == nil {
+		return nil
+	}
+	return task.GetContext()
+}
+
+// getFuzzRequest 从循环上下文里读取当前生效的 FuzzHTTPRequest。
 func getFuzzRequest(loop *reactloops.ReActLoop) (*mutate.FuzzHTTPRequest, error) {
 	fuzzReqAny := loop.GetVariable("fuzz_request")
 	if fuzzReqAny == nil {
-		return nil, utils.Error("fuzz_request not found in loop context")
+		return nil, utils.Error("fuzz_request not found in loop context. Auto bootstrap from user input may have failed; provide a URL/raw HTTP packet or call set_http_request first")
 	}
 	fuzzReq, ok := fuzzReqAny.(*mutate.FuzzHTTPRequest)
 	if !ok {
@@ -23,130 +960,541 @@ func getFuzzRequest(loop *reactloops.ReActLoop) (*mutate.FuzzHTTPRequest, error)
 	return fuzzReq, nil
 }
 
-// executeFuzzAndCompare executes the fuzz request and compares the response with the original
-func executeFuzzAndCompare(loop *reactloops.ReActLoop, fuzzResult mutate.FuzzHTTPRequestIf, actionName string) (string, error) {
+// executeFuzzAndCompare 是 HTTP fuzz 循环的核心执行入口。
+// 它的职责分三步：
+// 1. 执行 fuzz，并在循环中只收集结构化统计与受限详细记录。
+// 2. 结束后根据数据规模渲染 overview + analysis 文档。
+// 3. 在需要时只压缩 analysis 段，再把最终反馈送去满意度验证。
+func executeFuzzAndCompare(loop *reactloops.ReActLoop, fuzzResult mutate.FuzzHTTPRequestIf, actionName string, paramSummary string, action *aicommon.Action) (string, *aicommon.VerifySatisfactionResult, error) {
+	reactloops.EmitActionLog(loop, loopHTTPFuzzActionLogNodeFuzz, buildLoopHTTPFuzzActionLogStartLine(actionName, paramSummary, action))
+	reactloops.EmitStatus(loop, "模糊测试中 / Fuzzing...")
 	isHttpsStr := loop.Get("is_https")
 	isHttps := isHttpsStr == "true"
+	task := loop.GetCurrentTask()
+	streamTaskID := ""
+	var taskCtx context.Context
+	if task != nil {
+		streamTaskID = task.GetId()
+		if streamTaskID == "" {
+			streamTaskID = task.GetIndex()
+		}
+		taskCtx = task.GetContext()
+	}
+	runtimeID := uuid.New().String()
+	invoker := loop.GetInvoker()
+	if invoker != nil {
+		if cfg := invoker.GetConfig(); cfg != nil {
+			cfg.AppendRelatedRuntimeID(runtimeID)
+		}
+	}
+	if taskCtx == nil {
+		taskCtx = context.Background()
+	}
+	if loop != nil {
+		loop.Set("last_fuzz_runtime_id", runtimeID)
+	}
+	fuzzID := runtimeID
 
-	// Execute the fuzz request
-	resultCh, err := fuzzResult.Exec(mutate.WithPoolOpt_Https(isHttps))
-	if err != nil {
-		return "", utils.Errorf("failed to execute fuzz request: %v", err)
+	// 从 action 中提取 AI 生成的 reason（兼容 reason 和 generation_reason 两种字段名）
+	reason := ""
+	if action != nil {
+		reason = action.GetString("reason")
+		if reason == "" {
+			reason = action.GetString("generation_reason")
+		}
 	}
 
-	var results []string
-	var diffSummary strings.Builder
-	diffSummary.WriteString(fmt.Sprintf("=== Fuzz Results for %s ===\n", actionName))
+	// 进度事件仍然边执行边发，但正文报告改成最后统一渲染。
+	emitLoopHTTPFuzzStatusEvent(loop, loopHTTPFuzzStatusStart, fuzzID, runtimeID, actionName, reason, paramSummary, nil)
+	progressEmitter := &loopHTTPFuzzThrottleEmitter{
+		loop:         loop,
+		taskID:       streamTaskID,
+		fuzzID:       fuzzID,
+		runtimeID:    runtimeID,
+		reason:       reason,
+		paramSummary: paramSummary,
+		actionName:   actionName,
+		throttle:     utils.NewThrottle(loopHTTPFuzzProgressEmitInterval.Seconds()),
+	}
 
-	originalRequest := loop.Get("original_request")
-	count := 0
-	maxResults := 10 // Limit results to prevent overwhelming output
+	// 真实执行阶段只保留结构化数据，不在循环里直接拼接长文本报告。
+	execOpts := []mutate.HttpPoolConfigOption{
+		mutate.WithPoolOpt_Https(isHttps),
+		mutate.WithPoolOpt_RuntimeId(runtimeID),
+		mutate.WithPoolOpt_Source(loopHTTPFuzztestHTTPSource),
+		mutate.WithPoolOpt_SaveHTTPFlow(true),
+	}
+	if taskCtx != nil {
+		execOpts = append(execOpts, mutate.WithPoolOpt_Context(taskCtx))
+	}
+	resultCh, err := fuzzResult.Exec(execOpts...)
+	if err != nil {
+		emitLoopHTTPFuzzStatusEvent(loop, loopHTTPFuzzStatusFinish, fuzzID, runtimeID, actionName, "", "", nil)
+		log.Errorf("[executeFuzzAndCompare] %s exec failed: %v", actionName, err)
+		reactloops.EmitStatus(loop, "模糊测试失败 / Fuzz Test Failed")
+		return "", nil, err
+	}
+
+	originalRequest := getCurrentRequestRaw(loop)
+	overview := newLoopHTTPFuzzOverviewStats()
+	reportData := newLoopHTTPFuzzReportData()
+	representativeRequest := ""
+	representativeResponse := ""
+	representativeHiddenIndex := ""
+	collectedPayloads := make([]string, 0)
+	representativeStatusCode := 0
+	bestRepresentativeScore := -1
 
 	for result := range resultCh {
-		if count >= maxResults {
-			diffSummary.WriteString(fmt.Sprintf("\n... (more results truncated, showing first %d)\n", maxResults))
-			break
-		}
-
+		// 结果编号按 1 开始，便于报告、前端事件和样本索引统一。
+		resultIndex := overview.TotalRequests + 1
 		if result.Error != nil {
-			diffSummary.WriteString(fmt.Sprintf("\n[%d] Error: %v\n", count+1, result.Error))
-			count++
+			overview.observeError()
+			reportData.observeError(resultIndex, result.Error)
+			log.Errorf(fmt.Sprintf("%s 第 %d 个测试请求执行失败：%v", actionName, resultIndex, result.Error))
+			progressEmitter.emitProgress(overview, 0, false)
 			continue
 		}
 
-		// Get request and response
-		requestRaw := string(result.RequestRaw)
-		responseRaw := string(result.ResponseRaw)
+		processed := buildLoopHTTPFuzzProcessedResult(resultIndex, result, originalRequest, overview.BaselineBodyLength)
+		collectedPayloads = append(collectedPayloads, processed.Payloads...)
+		syncLoopHTTPFuzzLastResultState(loop, processed, runtimeID, progressEmitter, resultIndex)
 
-		// Compare request differences
-		requestDiff := compareRequests(originalRequest, requestRaw)
-		responseSummary := summarizeResponse(responseRaw)
+		overview.observeSuccess(processed.StatusCode, processed.DurationMs, processed.BodyLength, processed.HiddenIndex != "")
+		overview.considerInterestingSample(processed.Sample)
+		overview.observeResponseLengthGroup(processed.Sample)
 
-		diffSummary.WriteString(fmt.Sprintf("\n--- Result %d ---\n", count+1))
-		diffSummary.WriteString(fmt.Sprintf("Payload: %v\n", result.Payloads))
-		diffSummary.WriteString(fmt.Sprintf("Request Changes:\n%s\n", requestDiff))
-		diffSummary.WriteString(fmt.Sprintf("Response Summary:\n%s\n", responseSummary))
+		if shouldUpdateLoopHTTPFuzzRepresentative(processed, bestRepresentativeScore, representativeHiddenIndex, representativeRequest) {
+			bestRepresentativeScore = processed.Sample.Score
+			representativeRequest = processed.RequestRaw
+			representativeResponse = processed.ResponseRaw
+			representativeHiddenIndex = processed.HiddenIndex
+			representativeStatusCode = processed.StatusCode
+		}
 
-		// Store last request and response
-		loop.Set("last_request", requestRaw)
-		loop.Set("last_response", responseRaw)
+		reportData.observeDetailedResult(resultIndex, processed)
 
-		results = append(results, fmt.Sprintf("Payload: %v, Status: %s", result.Payloads, getStatusFromResponse(responseRaw)))
-		count++
+		progressEmitter.emitProgress(overview, processed.StatusCode, false)
 	}
 
-	diffResult := diffSummary.String()
-	loop.Set("diff_result", diffResult)
+	overview.finalizeResponseLengthGroups()
+	progressEmitter.emitProgress(overview, representativeStatusCode, true)
+	emitLoopHTTPFuzzStatusEvent(loop, loopHTTPFuzzStatusFinish, fuzzID, runtimeID, actionName, reason, paramSummary, buildLoopHTTPFuzzStatusProgress(overview, representativeStatusCode, 3))
 
-	return diffResult, nil
+	if representativeRequest != "" || representativeResponse != "" {
+		loop.Set("representative_request", representativeRequest)
+		loop.Set("representative_response", representativeResponse)
+		loop.Set("representative_httpflow_hidden_index", representativeHiddenIndex)
+		loop.Set(loopHTTPUploadRepresentativeSafeKey, sanitizeRequestTextForPrompt(representativeRequest))
+	}
+
+	overviewReport := buildLoopHTTPFuzzOverviewReport(actionName, paramSummary, overview)
+	analysisSection := buildLoopHTTPFuzzAnalysisSection(overview, reportData)
+
+	loop.Set("diff_result_compressed", "")
+
+	if len(strings.TrimSpace(analysisSection)) > loopHTTPFuzzCompressionThreshold && invoker != nil {
+		log.Infof("[executeFuzzAndCompare] %s report exceeds %d bytes, compressing", actionName, loopHTTPFuzzCompressionThreshold)
+		reactloops.EmitStatus(loop, "压缩测试报告中 / Compressing Test Report...")
+		compressionTarget := buildFuzzCompressionTarget(loop, actionName)
+		compressed, compressErr := invoker.CompressLongTextWithDestination(taskCtx, analysisSection, compressionTarget, loopHTTPFuzzCompressionTarget)
+		if compressErr != nil {
+			log.Warnf("[executeFuzzAndCompare] %s compression failed, using original report: %v", actionName, compressErr)
+			reactloops.EmitStatus(loop, "压缩失败，使用原始报告 / Compression Failed, Using Original")
+		} else {
+			analysisSection = buildCompressedAnalysisSection(compressed, representativeRequest, representativeResponse, representativeHiddenIndex)
+			loop.Set("diff_result_compressed", analysisSection)
+			reactloops.EmitStatus(loop, "验证测试目标中 / Verifying Test Goal...")
+		}
+	}
+
+	fullReport := joinLoopHTTPFuzzReportSections(overviewReport, analysisSection)
+	loop.Set("diff_result_full", fullReport)
+	loop.Set("diff_result_analysis", fullReport)
+
+	verificationPayload := buildLoopHTTPFuzzVerificationPayload(fullReport, representativeHiddenIndex)
+	verifyResult, verificationText, err := verifyFuzzCompletion(loop, taskCtx, actionName, verificationPayload, representativeHiddenIndex)
+	if err != nil {
+		return "", nil, err
+	}
+
+	actionResultSummary := fmt.Sprintf("共执行 %d 次测试，保存 %d 条 HTTPFlow。代表性响应状态：%s", overview.TotalRequests, overview.SavedHTTPFlowCount, formatLoopHTTPFuzzStatusCode(representativeStatusCode))
+	if representativeStatusCode == 0 {
+		actionResultSummary = fmt.Sprintf("共执行 %d 次测试，保存 %d 条 HTTPFlow。", overview.TotalRequests, overview.SavedHTTPFlowCount)
+	}
+	verificationSummary := buildLoopHTTPFuzzVerificationSummary(verifyResult)
+	actionRecord := recordLoopHTTPFuzzAction(loop, actionName, paramSummary, actionResultSummary, verificationSummary, representativeHiddenIndex, collectedPayloads)
+	actionFeedback := buildLoopHTTPFuzzActionFeedback(actionRecord)
+
+	reportFile, displaySummary := persistLoopHTTPFuzzReport(loop, actionName, fullReport)
+	operatorFeedback := buildLoopHTTPFuzzOperatorFeedback(actionFeedback, displaySummary, verificationText, reportFile)
+
+	finishLine := actionResultSummary
+	if verificationSummary != "" {
+		finishLine += "; " + verificationSummary
+	}
+	reactloops.EmitStatus(loop, fmt.Sprintf("模糊测试完成 / Fuzz Test Complete (%d requests)", overview.TotalRequests))
+	reactloops.EmitActionLog(loop, loopHTTPFuzzActionLogNodeFuzz, finishLine, displaySummary)
+
+	loop.Set("diff_result", operatorFeedback)
+	if reportFile != "" {
+		loop.Set("diff_result_file", reportFile)
+	}
+	persistLoopHTTPFuzzSessionContext(loop, actionName)
+
+	return operatorFeedback, verifyResult, nil
 }
 
-// compareRequests compares two HTTP requests and returns the differences
-func compareRequests(original, modified string) string {
-	originalLines := strings.Split(strings.TrimSpace(original), "\n")
-	modifiedLines := strings.Split(strings.TrimSpace(modified), "\n")
+func emitLoopHTTPFuzzStatusEvent(loop *reactloops.ReActLoop, status, fuzzID, runtimeID, actionName string, reason string, paramSummary string, progress *loopHTTPFuzzStatusProgress) {
+	if loop == nil || loop.GetEmitter() == nil || strings.TrimSpace(status) == "" || strings.TrimSpace(fuzzID) == "" {
+		return
+	}
+	_, _ = loop.GetEmitter().EmitJSON(schema.EVENT_TYPE_HTTP_FLOW_FUZZ_STATUS, loopHTTPFuzzStatusEventNode, loopHTTPFuzzStatusEvent{
+		Status:       status,
+		FuzzID:       fuzzID,
+		RuntimeID:    runtimeID,
+		ActionName:   actionName,
+		Reason:       reason,
+		ParamSummary: paramSummary,
+		Progress:     progress,
+	})
+}
 
-	var diff strings.Builder
-	maxLines := max(len(originalLines), len(modifiedLines))
+// buildFuzzCompressionTarget 只描述“可压缩分析段”的压缩目标，不包含固定 overview。
+func buildFuzzCompressionTarget(loop *reactloops.ReActLoop, actionName string) string {
+	task := loop.GetCurrentTask()
+	userInput := ""
+	if task != nil {
+		userInput = strings.TrimSpace(task.GetUserInput())
+	}
+	if userInput == "" {
+		userInput = "HTTP 安全模糊测试"
+	}
+	return fmt.Sprintf("用户正在执行 HTTP 安全模糊测试，当前步骤是 %s。你将收到的是可压缩分析段，不包含固定概况。你的核心目标是分析漏洞，而不是复述数据包。请覆盖所有请求/响应对，重点归纳疑似漏洞类型、触发依据、差异模式、可复现代表性数据包、以及下一步验证动作。原始目标：%s", actionName, userInput)
+}
 
-	for i := 0; i < maxLines; i++ {
-		origLine := ""
-		modLine := ""
-		if i < len(originalLines) {
-			origLine = strings.TrimSpace(originalLines[i])
+// buildCompressedAnalysisSection 只渲染压缩后的分析段。
+// 固定 overview 会在外层通过 joinLoopHTTPFuzzReportSections 单独拼接。
+func buildCompressedAnalysisSection(compressed, representativeRequest, representativeResponse, representativeHiddenIndex string) string {
+	var out strings.Builder
+	out.WriteString("=== Compressed Fuzz Analysis ===\n")
+	out.WriteString(compressed)
+	if representativeRequest != "" || representativeResponse != "" {
+		out.WriteString("\n\n=== Representative Packet For Follow-Up Testing ===\n")
+		if representativeHiddenIndex != "" {
+			out.WriteString(fmt.Sprintf("HTTPFlow: %s\n", representativeHiddenIndex))
 		}
-		if i < len(modifiedLines) {
-			modLine = strings.TrimSpace(modifiedLines[i])
+		if representativeRequest != "" {
+			out.WriteString("Request:\n")
+			out.WriteString(sanitizeRequestTextForPrompt(representativeRequest))
+			out.WriteRune('\n')
 		}
+		if representativeResponse != "" {
+			out.WriteString("Response:\n")
+			out.WriteString(representativeResponse)
+		}
+	}
+	return out.String()
+}
 
-		if origLine != modLine {
-			if origLine != "" {
-				diff.WriteString(fmt.Sprintf("  - %s\n", origLine))
+func verifyFuzzCompletion(loop *reactloops.ReActLoop, taskCtx context.Context, actionName, verificationPayload, representativeHiddenIndex string) (*aicommon.VerifySatisfactionResult, string, error) {
+	invoker := loop.GetInvoker()
+	task := loop.GetCurrentTask()
+	if invoker == nil || task == nil {
+		return nil, "", nil
+	}
+
+	reactloops.EmitStatus(loop, "验证测试目标中 / Verifying Test Goal...")
+	verifyResult, err := invoker.VerifyUserSatisfaction(taskCtx, task.GetUserInput(), true, verificationPayload)
+	if err != nil {
+		log.Errorf("[verifyFuzzCompletion] %s verification failed: %v", actionName, err)
+		return nil, "", utils.Wrap(err, "verify fuzz completion")
+	}
+
+	var verifySummary strings.Builder
+	verifySummary.WriteString("=== Verification ===\n")
+	verifySummary.WriteString(fmt.Sprintf("Satisfied: %v\n", verifyResult.Satisfied))
+	verifySummary.WriteString(fmt.Sprintf("Reasoning: %s\n", verifyResult.Reasoning))
+	if next := aicommon.FormatVerifyNextMovementsSummary(verifyResult.NextMovements); next != "" {
+		verifySummary.WriteString(fmt.Sprintf("Next Steps: %s\n", next))
+	}
+	if representativeHiddenIndex != "" {
+		verifySummary.WriteString(fmt.Sprintf("Representative HTTPFlow: %s\n", representativeHiddenIndex))
+	}
+
+	verificationText := verifySummary.String()
+	loop.Set("verification_result", verificationText)
+
+	if verifyResult.Satisfied {
+		reactloops.EmitStatus(loop, "已达到测试目标 / Test Goal Met")
+	} else {
+		reactloops.EmitStatus(loop, "需继续测试 / Continue Testing")
+	}
+
+	return verifyResult, verificationText, nil
+}
+
+func persistLoopHTTPFuzzReport(loop *reactloops.ReActLoop, actionName, fullReport string) (filename string, displaySummary string) {
+	fullReport = strings.TrimSpace(fullReport)
+	if fullReport == "" || loop == nil {
+		return "", ""
+	}
+	displaySummary = fullReport
+
+	loopDataDir := loop.GetLoopContentDir("data")
+	if loopDataDir == "" {
+		if len(fullReport) > loopHTTPFuzzReportSummaryMaxBytes {
+			displaySummary = fmt.Sprintf("结果过长，预览:\n%s", utils.ShrinkTextBlock(fullReport, 2000))
+		}
+		return "", displaySummary
+	}
+
+	filename = filepath.Join(loopDataDir,
+		fmt.Sprintf("fuzz_%s_%d_%s.txt", actionName, loop.GetCurrentIterationIndex(), utils.DatetimePretty2()))
+	if err := reactloops.SaveAndPinFile(loop, filename, []byte(fullReport)); err != nil {
+		log.Warnf("[persistLoopHTTPFuzzReport] failed to save report: %v", err)
+		filename = ""
+	}
+
+	if len(fullReport) > loopHTTPFuzzReportSummaryMaxBytes || filename != "" {
+		preview := utils.ShrinkTextBlock(fullReport, 2000)
+		if filename != "" {
+			displaySummary = fmt.Sprintf("共 %d 字节，已保存到文件。\n\n预览:\n%s\n\n文件: %s", len(fullReport), preview, filename)
+		} else {
+			displaySummary = fmt.Sprintf("结果过长，预览:\n%s", preview)
+		}
+	}
+	return filename, displaySummary
+}
+
+func buildLoopHTTPFuzzOperatorFeedback(actionFeedback, displaySummary, verificationText, reportFile string) string {
+	var out strings.Builder
+	out.WriteString(strings.TrimSpace(actionFeedback))
+	if summary := strings.TrimSpace(displaySummary); summary != "" {
+		out.WriteString("\n\n")
+		out.WriteString(summary)
+	}
+	if verificationText != "" {
+		out.WriteString("\n\n")
+		out.WriteString(utils.ShrinkTextBlock(verificationText, loopHTTPFuzzTimelinePreviewSize))
+	}
+	if reportFile != "" && !strings.Contains(out.String(), reportFile) {
+		out.WriteString("\n\n完整报告文件: ")
+		out.WriteString(reportFile)
+	}
+	return out.String()
+}
+
+func buildHTTPRequestStreamSummary(requestRaw string, isHTTPS bool) (string, string) {
+	if lowhttp.IsMultipartFormDataRequest([]byte(requestRaw)) {
+		if summary, err := parseMultipartUploadSummary([]byte(requestRaw)); err == nil && summary != nil && summary.IsMultipart {
+			return buildUploadAwareHTTPRequestStreamSummary(requestRaw, isHTTPS, summary)
+		}
+	}
+	requestURL := extractRequestURL(requestRaw, isHTTPS)
+	_, body := lowhttp.SplitHTTPPacketFast([]byte(requestRaw))
+	return requestURL, fmt.Sprintf("URL: %s BODY: [(%d) bytes]", requestURL, len(body))
+}
+
+func buildHTTPResponseStreamSummary(responseRaw, requestURL string) string {
+	status := getStatusFromResponse(responseRaw)
+	_, body := lowhttp.SplitHTTPPacketFast([]byte(responseRaw))
+	if status == 0 {
+		return fmt.Sprintf("URL: %s BODY: [(%d) bytes]", requestURL, len(body))
+	}
+	return fmt.Sprintf("URL: %s STATUS: %d BODY: [(%d) bytes]", requestURL, status, len(body))
+}
+
+func extractRequestURL(requestRaw string, isHTTPS bool) string {
+	urlObj, err := lowhttp.ExtractURLFromHTTPRequestRaw([]byte(requestRaw), isHTTPS)
+	if err == nil && urlObj != nil && urlObj.String() != "" {
+		return urlObj.String()
+	}
+
+	scheme := "http"
+	if isHTTPS {
+		scheme = "https"
+	}
+	if fallback := strings.TrimSpace(lowhttp.GetUrlFromHTTPRequest(scheme, []byte(requestRaw))); fallback != "" {
+		return fallback
+	}
+	return "(unknown url)"
+}
+
+func buildLoopHTTPFuzzActionLogStartLine(actionName, paramSummary string, action *aicommon.Action) string {
+	if line := buildLoopHTTPFuzzActionLogStartLineFromAction(actionName, action); line != "" {
+		return line
+	}
+	return buildLoopHTTPFuzzActionLogStartLineFromParamSummary(actionName, paramSummary)
+}
+
+func buildLoopHTTPFuzzActionLogStartLineFromAction(actionName string, action *aicommon.Action) string {
+	if action == nil {
+		return ""
+	}
+	switch actionName {
+	case "fuzz_header":
+		return formatLoopHTTPFuzzNamedValuesLine("请求头", "Header", action.GetString("header_name"), action.GetStringSlice("header_values"))
+	case "fuzz_body":
+		bodyType := strings.TrimSpace(action.GetString("body_type"))
+		if bodyType == "raw" {
+			return formatLoopHTTPFuzzValuesOnlyLine("请求体 raw", "Body raw", action.GetStringSlice("param_values"))
+		}
+		return formatLoopHTTPFuzzNamedValuesLine(
+			fmt.Sprintf("请求体 %s", bodyType),
+			fmt.Sprintf("Body %s", bodyType),
+			action.GetString("param_name"),
+			action.GetStringSlice("param_values"),
+		)
+	case "fuzz_get_params":
+		return formatLoopHTTPFuzzNamedValuesLine("GET 参数", "GET param", action.GetString("param_name"), action.GetStringSlice("param_values"))
+	case "fuzz_cookie":
+		return formatLoopHTTPFuzzNamedValuesLine("Cookie", "Cookie", action.GetString("cookie_name"), action.GetStringSlice("cookie_values"))
+	case "fuzz_method":
+		return formatLoopHTTPFuzzValuesOnlyLine("HTTP 方法", "HTTP method", action.GetStringSlice("methods"))
+	case "fuzz_path":
+		return formatLoopHTTPFuzzValuesOnlyLine("路径", "Path", action.GetStringSlice("paths"))
+	case "fuzz_upload":
+		return formatLoopHTTPFuzzNamedValuesLine(
+			fmt.Sprintf("上传 %s", action.GetString("upload_type")),
+			fmt.Sprintf("Upload %s", action.GetString("upload_type")),
+			action.GetString("field_name"),
+			firstNonEmptyStringSlice(action.GetStringSlice("file_names"), action.GetStringSlice("field_values")),
+		)
+	case "generate_and_send_packet":
+		target := strings.TrimSpace(action.GetString("target_purpose"))
+		if target == "" {
+			target = strings.TrimSpace(action.GetString("packet_type"))
+		}
+		target = utils.ShrinkString(target, 80)
+		if target == "" {
+			return "构造并发送数据包 / Send constructed packet"
+		}
+		return fmt.Sprintf("构造并发送数据包: %s / Send constructed packet: %s", target, target)
+	default:
+		return ""
+	}
+}
+
+func formatLoopHTTPFuzzNamedValuesLine(zhKind, enKind, name string, values []string) string {
+	name = strings.TrimSpace(name)
+	count := len(values)
+	preview := formatLoopHTTPFuzzValuePreview(values)
+	if name == "" {
+		return formatLoopHTTPFuzzValuesOnlyLine(zhKind, enKind, values)
+	}
+	if count == 0 {
+		return fmt.Sprintf("测试%s %s / Fuzz %s %s", zhKind, name, enKind, name)
+	}
+	if preview == "" {
+		return fmt.Sprintf("测试%s %s (%d 个载荷) / Fuzz %s %s (%d payloads)", zhKind, name, count, enKind, name, count)
+	}
+	return fmt.Sprintf("测试%s %s (%d 个载荷: %s) / Fuzz %s %s (%d payloads: %s)", zhKind, name, count, preview, enKind, name, count, preview)
+}
+
+func formatLoopHTTPFuzzValuesOnlyLine(zhKind, enKind string, values []string) string {
+	count := len(values)
+	preview := formatLoopHTTPFuzzValuePreview(values)
+	if preview == "" {
+		return fmt.Sprintf("测试%s (%d 个) / Fuzz %s (%d items)", zhKind, count, enKind, count)
+	}
+	return fmt.Sprintf("测试%s (%d 个: %s) / Fuzz %s (%d items: %s)", zhKind, count, preview, enKind, count, preview)
+}
+
+func formatLoopHTTPFuzzValuePreview(values []string) string {
+	return shrinkLoopHTTPFuzzList(dedupeStringSlice(values), loopHTTPFuzzActionLogValuePreviewLimit, loopHTTPFuzzActionLogValuePreviewChars)
+}
+
+func buildLoopHTTPFuzzActionLogStartLineFromParamSummary(actionName, paramSummary string) string {
+	paramSummary = strings.TrimSpace(paramSummary)
+	if paramSummary == "" {
+		return fmt.Sprintf("执行模糊测试 %s / Run fuzz test %s", actionName, actionName)
+	}
+
+	parts := strings.Split(paramSummary, ";")
+	displayParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.HasPrefix(part, "reason=") {
+			continue
+		}
+		if idx := strings.Index(part, "="); idx > 0 {
+			key := strings.TrimSpace(part[:idx])
+			value := strings.TrimSpace(part[idx+1:])
+			if len(value) > 80 {
+				value = utils.ShrinkTextBlock(value, 80)
 			}
-			if modLine != "" {
-				diff.WriteString(fmt.Sprintf("  + %s\n", modLine))
-			}
+			displayParts = append(displayParts, fmt.Sprintf("%s=%s", key, value))
 		}
 	}
 
-	if diff.Len() == 0 {
+	text := strings.Join(displayParts, ", ")
+	if text == "" {
+		text = utils.ShrinkTextBlock(paramSummary, loopHTTPFuzzActionLogParamFallbackChars)
+	} else {
+		text = utils.ShrinkTextBlock(text, loopHTTPFuzzActionLogParamFallbackChars)
+	}
+	return fmt.Sprintf("执行 %s: %s / Run %s: %s", actionName, text, actionName, text)
+}
+
+func buildFuzzTimelineSummary(summary string) string {
+	if len(summary) <= loopHTTPFuzzTimelinePreviewSize {
+		return summary
+	}
+	return utils.ShrinkTextBlock(summary, loopHTTPFuzzTimelinePreviewSize)
+}
+
+func applyFuzzVerificationOutcome(loop *reactloops.ReActLoop, operator *reactloops.LoopActionHandlerOperator, diffResult string, verifyResult *aicommon.VerifySatisfactionResult) {
+	markLoopHTTPFuzzLastAction(loop, getLoopHTTPFuzzLastAction(loop))
+	if verifyResult == nil {
+		operator.Feedback(diffResult)
+		return
+	}
+
+	loop.PushSatisfactionRecordWithCompletedTaskIndex(
+		verifyResult.Satisfied,
+		verifyResult.Reasoning,
+		verifyResult.CompletedTaskIndex,
+		verifyResult.NextMovements,
+		verifyResult.Evidence,
+		verifyResult.OutputFiles,
+		verifyResult.EvidenceOps,
+	)
+
+	if verifyResult.Satisfied && !aicommon.HasNewTodoAddOps(verifyResult.NextMovements) {
+		operator.Exit()
+		return
+	}
+
+	operator.Feedback(diffResult)
+	operator.Continue()
+}
+
+func buildLoopHTTPFuzzVerificationSummary(verifyResult *aicommon.VerifySatisfactionResult) string {
+	if verifyResult == nil {
+		return ""
+	}
+	state := "未达到当前目标"
+	if verifyResult.Satisfied {
+		state = "已达到当前目标"
+	}
+	if strings.TrimSpace(verifyResult.Reasoning) == "" {
+		return state
+	}
+	return fmt.Sprintf("%s；%s", state, strings.TrimSpace(verifyResult.Reasoning))
+}
+
+// compareRequests 用于对比两个 HTTP 请求，返回逐行差异。
+func compareRequests(original, modified string) string {
+	diffText, err := yakdiff.Diff(original, modified)
+	if err != nil {
+		return fmt.Sprintf("  (diff failed: %v)", err)
+	}
+	diffText = strings.TrimSpace(diffText)
+	if diffText == "" {
 		return "  (no changes)"
 	}
-	return diff.String()
-}
-
-// summarizeResponse creates a summary of the HTTP response
-func summarizeResponse(response string) string {
-	if response == "" {
-		return "  (empty response)"
-	}
-
-	statusLine, body := lowhttp.SplitHTTPPacketFast([]byte(response))
-
-	var summary strings.Builder
-	summary.WriteString(fmt.Sprintf("  Status: %s\n", statusLine))
-
-	// Get content length
-	contentLength := len(body)
-	summary.WriteString(fmt.Sprintf("  Content-Length: %d bytes\n", contentLength))
-
-	// Show first part of body if not too long
-	if contentLength > 0 {
-		bodyPreview := string(body)
-		if len(bodyPreview) > 200 {
-			bodyPreview = bodyPreview[:200] + "..."
-		}
-		bodyPreview = strings.ReplaceAll(bodyPreview, "\n", " ")
-		summary.WriteString(fmt.Sprintf("  Body Preview: %s\n", bodyPreview))
-	}
-
-	return summary.String()
-}
-
-// getStatusFromResponse extracts status code from response
-func getStatusFromResponse(response string) string {
-	statusLine, _ := lowhttp.SplitHTTPPacketFast([]byte(response))
-	return statusLine
+	return diffText
 }
 
 func max(a, b int) int {
@@ -154,4 +1502,11 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func abs(a int) int {
+	if a < 0 {
+		return -a
+	}
+	return a
 }

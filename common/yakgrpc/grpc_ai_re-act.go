@@ -2,13 +2,14 @@ package yakgrpc
 
 import (
 	"context"
-	"fmt"
-	"github.com/yaklang/yaklang/common/consts"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jinzhu/gorm"
 	"github.com/samber/lo"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiconfig"
+	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 
 	"github.com/yaklang/yaklang/common/ai/aid"
@@ -18,11 +19,24 @@ import (
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aireact"
+	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops/reactloops_yak"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
+
+func fixOptionsWithServiceName(serviceName string, opts ...aicommon.ConfigOption) []aicommon.ConfigOption {
+	aiCb, err := aicommon.CreateCallbackFromConfig(aiconfig.GetGlobalManager().GetFirstConfigByTierAndProviderAndModel(consts.TierIntelligent, serviceName, ""))
+	if err != nil {
+		log.Errorf("load ai service failed: %v", err)
+	} else {
+		opts = append(opts, aicommon.WithAutoTieredAICallback(aiCb))
+	}
+	log.Warnf("AIStartParams.AIService/AIModelName for WithAIChatInfo is deprecated, " +
+		"model info is now auto-detected from the actual AI gateway call")
+	return opts
+}
 
 func ConvertYPBAIStartParamsToReActConfig(i *ypb.AIStartParams) []aicommon.ConfigOption {
 	opts := make([]aicommon.ConfigOption, 0)
@@ -71,30 +85,76 @@ func ConvertYPBAIStartParamsToReActConfig(i *ypb.AIStartParams) []aicommon.Confi
 		opts = append(opts, aicommon.WithKeywords(i.GetIncludeSuggestedToolKeywords()...))
 	}
 	if i.GetAIService() != "" {
-		serviceName := i.GetAIService()
-		aiCb, err := aicommon.CreateCallbackFromConfig(aiconfig.GetGlobalManager().GetFirstConfigByTierAndProviderAndModel(consts.TierIntelligent, serviceName, ""))
-		if err != nil {
-			log.Errorf("load ai service failed: %v", err)
-		} else {
-			opts = append(opts, aicommon.WithAICallback(aiCb))
-		}
-		log.Warnf("AIStartParams.AIService/AIModelName for WithAIChatInfo is deprecated, " +
-			"model info is now auto-detected from the actual AI gateway call")
+		opts = fixOptionsWithServiceName(i.GetAIService(), opts...)
 	}
 
 	if !i.GetDisableAISearchForge() {
 		opts = append(opts, aid.WithAiForgeSearchTool())
 	}
 
+	// EnablePlan 晚于 DisableAISearchForge 应用，用于控制 PE / 蓝图动作；与 AI 搜索 Forge 工具独立。
+	opts = append(opts, aicommon.WithEnablePlanAndExec(i.GetEnablePlan()))
+	if i.GetEnableDetachedPlan() {
+		opts = append(opts, aicommon.WithEnableDetachedPlan(true))
+	}
+
 	if i.GetAICallTokenLimit() > 0 {
 		opts = append(opts, aicommon.WithAiCallTokenLimit(int64(i.GetAICallTokenLimit())))
+	}
+
+	if i.GetDisableToolIntervalReview() {
+		opts = append(opts, aicommon.WithDisableToolCallerIntervalReview(true))
+	}
+	if i.GetSyncPerceptionTrigger() {
+		opts = append(opts, aicommon.WithSyncPerceptionTrigger(true))
 	}
 
 	if i.GetUserPresetPrompt() != "" {
 		opts = append(opts, aicommon.WithUserPresetPrompt(i.GetUserPresetPrompt()))
 	}
 
+	if i.GetPlanExecTaskConcurrency() > 0 {
+		opts = append(opts, aicommon.WithPlanExecTaskConcurrency(int(i.GetPlanExecTaskConcurrency())))
+	}
+
+	if i.GetUserPlanPrompt() != "" {
+		opts = append(opts, aicommon.WithPlanPrompt(i.GetUserPlanPrompt()))
+	}
+
+	if i.GetSource() != "" {
+		opts = append(opts, aicommon.WithSessionSource(i.GetSource()))
+	}
+
+	if caps := aicommon.ParseEnabledCapabilitiesFromProto(i); len(caps) > 0 {
+		opts = append(opts, aicommon.WithEnabledCapabilities(caps...))
+	}
+
 	return opts
+}
+
+func resolveAISessionStartParams(db *gorm.DB, sessionID string, request *ypb.AIStartParams, preferCached bool) (*ypb.AIStartParams, error) {
+	if request == nil {
+		request = &ypb.AIStartParams{}
+	}
+	if !preferCached || db == nil || strings.TrimSpace(sessionID) == "" {
+		return request, nil
+	}
+
+	if _, err := yakit.GetAISessionMetaBySessionID(db, sessionID); err != nil {
+		if gorm.IsRecordNotFoundError(err) {
+			return request, nil
+		}
+		return nil, err
+	}
+
+	cached, err := yakit.GetAISessionMetaStartParamsBySessionID(db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if cached == nil {
+		return request, nil
+	}
+	return yakit.MergeCachedAISessionStartParams(cached, request), nil
 }
 
 func (s *Server) StartAIReAct(stream ypb.Yak_StartAIReActServer) error {
@@ -109,6 +169,14 @@ func (s *Server) StartAIReAct(stream ypb.Yak_StartAIReActServer) error {
 		return utils.Error("first msg is not a start/config message, set IsStart to true")
 	}
 
+	// 启动 ReAct 之前懒扫描用户的 ~/yakit-projects/ai-focus/，
+	// 防止客户端跳过 QueryAIFocus 直接发带 FocusModeLoop 的 free input 时
+	// 找不到注册项。冷却由 EnsureUserFocusModesLoaded 内部控制，失败只 log。
+	// 关键词: start ai re-act ensure user focus modes
+	if err := reactloops_yak.EnsureUserFocusModesLoaded(); err != nil {
+		log.Warnf("ensure user yak focus modes failed: %v", err)
+	}
+
 	startParams := firstMsg.Params
 
 	baseCtx, cancel := context.WithCancel(stream.Context())
@@ -116,12 +184,20 @@ func (s *Server) StartAIReAct(stream ypb.Yak_StartAIReActServer) error {
 
 	inputEvent := chanx.NewUnlimitedChan[*ypb.AIInputEvent](baseCtx, 10)
 
-	optsFromStartParams := ConvertYPBAIStartParamsToReActConfig(startParams)
-
 	var currentCoordinatorId = startParams.CoordinatorId
 	_ = currentCoordinatorId
 	var coordinatorIdOnce = new(sync.Once)
 	var sendMu sync.Mutex
+	// debugStreamPrinter 在 DEBUG=1 时把流式 delta 合并到单行，避免每个
+	// token 单独换行造成的刷屏；非流事件来临时先 FlushIfActive 收尾，让
+	// 后续 log / 普通事件都从新行开始，消除"夹心"现象。
+	// 关键词: DEBUG=1 流式输出体验, AI stream delta debug print
+	debugStreamPrinter := aicommon.GetDefaultDebugStreamPrinter()
+	// 同步把 common/log 默认输出包装上一层 flush, 让任何日志写入前先把
+	// 流缓冲刷出, 彻底消灭日志被夹在流中间的视觉混乱。
+	// 关键词: EnsureLogFlushWrapperInstalled grpc_ai_react entry
+	aicommon.EnsureLogFlushWrapperInstalled()
+
 	feedback := func(e *schema.AiOutputEvent) {
 		if e.Timestamp <= 0 {
 			e.Timestamp = time.Now().Unix() // fallback
@@ -133,10 +209,10 @@ func (s *Server) StartAIReAct(stream ypb.Yak_StartAIReActServer) error {
 		}
 
 		utils.Debug(func() {
-			if res := e.ToGRPC(); res != nil {
-				if res.IsStream {
-					fmt.Println(string(res.GetStreamDelta()))
-				}
+			if e.IsStream {
+				debugStreamPrinter.PrintStreamDelta(e)
+			} else {
+				debugStreamPrinter.FlushIfActive()
 			}
 		})
 
@@ -155,6 +231,36 @@ func (s *Server) StartAIReAct(stream ypb.Yak_StartAIReActServer) error {
 	if persistentSession == "" {
 		persistentSession = "default"
 	}
+
+	if startParams.GetAttach() {
+		runningReAct, err := aireact.WaitRunningSession(persistentSession, time.Minute)
+		if err != nil {
+			return err
+		}
+		return s.attachToRunningAIReActSession(stream, baseCtx, runningReAct, firstMsg, persistentSession, startParams)
+	}
+
+	if runningReAct, ok := aireact.GetRunningSession(persistentSession); ok {
+		return s.attachToRunningAIReActSession(stream, baseCtx, runningReAct, firstMsg, persistentSession, startParams)
+	}
+
+	resolvedStartParams, err := resolveAISessionStartParams(
+		s.GetProjectDatabase(),
+		persistentSession,
+		startParams,
+		startParams.GetPreferSessionCachedConfig(),
+	)
+	if err != nil {
+		return utils.Errorf("resolve session cached config failed: %v", err)
+	}
+	startParams = resolvedStartParams
+	firstMsg.Params = resolvedStartParams
+
+	if _, err := yakit.CreateOrUpdateAISessionMetaOnStart(s.GetProjectDatabase(), persistentSession, startParams, time.Now()); err != nil {
+		log.Warnf("persist ai session start meta failed for %s: %v", persistentSession, err)
+	}
+
+	optsFromStartParams := ConvertYPBAIStartParamsToReActConfig(startParams)
 	var hotpatchChan = chanx.NewUnlimitedChan[aicommon.ConfigOption](baseCtx, 10)
 
 	if aiconfig.IsTieredAIConfig() {
@@ -213,6 +319,81 @@ func (s *Server) StartAIReAct(stream ypb.Yak_StartAIReActServer) error {
 		}
 
 		inputEvent.SafeFeed(event)
+	}
+}
+
+func (s *Server) attachToRunningAIReActSession(
+	stream ypb.Yak_StartAIReActServer,
+	baseCtx context.Context,
+	runningReAct *aireact.ReAct,
+	firstMsg *ypb.AIInputEvent,
+	persistentSession string,
+	startParams *ypb.AIStartParams,
+) error {
+	log.Infof("attach grpc stream to running aireact session: %s", persistentSession)
+
+	if _, err := yakit.CreateOrUpdateAISessionMetaOnStart(s.GetProjectDatabase(), persistentSession, startParams, time.Now()); err != nil {
+		log.Warnf("persist ai session start meta failed for %s: %v", persistentSession, err)
+	}
+
+	var sendMu sync.Mutex
+	debugStreamPrinter := aicommon.GetDefaultDebugStreamPrinter()
+	aicommon.EnsureLogFlushWrapperInstalled()
+
+	feedback := func(e *schema.AiOutputEvent) {
+		if e.Timestamp <= 0 {
+			e.Timestamp = time.Now().Unix()
+		}
+
+		utils.Debug(func() {
+			if e.IsStream {
+				debugStreamPrinter.PrintStreamDelta(e)
+			} else {
+				debugStreamPrinter.FlushIfActive()
+			}
+		})
+
+		if stream.Context().Err() != nil {
+			return
+		}
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		if err := stream.Send(e.ToGRPC()); err != nil {
+			log.Errorf("send re-act event to attached stream failed: %v", err)
+		}
+	}
+
+	unsubscribe, ok := aireact.SubscribeRunningSession(persistentSession, feedback)
+	if !ok {
+		return utils.Errorf("failed to subscribe running aireact session: %s", persistentSession)
+	}
+	defer unsubscribe()
+
+	if firstMsg != nil && !firstMsg.GetIsStart() {
+		if err := runningReAct.SendInputEvent(firstMsg); err != nil {
+			log.Warnf("forward first input to running session failed: %v", err)
+		}
+	}
+
+	for {
+		select {
+		case <-baseCtx.Done():
+			log.Info("attached AIReAct stream context done")
+			return nil
+		default:
+		}
+
+		event, err := stream.Recv()
+		if err != nil {
+			log.Infof("attached AIReAct stream recv ended: %v", err)
+			return nil
+		}
+		if event.GetIsStart() {
+			continue
+		}
+		if err := runningReAct.SendInputEvent(event); err != nil {
+			log.Warnf("forward input to running session failed: %v", err)
+		}
 	}
 }
 

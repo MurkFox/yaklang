@@ -173,6 +173,78 @@ func (b *BasicBlock) Reachable() BasicBlockReachableKind {
 	return BasicBlockUnknown
 }
 
+func (b *BasicBlock) SetConditionFromValue(v Value, source string) {
+	if b == nil || utils.IsNil(v) {
+		return
+	}
+	// Do not assign b.Condition here: that field is owned by ssa4analyze.BlockCondition
+	// (merged reachability formula). Early ids break getCondition(), which ANDs edgeCond
+	// with GetValueById(from.Condition) and can call NewBinOp with a nil operand when the
+	// id is not yet a resolvable Value. Use ConditionValues / ConditionInst / ConditionMeta
+	// for CFG and block condition summaries instead.
+	b.ConditionValues = []int64{v.GetId()}
+	if b.ConditionMeta == nil {
+		b.ConditionMeta = map[string]any{}
+	}
+	if source != "" {
+		b.ConditionMeta["source"] = source
+	}
+	if _, ok := b.ConditionMeta["schema_version"]; !ok {
+		b.ConditionMeta["schema_version"] = 1
+	}
+}
+
+func (b *BasicBlock) SetConditionInstID(instID int64) {
+	if b == nil || instID <= 0 {
+		return
+	}
+	b.ConditionInst = instID
+}
+
+func (b *BasicBlock) GetConditionValues() []int64 {
+	if b == nil {
+		return nil
+	}
+	if len(b.ConditionValues) > 0 {
+		out := make([]int64, 0, len(b.ConditionValues))
+		for _, id := range b.ConditionValues {
+			if id > 0 {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	if b.Condition > 0 {
+		return []int64{b.Condition}
+	}
+	return nil
+}
+
+func (b *BasicBlock) BlockConditionSummary() BlockConditionSummary {
+	if b == nil {
+		return BlockConditionSummary{}
+	}
+	meta := map[string]any{}
+	for k, v := range b.ConditionMeta {
+		meta[k] = v
+	}
+	vals := b.GetConditionValues()
+	instID := b.ConditionInst
+	if instID <= 0 && len(vals) > 0 {
+		instID = vals[0]
+	}
+	summary := BlockConditionSummary{
+		BlockID:     b.GetId(),
+		CondInstID:  instID,
+		CondValueID: vals,
+		Meta:        meta,
+	}
+	if fn := b.GetFunc(); fn != nil {
+		summary.FuncID = fn.GetId()
+	}
+	return summary
+}
+
 func (b *BasicBlock) AddSucc(succ *BasicBlock) {
 	b.Succs = append(b.Succs, succ.GetId())
 	succ.Preds = append(succ.Preds, b.GetId())

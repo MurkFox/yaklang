@@ -11,6 +11,48 @@ import (
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
+func normalizeAISessionFilterStrings(vals []string) []string {
+	seen := make(map[string]struct{}, len(vals))
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+// applyAISessionSourceFilter matches source values. Empty string in the filter
+// also matches legacy rows where source was never set (NULL in DB).
+func applyAISessionSourceFilter(db *gorm.DB, sources []string) *gorm.DB {
+	sources = normalizeAISessionFilterStrings(sources)
+	if len(sources) == 0 {
+		return db
+	}
+
+	includeEmpty := false
+	nonEmpty := make([]string, 0, len(sources))
+	for _, s := range sources {
+		if s == "" {
+			includeEmpty = true
+			continue
+		}
+		nonEmpty = append(nonEmpty, s)
+	}
+
+	switch {
+	case includeEmpty && len(nonEmpty) == 0:
+		return db.Where("source IS NULL OR source = ?", "")
+	case includeEmpty:
+		return db.Where("(source IS NULL OR source = ?) OR source IN (?)", "", nonEmpty)
+	default:
+		return bizhelper.ExactQueryStringArrayOr(db, "source", sources)
+	}
+}
+
 func FilterAISessionMeta(db *gorm.DB, filter *ypb.AISessionFilter) *gorm.DB {
 	db = db.Model(&schema.AISession{})
 	if filter == nil {
@@ -20,6 +62,9 @@ func FilterAISessionMeta(db *gorm.DB, filter *ypb.AISessionFilter) *gorm.DB {
 	db = bizhelper.ExactQueryStringArrayOr(db, "session_id", filter.GetSessionID())
 	if filter.GetKeyword() != "" {
 		db = bizhelper.FuzzSearchWithStringArrayOrEx(db, []string{"session_id", "title"}, []string{filter.GetKeyword()}, false)
+	}
+	if len(filter.GetSource()) > 0 {
+		db = applyAISessionSourceFilter(db, filter.GetSource())
 	}
 	return db
 }
@@ -91,7 +136,11 @@ func QueryAISessionIDsForDelete(db *gorm.DB, filter *ypb.DeleteAISessionFilter, 
 		if filter.GetBeforeTimestamp() > 0 {
 			query = query.Where("updated_at < ?", time.Unix(filter.GetBeforeTimestamp(), 0))
 		}
-		if len(sessionIDs) == 0 && filter.GetAfterTimestamp() <= 0 && filter.GetBeforeTimestamp() <= 0 {
+		sources := normalizeAISessionFilterStrings(filter.GetSource())
+		if len(filter.GetSource()) > 0 {
+			query = applyAISessionSourceFilter(query, filter.GetSource())
+		}
+		if len(sessionIDs) == 0 && filter.GetAfterTimestamp() <= 0 && filter.GetBeforeTimestamp() <= 0 && len(sources) == 0 {
 			return nil, utils.Errorf("at least one filter condition is required")
 		}
 	}

@@ -3,6 +3,7 @@ package loop_intent
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
@@ -120,6 +121,7 @@ Skills: {{ .MatchedSkillNames }}
 		return
 	}
 
+	aiStart := time.Now()
 	forgeResult, err := invoker.InvokeSpeedPriorityLiteForge(
 		ctx,
 		"intent-finalize-summary",
@@ -145,11 +147,12 @@ Skills: {{ .MatchedSkillNames }}
 			),
 		},
 		aicommon.WithGeneralConfigStreamableFieldWithNodeId("intent", "intent_summary"),
-		aicommon.WithGeneralConfigStreamableFieldCallback(
+		aicommon.WithGeneralConfigStreamableFieldEmitterCallback(
 			[]string{"recommended_capabilities"},
 			recommendedCapabilitiesStreamCallback(invoker),
 		),
 	)
+	reactloops.SetWorkspaceDebugDuration(loop, reactloops.IntentDebugFinalizeAIDurationKey, time.Since(aiStart))
 	if err != nil {
 		log.Errorf("intent finalize: LiteForge invocation failed: %v", err)
 		buildFallbackIntentAnalysis(loop)
@@ -182,6 +185,8 @@ Skills: {{ .MatchedSkillNames }}
 			}
 		}
 	}
+	recommendedCaps = reactloops.ApplyScriptEditExecutionPolicy(loop, recommendedCaps)
+	reactloops.PreloadSingleRecommendedTool(loop, recommendedCaps)
 
 	// Build and set intent_analysis
 	if intentSummary == "" {
@@ -257,8 +262,19 @@ func buildFallbackIntentAnalysis(loop *reactloops.ReActLoop) {
 	loop.Set("intent_summary", intentSummary)
 	loop.Set("intent_analysis", intentSummary)
 
+	recommendedCaps := reactloops.ApplyScriptEditExecutionPolicy(loop, nil)
+	reactloops.PreloadSingleRecommendedTool(loop, recommendedCaps)
+
 	if matchedToolNames != "" {
 		loop.Set("recommended_tools", "Matched tools: "+matchedToolNames)
+	}
+	if len(recommendedCaps) > 0 {
+		recommendedTools := loop.Get("recommended_tools")
+		if recommendedTools != "" {
+			recommendedTools += "\n"
+		}
+		recommendedTools += "AI recommended: " + strings.Join(recommendedCaps, ", ")
+		loop.Set("recommended_tools", recommendedTools)
 	}
 	if matchedForgeNames != "" {
 		loop.Set("recommended_forges", "Matched forges: "+matchedForgeNames)

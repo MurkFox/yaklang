@@ -22,6 +22,33 @@ func (y *builder) VisitTypeHint(raw phpparser.ITypeHintContext) ssa.Type {
 	if i == nil {
 		return ssa.CreateAnyType()
 	}
+	if atom := i.TypeHintAtom(); atom != nil {
+		return y.VisitTypeHintAtom(atom)
+	}
+	if intersection := i.TypeHintIntersection(); intersection != nil {
+		if ctx, ok := intersection.(*phpparser.TypeHintIntersectionContext); ok {
+			return y.VisitTypeHintAtom(ctx.TypeHintAtom(0))
+		}
+	}
+	if union := i.TypeHintUnion(); union != nil {
+		if ctx, ok := union.(*phpparser.TypeHintUnionContext); ok {
+			return y.VisitTypeHintAtom(ctx.TypeHintAtom(0))
+		}
+	}
+	return ssa.CreateAnyType()
+}
+
+func (y *builder) VisitTypeHintAtom(raw phpparser.ITypeHintAtomContext) ssa.Type {
+	if y == nil || raw == nil || y.IsStop() {
+		return ssa.CreateAnyType()
+	}
+	recoverRange := y.SetRange(raw)
+	defer recoverRange()
+
+	i, _ := raw.(*phpparser.TypeHintAtomContext)
+	if i == nil {
+		return ssa.CreateAnyType()
+	}
 	if r := i.QualifiedStaticTypeRef(); r != nil {
 		//这里类型就行修复
 		className := y.VisitQualifiedStaticTypeRef(r)
@@ -30,13 +57,6 @@ func (y *builder) VisitTypeHint(raw phpparser.ITypeHintContext) ssa.Type {
 		_ = i.Callable().GetText()
 	} else if i.PrimitiveType() != nil {
 		return y.VisitPrimitiveType(i.PrimitiveType())
-	} else if i.Pipe() != nil {
-		//types := lo.Map(i.AllTypeHint(), func(item phpparser.ITypeHintContext, index int) ssa.Type {
-		//	return y.VisitTypeHint(i)
-		//})
-		//_ = types
-		// need a
-		// return ssa.NewUnionType(types)
 	}
 	return ssa.CreateAnyType()
 }
@@ -55,6 +75,9 @@ func (y *builder) VisitTypeRef(raw phpparser.ITypeRefContext) (*ssa.Blueprint, s
 	}
 	if i.FlexiVariable() != nil {
 		//todo: flexivariable
+	}
+	if i.StaticClassExprVariableMember() != nil {
+		return y.CreateBlueprint(raw.GetText()), raw.GetText()
 	}
 	if i.QualifiedNamespaceName() != nil {
 		if bluePrint := y.GetBluePrint(strings.TrimSpace(i.QualifiedNamespaceName().GetText())); bluePrint != nil {
@@ -162,17 +185,31 @@ func (y *builder) VisitQualifiedStaticTypeRef(raw phpparser.IQualifiedStaticType
 	if i == nil {
 		return nil
 	}
+	switch strings.ToLower(strings.TrimSpace(raw.GetText())) {
+	case "self", "static":
+		if y.MarkedThisClassBlueprint != nil {
+			return y.MarkedThisClassBlueprint
+		}
+	case "parent":
+		if y.MarkedThisClassBlueprint != nil {
+			return y.MarkedThisClassBlueprint.GetSuperBlueprint()
+		}
+	}
 	if i.QualifiedNamespaceName() != nil {
 		path, name := y.VisitQualifiedNamespaceName(i.QualifiedNamespaceName())
 		if library, _ := y.GetProgram().GetLibrary(strings.Join(path, ".")); !utils.IsNil(library) {
 			if cls := library.GetBluePrint(name); cls != nil {
 				return cls
 			}
-		} else {
-			if bluePrint := y.GetProgram().GetBluePrint(name); !utils.IsNil(bluePrint) {
-				return bluePrint
-			}
 		}
+		if bluePrint := y.findBlueprint(name); !utils.IsNil(bluePrint) {
+			return bluePrint
+		}
+		bluePrint := y.CreateBlueprint(name, raw)
+		if len(path) > 0 && !(len(path) == 1 && path[0] == name) {
+			bluePrint.SetFullTypeNames(path)
+		}
+		return bluePrint
 	}
 	log.Warnf("classBlue print not found: %s", raw.GetText())
 	return y.CreateBlueprint(yakunquote.TryUnquote(raw.GetText()), raw)

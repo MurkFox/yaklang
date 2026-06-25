@@ -1,7 +1,18 @@
 package aimem
 
+// TODO: migrate to AssembleLoopPrompt for prefix cache reuse
+//
+// AddRawText 仍走老的 GetBasicPromptInfo + aireact/prompts/base/base.txt 路径,
+// 是当前 aireact 中唯一一处未接入 aicommon.NewDefaultPromptPrefixBuilder 5 段
+// prefix cache 的入口。后续应改造为复用 AssembleLoopPrompt, 让 memory triage
+// 也能命中跨 turn 的 prefix cache。
+//
+// 关键词: aimem 老路径迁移, AssembleLoopPrompt, prefix cache 复用, 待治理
+
 import (
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
+	"github.com/yaklang/yaklang/common/log"
+
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +59,7 @@ func (r *AIMemoryTriage) AddRawText(i string) ([]*aicommon.MemoryEntity, error) 
 		return nil, err
 	}
 
+	log.Info("start to use speed priority lite forge to analyze memory")
 	ac, err := r.invoker.InvokeSpeedPriorityLiteForge(r.ctx, "memory-triage", promptResult, []aitool.ToolOption{
 		aitool.WithStructArrayParam(
 			"memory_entities",

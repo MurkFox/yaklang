@@ -3,204 +3,312 @@ package ssa
 import (
 	"github.com/jinzhu/gorm"
 	"github.com/yaklang/yaklang/common/utils"
-	"github.com/yaklang/yaklang/common/utils/asyncdb"
+	"github.com/yaklang/yaklang/common/utils/dbcache"
+	"github.com/yaklang/yaklang/common/utils/memedit"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
-
-type simpleCacheItem[T comparable] struct {
-	Name  string
-	Value T
-}
-
-type SimpleCache[T comparable] struct {
-	name  string
-	cache *utils.SafeMapWithKey[string, []T] // if  memory exist
-	save  *asyncdb.Save[simpleCacheItem[T]]  // save to database
-}
-
-func NewSimpleCache[T comparable](name string) *SimpleCache[T] {
-	return &SimpleCache[T]{
-		name:  name,
-		cache: utils.NewSafeMapWithKey[string, []T](),
-	}
-}
-
-func (c *SimpleCache[T]) Delete(key string, inst T) {
-	data, ok := c.cache.Get(key)
-	if !ok {
-		return
-	}
-	data = utils.RemoveSliceItem(data, inst)
-	c.cache.Set(key, data)
-	return
-}
-
-func (c *SimpleCache[T]) Add(key string, item T) {
-	if utils.IsNil(item) {
-		return
-	}
-
-	data, ok := c.cache.Get(key)
-	if !ok {
-		data = make([]T, 0)
-	}
-	data = append(data, item)
-	c.cache.Set(key, data)
-	if c.save != nil {
-		c.save.Save(simpleCacheItem[T]{
-			Name:  key,
-			Value: item,
-		})
-	}
-}
-
-func (c *SimpleCache[T]) ForEach(f func(string, []T)) {
-	c.cache.ForEach(func(key string, value []T) bool {
-		f(key, value)
-		return true
-	})
-}
-
-func (c *SimpleCache[T]) Close() {
-	if c.save != nil {
-		c.save.Close()
-	}
-}
 
 const (
 	IndexSaveSize = 2000
 )
 
-func (s *SimpleCache[T]) SetSaver(f func([]simpleCacheItem[T]), opt ...asyncdb.Option) {
-	opt = append(opt,
-		asyncdb.WithSaveSize(defaultSaveSize),
-		asyncdb.WithSaveTimeout(saveTime),
-	)
-	s.save = asyncdb.NewSave(f, opt...)
+type indexStore struct {
+	mode    ProgramCacheKind
+	program *Program
+	db      *gorm.DB
+
+	variable *utils.SafeMapWithKey[string, []int64]
+	member   *utils.SafeMapWithKey[string, []int64]
+	class    *utils.SafeMapWithKey[string, []int64]
+	consts   *utils.SafeMapWithKey[string, []int64]
+
+	indexSaver  *dbcache.Save[*ssadb.IrIndex]
+	offsetSaver *dbcache.Save[*ssadb.IrOffset]
 }
 
-func (c *ProgramCache) initIndex(databaseKind ProgramCacheKind, saveSize int) {
-	if saveSize < IndexSaveSize {
-		saveSize = IndexSaveSize // Ensure minimum save size
+func newIndexStore(cfg *ssaconfig.Config, prog *Program, mode ProgramCacheKind, db *gorm.DB, saveSize int) *indexStore {
+	saveSize = resolveAuxiliarySaveSize(cfg, saveSize)
+	store := &indexStore{
+		mode:     mode,
+		program:  prog,
+		db:       db,
+		variable: utils.NewSafeMapWithKey[string, []int64](),
+		member:   utils.NewSafeMapWithKey[string, []int64](),
+		class:    utils.NewSafeMapWithKey[string, []int64](),
+		consts:   utils.NewSafeMapWithKey[string, []int64](),
 	}
-	c.editorCache = NewSimpleCache[*ssadb.IrSource]("EditorCache")
-	if databaseKind == ProgramCacheDBWrite {
-		c.editorCache.SetSaver(
-			func(iii []simpleCacheItem[*ssadb.IrSource]) {
-				saveStep := func() error {
-					return utils.GormTransaction(c.DB, func(tx *gorm.DB) error {
-						for _, item := range iii {
-							if err := tx.Save(item.Value).Error; err != nil {
-								log.Errorf("DATABASE: save ir source to database error: %v", err)
-							}
-						}
-						return nil
-					})
-				}
-				c.diagnosticsTrack("ssa.Database.SaveIrSourceBatch", saveStep)
-				return
-			},
-			asyncdb.WithSaveSize(saveSize),
-		)
+	if mode != ProgramCacheDBWrite || db == nil {
+		return store
 	}
 
-	c.offsetCache = NewSimpleCache[*ssadb.IrOffset]("OffsetCache")
-	if databaseKind == ProgramCacheDBWrite {
-		c.offsetCache.SetSaver(
-			func(iii []simpleCacheItem[*ssadb.IrOffset]) {
-				saveStep := func() error {
-					return utils.GormTransaction(c.DB, func(tx *gorm.DB) error {
-						for _, item := range iii {
-							ssadb.SaveIrOffset(tx, item.Value)
-						}
-						return nil
-					})
-				}
-				c.diagnosticsTrack("ssa.Database.SaveIrOffsetBatch", saveStep)
-				return
-			},
-			asyncdb.WithSaveSize(saveSize),
-		)
-	}
-
-	c.indexCache = NewSimpleCache[*ssadb.IrIndex]("IndexCache")
-	if databaseKind == ProgramCacheDBWrite {
-		c.indexCache.SetSaver(
-			func(iii []simpleCacheItem[*ssadb.IrIndex]) {
-				saveStep := func() error {
-					return utils.GormTransaction(c.DB, func(tx *gorm.DB) error {
-						var indices []*ssadb.IrIndex
-						for _, item := range iii {
-							if item.Value != nil {
-								indices = append(indices, item.Value)
-							}
-						}
-						ssadb.SaveIrIndexBatch(tx, indices)
-						return nil
-					})
-				}
-				c.diagnosticsTrack("ssa.Database.SaveIrIndexBatch", saveStep)
-				return
-			},
-			asyncdb.WithSaveSize(saveSize),
-		)
-	}
-
-	c.VariableIndex = NewSimpleCache[Instruction]("VariableIndex")
-	if databaseKind == ProgramCacheDBWrite {
-		c.VariableIndex.SetSaver(
-			func(items []simpleCacheItem[Instruction]) {
-				for _, item := range items {
-					ret := CreateVariableIndexByName(item.Name, item.Value)
-					c.indexCache.Add("", ret)
-
-					// save to offset
-					if value, ok := item.Value.(Value); ok {
-						variable := value.GetVariable(item.Name)
-						if !utils.IsNil(c.offsetCache) && !utils.IsNil(variable) {
-							for _, offset := range ConvertVariable2Offset(variable, item.Name, int64(value.GetId())) {
-								c.offsetCache.Add("", offset)
-							}
-						}
+	store.indexSaver = dbcache.NewSave(func(indices []*ssadb.IrIndex) {
+		saveStep := func() error {
+			return utils.GormTransaction(db, func(tx *gorm.DB) error {
+				batch := make([]*ssadb.IrIndex, 0, len(indices))
+				for _, index := range indices {
+					if index != nil {
+						batch = append(batch, index)
 					}
 				}
-			},
-			asyncdb.WithSaveSize(saveSize),
-		)
-	}
-	c.MemberIndex = NewSimpleCache[Instruction]("MemberIndex")
-	if databaseKind == ProgramCacheDBWrite {
-		c.MemberIndex.SetSaver(
-			func(items []simpleCacheItem[Instruction]) {
-				for _, item := range items {
-					item := CreateVariableIndexByMember(item.Name, item.Value)
-					c.indexCache.Add("", item)
+				ssadb.SaveIrIndexBatch(tx, batch)
+				return nil
+			})
+		}
+		store.diagnosticsTrack("ssa.Database.SaveIrIndexBatch", saveStep)
+	},
+		dbcache.WithSaveSize(saveSize),
+		dbcache.WithSaveTimeout(saveTime),
+	)
+	store.offsetSaver = dbcache.NewSave(func(offsets []*ssadb.IrOffset) {
+		saveStep := func() error {
+			return utils.GormTransaction(db, func(tx *gorm.DB) error {
+				for _, offset := range offsets {
+					if offset == nil {
+						continue
+					}
+					ssadb.SaveIrOffset(tx, offset)
 				}
-			},
-			asyncdb.WithSaveSize(saveSize),
-		)
+				return nil
+			})
+		}
+		store.diagnosticsTrack("ssa.Database.SaveIrOffsetBatch", saveStep)
+	},
+		dbcache.WithSaveSize(saveSize),
+		dbcache.WithSaveTimeout(saveTime),
+	)
+	return store
+}
+
+func (s *indexStore) Close() {
+	if s == nil {
+		return
+	}
+	if s.indexSaver != nil {
+		s.indexSaver.Close()
+	}
+	if s.offsetSaver != nil {
+		s.offsetSaver.Close()
+	}
+}
+
+func (s *indexStore) AddInstructionOffsets(inst Instruction) {
+	if s == nil || s.offsetSaver == nil || utils.IsNil(inst) {
+		return
+	}
+	if offset := ConvertValue2Offset(inst); offset != nil {
+		s.offsetSaver.Save(offset)
+	}
+}
+
+func (s *indexStore) AddConst(inst Instruction) {
+	if s == nil || utils.IsNil(inst) {
+		return
+	}
+	appendResidentIndex(s.consts, inst.GetName(), inst.GetId())
+}
+
+func (s *indexStore) AddVariable(name string, inst Instruction) {
+	if s == nil || utils.IsNil(inst) {
+		return
+	}
+	name, member := normalizeVariableName(name)
+	if member != "" {
+		appendResidentIndex(s.member, member, inst.GetId())
+		if s.indexSaver != nil {
+			s.indexSaver.Save(CreateVariableIndexByMember(member, inst))
+		}
+		return
 	}
 
-	c.ClassIndex = NewSimpleCache[Instruction]("ClassIndex")
-	if databaseKind == ProgramCacheDBWrite {
-		c.ClassIndex.SetSaver(
-			func(items []simpleCacheItem[Instruction]) {
-				for _, item := range items {
-					item := CreateClassIndex(item.Name, item.Value)
-					c.indexCache.Add("", item)
+	appendResidentIndex(s.variable, name, inst.GetId())
+	if s.indexSaver != nil {
+		s.indexSaver.Save(CreateVariableIndexByName(name, inst))
+	}
+}
+
+func (s *indexStore) RemoveVariable(name string, inst Instruction) {
+	if s == nil || utils.IsNil(inst) {
+		return
+	}
+	name, member := normalizeVariableName(name)
+	if member != "" {
+		removeResidentIndex(s.member, member, inst.GetId())
+		return
+	}
+	removeResidentIndex(s.variable, name, inst.GetId())
+}
+
+func (s *indexStore) AddClassInstance(name string, inst Instruction) {
+	if s == nil || utils.IsNil(inst) {
+		return
+	}
+	appendResidentIndex(s.class, name, inst.GetId())
+	if s.indexSaver != nil {
+		s.indexSaver.Save(CreateClassIndex(name, inst))
+	}
+}
+
+func (s *indexStore) FindByVariableEx(mod ssadb.MatchMode, checkValue func(string) bool, resolve func(id int64) Instruction) []Instruction {
+	if s == nil || resolve == nil {
+		return nil
+	}
+	var ins []Instruction
+	appendResolved := func(ids []int64) {
+		for _, id := range ids {
+			if id <= 0 {
+				continue
+			}
+			inst := resolve(id)
+			if inst == nil {
+				continue
+			}
+			ins = append(ins, inst)
+		}
+	}
+	if mod&ssadb.ConstType != 0 {
+		s.consts.ForEach(func(_ string, ids []int64) bool {
+			for _, id := range ids {
+				if id <= 0 {
+					continue
 				}
-			},
-			asyncdb.WithSaveSize(saveSize),
-		)
+				inst := resolve(id)
+				if inst == nil {
+					continue
+				}
+				if checkValue(inst.String()) {
+					ins = append(ins, inst)
+				}
+			}
+			return true
+		})
+		return ins
+	}
+	if mod&ssadb.KeyMatch != 0 {
+		s.member.ForEach(func(key string, instructions []int64) bool {
+			if checkValue(key) {
+				appendResolved(instructions)
+			}
+			return true
+		})
+	}
+	if mod&ssadb.NameMatch != 0 {
+		s.variable.ForEach(func(key string, instructions []int64) bool {
+			if checkValue(key) {
+				appendResolved(instructions)
+			}
+			return true
+		})
+		s.class.ForEach(func(key string, instructions []int64) bool {
+			if checkValue(key) {
+				appendResolved(instructions)
+			}
+			return true
+		})
+	}
+	return ins
+}
+
+func (s *indexStore) diagnosticsTrack(name string, steps ...func() error) {
+	if s == nil || s.program == nil {
+		for _, step := range steps {
+			if step != nil {
+				_ = step()
+			}
+		}
+		return
+	}
+	s.program.DiagnosticsTrack(name, steps...)
+}
+
+func (s *indexStore) SaveVariableOffset(variable *Variable, rng *memedit.Range) {
+	if s == nil || s.offsetSaver == nil || utils.IsNil(variable) || utils.IsNil(rng) {
+		return
+	}
+	if offset := CreateVariableOffset(variable, rng); offset != nil {
+		s.offsetSaver.Save(offset)
+	}
+}
+
+func appendResidentIndex(index *utils.SafeMapWithKey[string, []int64], key string, id int64) {
+	if index == nil || id <= 0 {
+		return
+	}
+	data, ok := index.Get(key)
+	if !ok {
+		data = make([]int64, 0, 1)
+	}
+	data = append(data, id)
+	index.Set(key, data)
+}
+
+func removeResidentIndex(index *utils.SafeMapWithKey[string, []int64], key string, id int64) {
+	if index == nil || id <= 0 {
+		return
+	}
+	data, ok := index.Get(key)
+	if !ok {
+		return
+	}
+	data = utils.RemoveSliceItem(data, id)
+	index.Set(key, data)
+}
+
+func CreateVariableIndexByName(name string, inst Instruction) *ssadb.IrIndex {
+	return CreateVariableIndex(inst, name, "")
+}
+
+func CreateVariableIndexByMember(member string, inst Instruction) *ssadb.IrIndex {
+	return CreateVariableIndex(inst, "", member)
+}
+
+func CreateVariableIndex(inst Instruction, name, member string) *ssadb.IrIndex {
+	if utils.IsNil(inst) {
+		return nil
+	}
+	if inst.GetId() == -1 {
+		return nil
+	}
+	prog := inst.GetProgram()
+	if utils.IsNil(prog) || utils.IsNil(prog.GetApplication()) || utils.IsNil(prog.NameCache) {
+		return nil
+	}
+	progName := prog.GetApplication().GetProgramName()
+
+	index := ssadb.CreateIndex(progName)
+	index.ProgramName = prog.GetApplication().Name
+	index.ValueID = inst.GetId()
+	id := prog.NameCache.GetID(name)
+	index.VariableID = &id
+
+	value, ok := inst.(Value)
+	if !ok {
+		return nil
+	}
+	variable := value.GetVariable(name)
+	if variable != nil {
+		index.VersionID = variable.GetVersion()
+		if scope := variable.GetScope(); scope != nil {
+			index.ScopeName = scope.GetScopeName()
+		}
 	}
 
-	c.ConstCache = NewSimpleCache[Instruction]("ConstCache")
-	if databaseKind == ProgramCacheDBWrite {
-		c.ConstCache.SetSaver(
-			func(ii []simpleCacheItem[Instruction]) {
-			},
-			asyncdb.WithSaveSize(saveSize),
-		)
-	}
+	fieldID := prog.NameCache.GetID(member)
+	index.FieldID = &fieldID
+	return index
+}
 
+func CreateClassIndex(name string, inst Instruction) *ssadb.IrIndex {
+	if inst.GetId() == -1 {
+		return nil
+	}
+	prog := inst.GetProgram()
+	progName := prog.GetApplication().GetProgramName()
+
+	index := ssadb.CreateIndex(progName)
+	index.ProgramName = prog.GetApplication().Name
+	index.ValueID = inst.GetId()
+	classID := prog.NameCache.GetID(name)
+	index.ClassID = &classID
+	return index
 }

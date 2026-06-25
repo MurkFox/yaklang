@@ -1,7 +1,6 @@
 package ziputil
 
 import (
-	"archive/zip"
 	"io"
 	"io/ioutil"
 	"os"
@@ -12,6 +11,7 @@ import (
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/memfile"
+	zip "github.com/yaklang/yaklang/common/utils/zipx"
 )
 
 // 压缩文件
@@ -226,7 +226,18 @@ func DeCompressFromRaw(raw []byte, dest string) error {
 	return nil
 }
 
-// 解压
+// Decompress 解压一个 zip 文件到指定目标目录
+// 参数:
+//   - zipFile: 待解压的 zip 文件路径
+//   - dest: 解压输出的目标目录
+//
+// 返回值:
+//   - 错误信息
+//
+// Example:
+// ```
+// zip.Decompress("/tmp/abc.zip", "/tmp/abc_extracted")~
+// ```
 func DeCompress(zipFile, dest string) error {
 	raw, err := ioutil.ReadFile(zipFile)
 	if err != nil {

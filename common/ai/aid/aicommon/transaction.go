@@ -1,18 +1,50 @@
 package aicommon
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/utils"
 )
+
+func is429Response(ctx context.Context, rsp *AIResponse) bool {
+	if rsp == nil {
+		return false
+	}
+	rsp.WaitForHTTPHeaders(ctx)
+	return rsp.GetHTTPStatusCode() == 429
+}
 
 func CallAITransaction(
 	c AICallerConfigIf,
 	prompt string,
 	callAi func(*AIRequest) (*AIResponse, error),
 	postHandler func(rsp *AIResponse) error,
+	requestOpts ...AIRequestOption,
+) error {
+	return callAITransaction(c, prompt, callAi, postHandler, nil, requestOpts...)
+}
+
+func CallAITransactionWithFailureExtra(
+	c AICallerConfigIf,
+	prompt string,
+	callAi func(*AIRequest) (*AIResponse, error),
+	postHandler func(rsp *AIResponse) error,
+	failureExtra map[string]any,
+	requestOpts ...AIRequestOption,
+) error {
+	return callAITransaction(c, prompt, callAi, postHandler, failureExtra, requestOpts...)
+}
+
+func callAITransaction(
+	c AICallerConfigIf,
+	prompt string,
+	callAi func(*AIRequest) (*AIResponse, error),
+	postHandler func(rsp *AIResponse) error,
+	failureExtra map[string]any,
 	requestOpts ...AIRequestOption,
 ) error {
 	var seq int64
@@ -26,9 +58,17 @@ func CallAITransaction(
 	}
 	var postHandlerErr error
 	var lastErr error
+	var lastCallAiErr error // 保留 API 调用错误，防止被 postHandler 错误覆盖
 	var lastRsp *AIResponse
+	var lastReq *AIRequest
 
 	emitter := c.GetEmitter()
+	bindEmitter := func(rsp *AIResponse) *Emitter {
+		if rsp == nil {
+			return emitter
+		}
+		return rsp.BindEmitter(emitter)
+	}
 
 	requestOpts = append(requestOpts,
 		WithAIRequest_OnAcquireSeq(func(i int64) {
@@ -36,9 +76,10 @@ func CallAITransaction(
 		}),
 		WithAIRequest_SaveCheckpointCallback(func(handler CheckpointCommitHandler) {
 			saver = handler
-		}))
+		}),
+	)
 
-	for i := int64(0); i < trcRetry; i++ {
+	for i := int64(0); i < trcRetry; {
 		if c.IsCtxDone() {
 			return utils.Errorf("context is done, cannot continue transaction")
 		}
@@ -52,20 +93,35 @@ func CallAITransaction(
 			}
 		})
 
-		rsp, err := callAi(
-			NewAIRequest(
-				finalPrompt,
-				append(requestOpts, WithAIRequest_SeqId(seq))...,
-			))
+		aiReq := NewAIRequest(
+			finalPrompt,
+			append(requestOpts, WithAIRequest_SeqId(seq))...,
+		)
+		lastReq = aiReq
+		rsp, err := callAi(aiReq)
 		if err != nil {
 			lastErr = err
+			lastCallAiErr = err
 			lastRsp = rsp
-			emitter.EmitError("call ai api error (attempt %d/%d): %v", i+1, trcRetry, err)
+			rspEmitter := bindEmitter(rsp)
+
+			if is429Response(c.GetContext(), rsp) {
+				rspEmitter.EmitWarning("429 rate limit detected in transaction layer (seq=%d), will retry without counting attempt", seq)
+				select {
+				case <-c.GetContext().Done():
+					return err
+				case <-time.After(5 * time.Second):
+					continue
+				}
+			}
+
+			i++
+			rspEmitter.EmitError("call ai api error (attempt %d/%d): %v", i, trcRetry, err)
 			select {
 			case <-c.GetContext().Done():
 				return err
 			case <-time.After(100 * time.Millisecond):
-				emitter.EmitWarning("call ai transaction retry (attempt %d/%d)", i+1, trcRetry)
+				rspEmitter.EmitWarning("call ai transaction retry (attempt %d/%d)", i, trcRetry)
 				continue
 			}
 		}
@@ -74,14 +130,24 @@ func CallAITransaction(
 		}
 		lastRsp = rsp
 		postHandlerErr = postHandler(rsp)
+		// 检查 rsp 的 error（由 AIChatToAICallbackType 等设置），合并错误
+		if rspErr := rsp.GetError(); rspErr != nil {
+			if postHandlerErr != nil {
+				postHandlerErr = utils.Errorf("post handler: %v; ai callback: %v", postHandlerErr, rspErr)
+			} else {
+				postHandlerErr = rspErr
+			}
+		}
 		if postHandlerErr != nil {
 			lastErr = postHandlerErr
-			emitter.EmitError("ai transaction postHandler error (attempt %d/%d): %v", i+1, trcRetry, postHandlerErr)
+			i++
+			rspEmitter := bindEmitter(rsp)
+			rspEmitter.EmitError("ai transaction postHandler error (attempt %d/%d): %v", i, trcRetry, postHandlerErr)
 			select {
 			case <-c.GetContext().Done():
 				return postHandlerErr
 			case <-time.After(100 * time.Millisecond):
-				emitter.EmitWarning("call ai transaction retry (attempt %d/%d)", i+1, trcRetry)
+				rspEmitter.EmitWarning("call ai transaction retry (attempt %d/%d)", i, trcRetry)
 				continue
 			}
 		}
@@ -91,10 +157,16 @@ func CallAITransaction(
 				emitter.EmitError("cannot save checkpoint")
 				return err
 			} else {
-				emitter.EmitInfo("checkpoint cached in database: %v:%v", utils.ShrinkString(cp.CoordinatorUuid, 12), cp.Seq)
+				//emitter.EmitInfo("checkpoint cached in database: %v:%v", utils.ShrinkString(cp.CoordinatorUuid, 12), cp.Seq)
 			}
 		}
 		return nil
+	}
+
+	// 确定最终错误：优先使用 API 调用错误，保留错误链
+	finalErr := lastErr
+	if lastCallAiErr != nil {
+		finalErr = lastCallAiErr
 	}
 
 	var modelInfo string
@@ -113,7 +185,7 @@ func CallAITransaction(
 			"2. Try switching to a different AI model\n"+
 			"3. Simplify the task or reduce the prompt complexity\n"+
 			"4. Check network connectivity and API rate limits",
-		trcRetry, modelInfo, lastErr,
+		trcRetry, modelInfo, finalErr,
 	)
 	if lastRsp != nil {
 		rawDump := lastRsp.GetRawHTTPResponseDump()
@@ -121,10 +193,16 @@ func CallAITransaction(
 			finalErrMsg += "\n\n--- Last Raw HTTP Response ---\n" + utils.ShrinkString(rawDump, 4096)
 		}
 	}
-	emitter.EmitDefaultStreamEvent("ai-error", strings.NewReader(finalErrMsg), "")
+	bindEmitter(lastRsp).EmitDefaultStreamEvent("ai-error", strings.NewReader(finalErrMsg), "")
 
-	if lastErr != nil {
-		return utils.Errorf("max retry count[%v] reached in transaction, last error: %v", trcRetry, lastErr)
+	var tier consts.ModelTier
+	if lastReq != nil {
+		tier = consts.ModelTier(lastReq.GetModelTier())
+	}
+	EmitAICallFailureIfApplicable(c, tier, lastRsp, finalErr, failureExtra)
+
+	if finalErr != nil {
+		return utils.Wrap(finalErr, fmt.Sprintf("max retry count[%v] reached in transaction", trcRetry))
 	}
 	return utils.Errorf("max retry count[%v] reached in transaction", trcRetry)
 }

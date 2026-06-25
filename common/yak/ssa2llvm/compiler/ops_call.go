@@ -63,6 +63,7 @@ func (c *Compiler) newDispatchContextCallSpec(inst *ssa.Call, binding ExternBind
 		return contextCallSpec{}, fmt.Errorf("newDispatchContextCallSpec: missing dispatch id for call %d", inst.GetId())
 	}
 
+	c.recordRuntimeDispatchDependency(binding.DispatchID)
 	return contextCallSpec{
 		inst:      inst,
 		kind:      abi.KindDispatch,
@@ -95,12 +96,16 @@ func (c *Compiler) newRuntimeMethodDispatchSpec(inst *ssa.Call, fn *ssa.Function
 
 	methodNamePtr := c.Builder.CreateGlobalStringPtr(methodName, fmt.Sprintf("yak_method_name_%d", inst.GetId()))
 	methodNameI64 := llvm.ConstPtrToInt(methodNamePtr, c.LLVMCtx.Int64Type())
-	args := make([]contextCallArg, 0, len(inst.Args)+2)
+	callArgs := append([]int64{}, inst.Args...)
+	if len(callArgs) > 0 && callArgs[0] == obj.GetId() {
+		callArgs = callArgs[1:]
+	}
+	args := make([]contextCallArg, 0, len(callArgs)+2)
 	args = append(args,
 		contextCallArg{ssaID: obj.GetId()},
 		contextCallArg{value: methodNameI64},
 	)
-	for _, argID := range inst.Args {
+	for _, argID := range callArgs {
 		args = append(args, contextCallArg{ssaID: argID, tagPointerArg: true})
 	}
 	return contextCallSpec{
@@ -116,6 +121,11 @@ func (c *Compiler) newRuntimeMethodDispatchSpec(inst *ssa.Call, fn *ssa.Function
 
 // compileCall compiles a ssa.Call instruction to LLVM IR.
 func (c *Compiler) compileCall(inst *ssa.Call) error {
+	if inst != nil {
+		if cached, ok := c.getCachedValue(inst, inst.GetId()); ok {
+			return c.finishContextCall(inst, cached)
+		}
+	}
 	if handled, err := c.compileTaggedObfCall(inst); handled || err != nil {
 		return err
 	}
@@ -196,6 +206,16 @@ func (c *Compiler) compileCall(inst *ssa.Call) error {
 		if err != nil {
 			return err
 		}
+		return c.lowerResolvedContextCall(spec)
+	}
+
+	if c.shouldUseYaklibDispatch(calleeName) {
+		return c.lowerYaklibDispatchCall(inst, calleeName)
+	}
+
+	if spec, ok, err := c.newDynamicCallableContextCallSpec(inst, fn, calleeVal); err != nil {
+		return err
+	} else if ok {
 		return c.lowerResolvedContextCall(spec)
 	}
 

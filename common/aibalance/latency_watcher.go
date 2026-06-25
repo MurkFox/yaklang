@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/schema"
 )
 
 // LatencyWatcher monitors provider latency and triggers health checks when issues are detected
@@ -59,13 +58,25 @@ func StopLatencyWatcher() {
 	}
 }
 
-// Start begins the latency watcher background goroutine
+// Start begins the latency watcher background goroutine.
+//
+// 注意：支持 Stop -> Start 的循环（测试场景需要在 chat baseline 采样
+// 之前暂停 watcher、采样后重新开启）。如果之前的 Stop 已经 close 了
+// stopChan，这里会重建一个新的 channel，让 watchLoop 不会刚启动就退出。
+//
+// 关键词: LatencyWatcher Start 支持 stopChan 重建, Stop->Start 循环
 func (w *LatencyWatcher) Start() {
 	w.mutex.Lock()
 	if w.running {
 		w.mutex.Unlock()
 		log.Infof("LatencyWatcher is already running")
 		return
+	}
+	// 如果旧 stopChan 已 close，重建一个，避免 watchLoop 起来就退出。
+	select {
+	case <-w.stopChan:
+		w.stopChan = make(chan struct{})
+	default:
 	}
 	w.running = true
 	w.mutex.Unlock()
@@ -142,7 +153,7 @@ func (w *LatencyWatcher) checkProviders(isNormalCheck bool) {
 			go w.triggerHealthCheck(p.ID, p.WrapperName)
 		} else if wasTracked {
 			// Provider has recovered
-			log.Infof("LatencyWatcher: provider %s (ID: %d) has recovered, latency: %dms, healthy: %v",
+			log.Debugf("LatencyWatcher: provider %s (ID: %d) has recovered, latency: %dms, healthy: %v",
 				p.WrapperName, p.ID, p.LastLatency, p.IsHealthy)
 			delete(w.problematicIDs, p.ID)
 		}
@@ -150,13 +161,13 @@ func (w *LatencyWatcher) checkProviders(isNormalCheck bool) {
 
 	// Log summary
 	if len(w.problematicIDs) > 0 {
-		log.Infof("LatencyWatcher: currently monitoring %d problematic providers with fast health check interval (%v)",
+		log.Debugf("LatencyWatcher: currently monitoring %d problematic providers with fast health check interval (%v)",
 			len(w.problematicIDs), w.fastInterval)
 	}
 }
 
 // isProviderProblematic checks if a provider is problematic based on latency and health status
-func (w *LatencyWatcher) isProviderProblematic(p *schema.AiProvider) bool {
+func (w *LatencyWatcher) isProviderProblematic(p *AiProvider) bool {
 	// Provider is problematic if:
 	// 1. First check not completed (highest priority - need to complete first check)
 	if !p.IsFirstCheckCompleted {
@@ -182,7 +193,7 @@ func (w *LatencyWatcher) triggerHealthCheck(providerID uint, providerName string
 	}
 
 	if result != nil {
-		log.Infof("LatencyWatcher: health check result for provider %s (ID: %d): healthy=%v, latency=%dms",
+		log.Debugf("LatencyWatcher: health check result for provider %s (ID: %d): healthy=%v, latency=%dms",
 			providerName, providerID, result.IsHealthy, result.ResponseTime)
 	}
 }

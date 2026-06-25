@@ -3,16 +3,18 @@ package aiengine
 import (
 	"context"
 	"encoding/json"
+	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiconfig"
+	"github.com/yaklang/yaklang/common/consts"
 	"sync"
 	"time"
 
-	"github.com/yaklang/yaklang/common/ai"
 	"github.com/yaklang/yaklang/common/ai/aid"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/rag"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
@@ -35,15 +37,44 @@ type AIEngine struct {
 	taskEndpoints      map[string]*aicommon.Endpoint   // 任务ID -> 任务完成 endpoint
 }
 
-// NewAIEngine 创建新的 AI 引擎实例
+// NewAIEngine 创建新的 AI 引擎实例（导出名为 aim.NewAIEngine）
+// AI 引擎封装了 ReAct 等能力，可通过 SendMsg/SendMsgAsync 发送任务
+// 参数:
+//   - options: 引擎配置可选项，如 aim.aiCallback、aim.maxIteration、aim.onEvent 等
+//
+// 返回值:
+//   - AI 引擎实例
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的 AI 服务（示意性示例）
+// engine = aim.NewAIEngine(aim.maxIteration(10))~
+// defer engine.Close()
+// engine.SendMsg("list files in current dir")
+// ```
 func NewAIEngine(options ...AIEngineConfigOption) (*AIEngine, error) {
 	config := NewAIEngineConfig(options...)
+	notifySessionID(config)
 
 	// 创建上下文
 	ctx, cancel := context.WithCancel(config.Context)
 
 	// 创建通道
 	outputChan := make(chan *schema.AiOutputEvent, 100)
+
+	// 创建 endpoint manager 用于任务同步
+	epm := aicommon.NewEndpointManagerContext(ctx)
+
+	engine := &AIEngine{
+		config:           config,
+		outputChan:       outputChan,
+		ctx:              ctx,
+		cancel:           cancel,
+		activeTasks:      make(map[string]aicommon.AITaskState),
+		allTasksEndpoint: epm.CreateEndpoint(),
+		taskEndpoints:    make(map[string]*aicommon.Endpoint),
+	}
 
 	// 构建 ReAct 配置选项
 	reactOptions := buildReActOptions(ctx, config, outputChan)
@@ -55,19 +86,7 @@ func NewAIEngine(options ...AIEngineConfigOption) (*AIEngine, error) {
 		return nil, utils.Errorf("failed to create ReAct AIEngineOperator instance: %v", err)
 	}
 
-	// 创建 endpoint manager 用于任务同步
-	epm := aicommon.NewEndpointManagerContext(ctx)
-
-	engine := &AIEngine{
-		config:           config,
-		operator:         operator,
-		outputChan:       outputChan,
-		ctx:              ctx,
-		cancel:           cancel,
-		activeTasks:      make(map[string]aicommon.AITaskState),
-		allTasksEndpoint: epm.CreateEndpoint(), // 所有任务完成信号
-		taskEndpoints:    make(map[string]*aicommon.Endpoint),
-	}
+	engine.operator = operator
 
 	// 启动输出处理器
 	engine.wg.Add(1)
@@ -76,6 +95,7 @@ func NewAIEngine(options ...AIEngineConfigOption) (*AIEngine, error) {
 	// 发送初始化配置
 	err = engine.sendInitConfig()
 	if err != nil {
+		cancel()
 		return nil, utils.Errorf("send init config failed: %v", err)
 	}
 	return engine, nil
@@ -149,7 +169,8 @@ func (e *AIEngine) sendMsgAndGetTaskName(input string, attachedResources ...*aic
 
 // SendMsg 执行 AI 任务（阻塞直到该任务完成）
 func (e *AIEngine) SendMsg(input string, options ...AIEngineConfigOption) error {
-	// 创建临时config
+	// 临时 config 仅提取 AttachedResources，复用引擎 session，避免重复生成 sessionID
+	options = append([]AIEngineConfigOption{WithSessionID(e.config.SessionID)}, options...)
 	config := NewAIEngineConfig(options...)
 
 	// 发送消息并获取任务名称
@@ -244,7 +265,7 @@ func (e *AIEngine) GetActiveTaskCount() int {
 
 // SendMsgAsync 异步执行 AI 任务（立即返回）
 func (e *AIEngine) SendMsgAsync(input string, options ...AIEngineConfigOption) error {
-	// 创建临时config
+	options = append([]AIEngineConfigOption{WithSessionID(e.config.SessionID)}, options...)
 	config := NewAIEngineConfig(options...)
 
 	// 发送消息后直接返回
@@ -274,6 +295,14 @@ func (e *AIEngine) Wait() {
 // IsFinished 检查任务是否完成
 func (e *AIEngine) IsFinished() bool {
 	return e.operator.IsFinished()
+}
+
+// SendInputEvent forwards an AI input event to the underlying operator.
+func (e *AIEngine) SendInputEvent(event *ypb.AIInputEvent) error {
+	if e == nil || e.operator == nil {
+		return utils.Error("ai engine is not initialized")
+	}
+	return e.operator.SendInputEvent(event)
 }
 
 // Close 关闭 AI 引擎，释放资源
@@ -318,6 +347,9 @@ func (e *AIEngine) handleOutputEvents() {
 // processOutputEvent 处理单个输出事件
 func (e *AIEngine) processOutputEvent(event *schema.AiOutputEvent) {
 	if event.Type == schema.EVENT_TYPE_STRUCTURED {
+		if event.NodeId == "stream-finished" {
+			e.handleStreamFinishedEvent(event)
+		}
 		if event.NodeId == "react_task_created" {
 			taskInfo := map[string]string{}
 			err := json.Unmarshal(event.Content, &taskInfo)
@@ -398,11 +430,35 @@ func (e *AIEngine) processOutputEvent(event *schema.AiOutputEvent) {
 	case schema.EVENT_TYPE_STREAM:
 		e.config.OnStream(e.operator, event, event.NodeId, event.StreamDelta)
 	default:
+
 		// 记录其他事件类型
 		if event.Type == "error" {
 			log.Errorf("AI Engine error: %s", string(event.Content))
 		}
 	}
+}
+
+func (e *AIEngine) handleStreamFinishedEvent(event *schema.AiOutputEvent) {
+	streamWriterID := event.GetStreamEventWriterId()
+	if streamWriterID == "" {
+		return
+	}
+
+	streamEvents, err := yakit.QueryAIEvent(consts.GetGormProjectDatabase(), &ypb.AIEventFilter{
+		EventUUIDS: []string{streamWriterID},
+	})
+	if err != nil {
+		log.Errorf("query stream event failed: event_uuid=%s err=%v", streamWriterID, err)
+		return
+	}
+	if len(streamEvents) == 0 || streamEvents[0] == nil {
+		log.Warnf("stream event not found after stream-finished: event_uuid=%s", streamWriterID)
+		return
+	}
+
+	streamEvent := streamEvents[0]
+	e.config.OnStreamEnd(e.operator, streamEvent, streamEvent.NodeId)
+	e.config.OnStreamEndWithTotal(e.operator, streamEvent, streamEvent.NodeId, streamEvent.StreamDelta)
 }
 
 // buildReActOptions 构建 ReAct 配置选项
@@ -413,7 +469,7 @@ func buildReActOptions(ctx context.Context, config *AIEngineConfig, outputChan c
 		aicommon.WithBuiltinTools(),
 
 		// AI 服务配置
-		aicommon.WithAICallback(aicommon.AIChatToAICallbackType(ai.Chat)),
+		aicommon.WithTieredAICallback(),
 
 		// 知识库配置
 		aicommon.WithEnhanceKnowledgeManager(rag.NewRagEnhanceKnowledgeManager()),
@@ -478,6 +534,14 @@ func buildReActOptions(ctx context.Context, config *AIEngineConfig, outputChan c
 		options = append(options, aicommon.WithKeywords(config.Keywords...))
 	}
 
+	if len(config.ExtraMCPServers) > 0 {
+		options = append(options, aicommon.WithExtraMCPServers(config.ExtraMCPServers...))
+	}
+
+	if config.RestrictToSessionMCP {
+		options = append(options, aicommon.WithRestrictToolsToExtraMCPServers(true))
+	}
+
 	// 交互配置
 	if !config.AllowUserInteract {
 		options = append(options, aicommon.WithAllowRequireForUserInteract(false))
@@ -498,14 +562,27 @@ func buildReActOptions(ctx context.Context, config *AIEngineConfig, outputChan c
 
 	// AI 服务
 	if config.AICallback != nil {
-		options = append(options, aicommon.WithAICallback(config.AICallback))
+		options = append(options, aicommon.WithAutoTieredAICallback(config.AICallback))
 	} else if config.AIService != "" {
-		chat, err := ai.LoadChater(config.AIService)
+		cb, err := aicommon.CreateCallbackFromConfig(aiconfig.GetGlobalManager().GetFirstConfigByTierAndProviderAndModel(consts.TierIntelligent, config.AIService, ""))
 		if err != nil {
 			log.Errorf("load ai service failed: %v", err)
 		} else {
-			options = append(options, aicommon.WithAICallback(aicommon.AIChatToAICallbackType(chat)))
+			options = append(options, aicommon.WithAutoTieredAICallback(cb))
 		}
+	}
+	if config.QualityPriorityAICallback != nil {
+		options = append(options, aicommon.WithQualityPriorityAICallback(config.QualityPriorityAICallback))
+	}
+	if config.SpeedPriorityAICallback != nil {
+		options = append(options, aicommon.WithSpeedPriorityAICallback(config.SpeedPriorityAICallback))
+	}
+
+	// 把 user 端 ai.usageCallback(...) 透传到 React Config 上, Tiered AI
+	// 路径会从 Config.GetUserUsageCallback() 取出再注入到上游 chat opts.
+	// 关键词: buildReActOptions UsageCallback 透传
+	if config.UserUsageCallback != nil {
+		options = append(options, aicommon.WithUserUsageCallback(config.UserUsageCallback))
 	}
 
 	// 高级配置
@@ -544,6 +621,21 @@ func buildReActOptions(ctx context.Context, config *AIEngineConfig, outputChan c
 	return options
 }
 
+// InvokeReAct 以 ReAct 模式执行一次 AI 任务并阻塞至完成（导出名为 aim.InvokeReAct）
+// 内部会创建一个临时 AI 引擎，执行完成后自动关闭
+// 参数:
+//   - input: 任务输入（自然语言指令）
+//   - options: 引擎配置可选项，如 aim.aiCallback、aim.onEvent 等
+//
+// 返回值:
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的 AI 服务（示意性示例）
+// err = aim.InvokeReAct("summarize the README", aim.maxIteration(5))
+// if err != nil { die(err) }
+// ```
 func InvokeReAct(input string, options ...AIEngineConfigOption) error {
 	engine, err := NewAIEngine(options...)
 	if err != nil {
@@ -554,7 +646,22 @@ func InvokeReAct(input string, options ...AIEngineConfigOption) error {
 	return engine.SendMsg(input, options...)
 }
 
-// InvokeReActAsync 异步执行 ReAct 任务，并返回引擎实例
+// InvokeReActAsync 异步执行 ReAct 任务，并返回引擎实例（导出名为 aim.InvokeReActAsync）
+// 参数:
+//   - input: 任务输入（自然语言指令）
+//   - options: 引擎配置可选项
+//
+// 返回值:
+//   - AI 引擎实例（可用于后续交互或等待）
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的 AI 服务（示意性示例）
+// engine = aim.InvokeReActAsync("scan target", aim.onEvent(func(op, e) { dump(e) }))~
+// defer engine.Close()
+// engine.Wait()
+// ```
 func InvokeReActAsync(input string, options ...AIEngineConfigOption) (*AIEngine, error) {
 	engine, err := NewAIEngine(options...)
 	if err != nil {

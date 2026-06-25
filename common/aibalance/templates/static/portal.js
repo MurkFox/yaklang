@@ -14,6 +14,9 @@
         let apiKeysPageSize = 20;
         let apiKeysPagination = null;
         let apiKeysData = [];
+        // 当前 API Key 列表按用户名过滤值（空=不过滤）
+        // 关键词: apiKeyUsernameFilterValue, API Key 列表 username 过滤状态
+        let apiKeyUsernameFilterValue = '';
         
         // ==================== Authentication Error Handler ====================
         
@@ -75,6 +78,54 @@
             }
             return false;
         }
+
+        // ==================== Session Auto-Refresh ====================
+        // 后端 session 有效期为 30 分钟。只要 portal 页面开着，
+        // 这里就每 10 分钟自动调一次 /portal/api/session/refresh，把
+        // ExpiresAt 顺延 30 分钟，避免因长时间挂在页面上而被强制登出。
+        // 设计上不复用 authFetch，因为它会在 401/403 时直接跳转登录，
+        // 而我们希望续期失败时让上层业务请求自然触发跳转，这里只静默重试。
+        // 关键词: session auto refresh keep alive 自动续期 token
+        const SESSION_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+        let __sessionRefreshTimer = null;
+
+        async function refreshAdminSessionOnce() {
+            try {
+                const resp = await fetch('/portal/api/session/refresh', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                });
+                if (resp.status === 401 || resp.status === 403) {
+                    handleAuthError();
+                    return false;
+                }
+                if (!resp.ok) {
+                    console.warn('session refresh non-ok status:', resp.status);
+                    return false;
+                }
+                const data = await resp.json().catch(() => null);
+                if (data && data.expires_at) {
+                    console.debug('session refreshed, new expires_at:', data.expires_at);
+                }
+                return true;
+            } catch (e) {
+                console.warn('session refresh error:', e);
+                return false;
+            }
+        }
+
+        function startSessionAutoRefresh() {
+            if (__sessionRefreshTimer) return;
+            // 进入页面立刻续一次，覆盖 "session 还剩不多就刷新页面" 的场景，
+            // 避免下一次定时还没到就过期了。
+            refreshAdminSessionOnce();
+            __sessionRefreshTimer = setInterval(refreshAdminSessionOnce, SESSION_REFRESH_INTERVAL_MS);
+            // 暴露给手动调试。
+            window.__sessionRefreshTimer = __sessionRefreshTimer;
+        }
+
+        window.refreshAdminSessionOnce = refreshAdminSessionOnce;
+        window.startSessionAutoRefresh = startSessionAutoRefresh;
         
         // 模型选择相关
         let portalAvailableModels = [];
@@ -114,6 +165,19 @@
                 document.getElementById('stat-concurrent-requests').textContent = data.concurrent_requests || 0;
                 document.getElementById('stat-web-search-count').textContent = data.web_search_count || 0;
                 document.getElementById('stat-amap-count').textContent = data.amap_count || 0;
+                var todayDauEl = document.getElementById('stat-today-dau');
+                if (todayDauEl) {
+                    todayDauEl.textContent = (data.today_dau || 0).toLocaleString();
+                }
+                if (typeof renderDiskCard === 'function') {
+                    renderDiskCard(data.disk_info || {});
+                }
+                if (typeof renderStorageCard === 'function') {
+                    renderStorageCard(data.storage_info || {});
+                }
+                if (typeof renderDauCacheTab === 'function') {
+                    renderDauCacheTab(data);
+                }
             },
             
             // 渲染供应商表格
@@ -124,7 +188,7 @@
                 tbody.innerHTML = '';
                 
                 if (!data.providers || data.providers.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="10" class="text-center">No providers found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="11" class="text-center">No providers found</td></tr>';
                     return;
                 }
                 
@@ -132,6 +196,7 @@
                     const row = document.createElement('tr');
                     row.dataset.id = p.id;
                     row.dataset.status = p.health_status_class;
+                    row.dataset.activeCacheControl = p.active_cache_control ? '1' : '0';
                     
                     let healthBadge = '';
                     let latencyDisplay = '';
@@ -145,6 +210,12 @@
                         healthBadge = '<span class="health-badge unhealthy">未知</span>';
                         latencyDisplay = '<span class="health-latency">-</span>';
                     }
+                    
+                    // Active Cache Control 徽章: 打开时显示绿色 CC, 关闭时留空
+                    // 关键词: renderProviders active_cache_control 徽章列, 主动 cache_control 注入开关可视化
+                    const ccBadge = p.active_cache_control
+                        ? '<span class="health-badge healthy" title="Active Cache Control 已开启: 自动给最末 system 注入 cache_control:ephemeral">CC</span>'
+                        : '<span class="health-badge" style="color:#999;background:transparent;border:1px dashed #ccc;" title="Active Cache Control 关闭: 走 tongyi+白名单 legacy 路径或 strip">-</span>';
                     
                     row.innerHTML = `
                         <td class="checkbox-column">
@@ -171,7 +242,7 @@
                         <td class="copyable api-key-cell" data-full-text="${this.escapeHtml(p.api_key)}">
                             <div class="api-key-container">
                                 <span class="api-key-display">${p.api_key ? '•••••••' : ''}</span>
-                                <button class="btn btn-sm btn-copy" onclick="copyToClipboard('${this.escapeHtml(p.api_key)}')" title="复制 API Key">
+                                <button class="btn btn-sm btn-copy" onclick="copyToClipboard('${escapeJsInHtmlAttr(p.api_key)}')" title="复制 API Key">
                                     <svg viewBox="0 0 24 24" width="14" height="14">
                                         <path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
                                     </svg>
@@ -179,6 +250,7 @@
                             </div>
                         </td>
                         <td>${p.total_requests}</td>
+                        <td class="text-center">${ccBadge}</td>
                         <td>
                             <div class="provider-actions">
                                 <button class="btn btn-sm btn-quick-add" onclick="quickAddProvider('${p.id}')" title="快速添加">
@@ -241,31 +313,35 @@
                     const row = document.createElement('tr');
                     row.dataset.apiId = key.id;
                     row.dataset.apiStatus = key.active ? 'active' : 'inactive';
-                    row.dataset.trafficLimit = key.traffic_limit;
-                    row.dataset.trafficUsed = key.traffic_used;
-                    row.dataset.trafficEnabled = key.traffic_limit_enable;
+                    row.dataset.tokenLimit = key.token_limit || 0;
+                    row.dataset.tokenUsed = key.token_used || 0;
+                    row.dataset.tokenEnabled = !!key.token_limit_enable;
                     
                     let statusBadge = key.active 
                         ? '<span class="health-badge healthy" style="font-size:12px;">激活</span>'
                         : '<span class="health-badge unhealthy" style="font-size:12px;">禁用</span>';
                     
-                    let trafficLimitCell = '';
-                    if (key.traffic_limit_enable) {
-                        const percent = key.traffic_percent;
-                        let barColor = '#4caf50';
-                        if (percent > 90) barColor = '#f44336';
-                        else if (percent > 70) barColor = '#ff9800';
-                        
-                        trafficLimitCell = `
-                            <div class="traffic-limit-info" title="已用/限额: ${key.traffic_used_formatted}/${key.traffic_limit_formatted} (${percent.toFixed(1)}%)">
+                    // 字节流量限额列已停用：统一改用 Token 维度计费/限额
+                    // 关键词: API Key Token 用量列 + Token 限额列渲染, 字节流量限额停用
+                    const tokenUsedRaw = Number(key.token_used) || 0;
+                    const tokenLimitRaw = Number(key.token_limit) || 0;
+                    const tokenUsedDisplay = formatTokenCount(tokenUsedRaw);
+                    let tokenLimitCell = '';
+                    if (key.token_limit_enable && tokenLimitRaw > 0) {
+                        const tPercent = (tokenUsedRaw / tokenLimitRaw) * 100;
+                        let tBarColor = '#4caf50';
+                        if (tPercent > 90) tBarColor = '#f44336';
+                        else if (tPercent > 70) tBarColor = '#ff9800';
+                        tokenLimitCell = `
+                            <div class="traffic-limit-info" title="Token 用量: ${tokenUsedRaw}/${tokenLimitRaw} (${tPercent.toFixed(1)}%)">
                                 <div class="traffic-progress" style="width: 80px; height: 8px; background: #e0e0e0; border-radius: 4px; overflow: hidden;">
-                                    <div style="width: ${Math.min(percent, 100)}%; height: 100%; background: ${barColor};"></div>
+                                    <div style="width: ${Math.min(tPercent, 100)}%; height: 100%; background: ${tBarColor};"></div>
                                 </div>
-                                <small>${key.traffic_used_formatted}/${key.traffic_limit_formatted}</small>
+                                <small>${tokenUsedDisplay}/${formatTokenCount(tokenLimitRaw)}</small>
                             </div>
                         `;
                     } else {
-                        trafficLimitCell = '<span style="color: #999;">未限制</span>';
+                        tokenLimitCell = '<span style="color: #999;">未限制</span>';
                     }
                     
                     let actionButtons = key.active
@@ -282,7 +358,7 @@
                         <td class="text-center">${key.id}</td>
                         <td class="text-center">${statusBadge}</td>
                         <td class="copyable api-key-cell" data-full-text="${this.escapeHtml(key.key)}">${this.escapeHtml(key.display_key)}</td>
-                        <td class="copyable editable-allowed-models" data-api-id="${key.id}" data-current-models="${this.escapeHtml(key.allowed_models)}" data-full-text="${this.escapeHtml(key.allowed_models)}" title="右键点击修改允许的模型">${this.escapeHtml(key.allowed_models)}</td>
+                        <td class="copyable editable-allowed-models" data-api-id="${key.id}" data-current-models="${this.escapeHtml(key.allowed_models)}" data-full-text="${this.escapeHtml(key.allowed_models)}" title="右键点击修改允许的模型">${renderAllowedModelsCellContent(key.allowed_models)}</td>
                         <td class="text-center">${key.usage_count}</td>
                         <td class="text-center">${key.web_search_count || 0}</td>
                         <td class="text-center">
@@ -295,13 +371,14 @@
                                 <span title="输出流量">↑ ${key.output_bytes_formatted}</span>
                             </div>
                         </td>
-                        <td class="text-center">${trafficLimitCell}</td>
+                        <td class="text-center" title="Token 计费用量">${tokenUsedDisplay}</td>
+                        <td class="text-center">${tokenLimitCell}</td>
                         <td class="text-center">${this.escapeHtml(creatorName)}</td>
                         <td>${key.last_used_at || '-'}</td>
                         <td class="text-center">
                             <div style="display: flex; gap: 2px; justify-content: center; flex-wrap: wrap;">
                                 ${actionButtons}
-                                <button class="btn btn-sm" onclick="showTrafficLimitDialog(${key.id}, ${key.traffic_limit}, ${key.traffic_used}, ${key.traffic_limit_enable})" title="流量设置" style="padding:2px 4px;font-size:11px;">流量</button>
+                                <button class="btn btn-sm" onclick="showTokenLimitDialog(${key.id}, ${tokenLimitRaw}, ${tokenUsedRaw}, ${!!key.token_limit_enable})" title="Token 限额设置" style="padding:2px 4px;font-size:11px;background:#1976d2;color:#fff;">Token★</button>
                                 <button class="btn btn-sm btn-danger" onclick="deleteAPIKey(${key.id})" title="删除" style="padding:2px 4px;font-size:11px;">删除</button>
                             </div>
                         </td>
@@ -344,47 +421,98 @@
                 });
             },
             
-            // 渲染模型信息表格
+            // 渲染对外模型(Wrapper)信息表格：仅描述/标签，不含传统字节倍数与 Token 计费倍率
+            // 关键词: renderModels wrapper 元数据, 仅描述标签, 传统倍数列已移除
             renderModels: function(data) {
                 const tbody = document.getElementById('models-table-body');
                 if (!tbody) return;
-                
+
                 tbody.innerHTML = '';
-                
+
                 if (!data.model_metas || data.model_metas.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="text-center">No models found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="5" class="text-center">No models found</td></tr>';
                     return;
                 }
-                
+
+                const self = this;
+
                 data.model_metas.forEach(model => {
                     const row = document.createElement('tr');
                     row.dataset.modelName = model.name;
-                    row.dataset.trafficMultiplier = model.traffic_multiplier.toFixed(2);
-                    
-                    let badgeColor = '#2196f3';
-                    if (model.traffic_multiplier > 1.5) badgeColor = '#ff9800';
-                    else if (model.traffic_multiplier > 1.0) badgeColor = '#4caf50';
-                    
-                    row.innerHTML = `
-                        <td class="copyable" data-full-text="${this.escapeHtml(model.name)}">${this.escapeHtml(model.name)}</td>
-                        <td class="text-center">${model.provider_count}</td>
-                        <td class="text-center">
-                            <span class="traffic-multiplier-badge" style="background: ${badgeColor}; color: white; padding: 2px 8px; border-radius: 10px; font-size: 12px;" title="流量消耗将乘以此倍数">
-                                x${model.traffic_multiplier.toFixed(2)}
-                            </span>
-                        </td>
-                        <td class="copyable" data-full-text="${this.escapeHtml(model.description || '')}">${model.description || '-'}</td>
-                        <td class="copyable" data-full-text="${this.escapeHtml(model.tags || '')}">${model.tags || '-'}</td>
-                        <td class="text-center">
-                            <button class="btn btn-sm" onclick="openEditModelModal('${this.escapeHtml(model.name)}', '${this.escapeHtml(model.description || '')}', '${this.escapeHtml(model.tags || '')}', ${model.traffic_multiplier})" title="编辑模型信息">
-                                编辑
-                            </button>
-                            <button class="btn btn-sm" style="background-color: #4caf50; margin-left: 5px;" onclick="showCurlCommand('${this.escapeHtml(model.name)}')" title="查看 curl 命令">
-                                curl
-                            </button>
-                        </td>
-                    `;
-                    
+
+                    row.innerHTML =
+                        '<td class="copyable" data-full-text="' + self.escapeHtml(model.name) + '">' + self.escapeHtml(model.name) + '</td>' +
+                        '<td class="text-center">' + model.provider_count + '</td>' +
+                        '<td class="copyable" data-full-text="' + self.escapeHtml(model.description || '') + '">' + (model.description || '-') + '</td>' +
+                        '<td class="copyable" data-full-text="' + self.escapeHtml(model.tags || '') + '">' + (model.tags || '-') + '</td>' +
+                        '<td class="text-center">' +
+                        '<button class="btn btn-sm" onclick="openEditModelModal(\'' + escapeJsInHtmlAttr(model.name) + '\', \'' + escapeJsInHtmlAttr(model.description || '') + '\', \'' + escapeJsInHtmlAttr(model.tags || '') + '\')" title="编辑描述/标签">编辑</button>' +
+                        '<button class="btn btn-sm" style="background-color: #4caf50; margin-left: 5px;" onclick="showCurlCommand(\'' + escapeJsInHtmlAttr(model.name) + '\')" title="查看 curl 命令">curl</button>' +
+                        '</td>';
+
+                    tbody.appendChild(row);
+                });
+            },
+
+            // 渲染实际模型(内部转发名)计费倍率表：计费的真正主体
+            // 关键词: renderActualModels, 实际模型计费倍率, 生效倍率, 勾选批量
+            renderActualModels: function(data) {
+                const tbody = document.getElementById('actual-models-table-body');
+                if (!tbody) return;
+
+                tbody.innerHTML = '';
+                const selectAll = document.getElementById('actual-models-select-all');
+                if (selectAll) selectAll.checked = false;
+
+                const models = data.actual_models || [];
+                if (models.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center">No actual models found</td></tr>';
+                    return;
+                }
+
+                const fmtEff = (v) => (typeof v === 'number') ? v.toFixed(2) : '-';
+                const self = this;
+
+                models.forEach(m => {
+                    const row = document.createElement('tr');
+                    const iEsc = self.escapeHtml(m.internal_model_name);
+                    // iJs 专供 onclick 内联字符串实参使用（实际模型名可能来自上游模型列表，
+                    // 含引号会闭合处理器导致 XSS），HTML 属性/正文展示仍用 iEsc。
+                    const iJs = escapeJsInHtmlAttr(m.internal_model_name);
+                    const wrappers = (m.wrappers || []).join(', ');
+
+                    const statusBadge = m.has_multiplier
+                        ? '<span style="background:#fff3e0; color:#ef6c00; padding:1px 6px; border-radius:8px;">已设</span>'
+                        : '<span style="background:#eee; color:#888; padding:1px 6px; border-radius:8px;">继承默认</span>';
+
+                    // 免费模型：倍率失效，加权计费 Token 恒为 0，单独用绿色徽标提示
+                    const effBadges = m.is_free
+                        ? '<span style="background:#e8f5e9; color:#2e7d32; padding:1px 8px; border-radius:8px; font-weight:600;">免费 (不计费)</span>'
+                        : ('<span style="background:#e3f2fd; color:#1565c0; padding:1px 6px; border-radius:8px;">入 ' + fmtEff(m.effective_input) + '</span> ' +
+                           '<span style="background:#e8f5e9; color:#2e7d32; padding:1px 6px; border-radius:8px;">出 ' + fmtEff(m.effective_output) + '</span> ' +
+                           '<span style="background:#fff3e0; color:#ef6c00; padding:1px 6px; border-radius:8px;">建 ' + fmtEff(m.effective_cache_create) + '</span> ' +
+                           '<span style="background:#fce4ec; color:#c2185b; padding:1px 6px; border-radius:8px;">命 ' + fmtEff(m.effective_cache_hit) + '</span>');
+
+                    const editArgs = "'" + iJs + "'," +
+                        (m.config_input || 0) + ',' + (m.config_output || 0) + ',' +
+                        (m.config_cache_create || 0) + ',' + (m.config_cache_hit || 0) + ',' +
+                        (m.is_free ? 'true' : 'false');
+                    const clearBtn = m.has_multiplier
+                        ? '<button class="btn btn-sm" style="background-color:#f44336; color:#fff; margin-left:5px;" onclick="clearModelMultiplierDirect(\'' + iJs + '\')" title="清除该实际模型倍率，回落全局默认">清除</button>'
+                        : '';
+
+                    row.innerHTML =
+                        '<td class="text-center"><input type="checkbox" class="actual-model-check" value="' + iEsc + '"></td>' +
+                        '<td class="copyable" data-full-text="' + iEsc + '" style="font-family:monospace;">' + iEsc + '</td>' +
+                        '<td class="copyable" data-full-text="' + self.escapeHtml(wrappers) + '">' + (self.escapeHtml(wrappers) || '-') + '</td>' +
+                        '<td class="text-center">' + (m.provider_count || 0) + '</td>' +
+                        '<td class="text-center">' + statusBadge + '</td>' +
+                        '<td class="text-center" style="font-family:monospace;">' + effBadges + '</td>' +
+                        '<td class="text-center">' +
+                        '<button class="btn btn-sm" onclick="openModelMultiplierModal(' + editArgs + ')" title="编辑该实际模型计费倍率">编辑</button>' +
+                        clearBtn +
+                        '</td>';
+
                     tbody.appendChild(row);
                 });
             },
@@ -475,6 +603,7 @@
                     // Use paginated API for API keys instead of bulk loading
                     loadAPIKeysPaginated(1, apiKeysPageSize);
                     this.renderModels(data);
+                    this.renderActualModels(data);
                     this.renderTOTP(data);
                     this.populateModelSelect(data);
                     
@@ -502,6 +631,9 @@
         // 页面加载完成后初始化
         document.addEventListener('DOMContentLoaded', function() {
             PortalDataLoader.init();
+            // 启动 session 自动续期：只要页面开着就每 10 分钟续一次。
+            // 关键词: session keep alive, 自动续期定时器启动
+            startSessionAutoRefresh();
         });
         
         // 全局刷新函数
@@ -514,7 +646,10 @@
         // Load API keys with pagination
         async function loadAPIKeysPaginated(page = 1, pageSize = 20) {
             try {
-                const url = `/portal/api/api-keys?page=${page}&pageSize=${pageSize}&sortBy=created_at&sortOrder=desc`;
+                let url = `/portal/api/api-keys?page=${page}&pageSize=${pageSize}&sortBy=created_at&sortOrder=desc`;
+                if (apiKeyUsernameFilterValue) {
+                    url += `&username=${encodeURIComponent(apiKeyUsernameFilterValue)}`;
+                }
                 const response = await authFetch(url);
                 if (!response) return; // Auth error handled
                 
@@ -539,7 +674,86 @@
                 showToast('Error loading API keys', 'error');
             }
         }
-        
+
+        // 按用户名过滤 API Key 列表（精确匹配，用户名可重复）
+        // 关键词: applyApiKeyUsernameFilter, clearApiKeyUsernameFilter
+        function applyApiKeyUsernameFilter() {
+            const el = document.getElementById('apiKeyUsernameFilter');
+            apiKeyUsernameFilterValue = el ? el.value.trim() : '';
+            loadAPIKeysPaginated(1, apiKeysPageSize);
+        }
+        function clearApiKeyUsernameFilter() {
+            const el = document.getElementById('apiKeyUsernameFilter');
+            if (el) el.value = '';
+            apiKeyUsernameFilterValue = '';
+            loadAPIKeysPaginated(1, apiKeysPageSize);
+        }
+
+        // ==================== API Key 绑定用户信息编辑 ====================
+        // 关键词: openApiKeyMetaModal saveApiKeyMeta closeApiKeyMetaModal, Username Remark MetaInfo
+        // 通过 id 从 apiKeysData 查找当前行，避免把含引号的文本内联进 onclick 属性导致 HTML 破坏。
+        function openApiKeyMetaModal(apiKeyId) {
+            const row = (apiKeysData || []).find(k => String(k.id) === String(apiKeyId)) || {};
+            const username = row.username || '';
+            const remark = row.remark || '';
+            const metainfo = row.metainfo || '';
+            const existing = document.getElementById('apiKeyMetaModal');
+            if (existing) existing.remove();
+            const html = `
+                <div id="apiKeyMetaModal" class="delete-confirmation-modal" style="display: flex;">
+                    <div class="modal-content" style="width: 520px; max-width: 92vw;">
+                        <span class="close-modal" onclick="closeApiKeyMetaModal()">&times;</span>
+                        <h4>编辑绑定用户信息 <small style="color:#6a1b9a;font-weight:normal;">（API Key ID: ${apiKeyId}）</small></h4>
+                        <div class="form-group">
+                            <label for="metaUsernameInput">用户名（可重复）:</label>
+                            <input type="text" id="metaUsernameInput" class="form-control" value="${escapeHtml(username || '')}" placeholder="用于按用户聚合，可重复">
+                        </div>
+                        <div class="form-group">
+                            <label for="metaRemarkInput">备注:</label>
+                            <input type="text" id="metaRemarkInput" class="form-control" value="${escapeHtml(remark || '')}" placeholder="自由文本备注">
+                        </div>
+                        <div class="form-group">
+                            <label for="metaMetaInfoInput">metainfo（JSON 文本，OAuth 等外部系统绑定信息）:</label>
+                            <textarea id="metaMetaInfoInput" class="form-control" rows="4" style="font-family: monospace; font-size: 12px;" placeholder='{"oauth_provider":"...","sub":"..."}'>${escapeHtml(metainfo || '')}</textarea>
+                        </div>
+                        <div class="modal-actions">
+                            <span style="flex:1;"></span>
+                            <button class="btn" onclick="closeApiKeyMetaModal()">取消</button>
+                            <button class="btn btn-primary" onclick="saveApiKeyMeta(${apiKeyId})">保存</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', html);
+        }
+        function closeApiKeyMetaModal() {
+            const modal = document.getElementById('apiKeyMetaModal');
+            if (modal) modal.remove();
+        }
+        async function saveApiKeyMeta(apiKeyId) {
+            const username = (document.getElementById('metaUsernameInput') || {}).value || '';
+            const remark = (document.getElementById('metaRemarkInput') || {}).value || '';
+            const metainfo = (document.getElementById('metaMetaInfoInput') || {}).value || '';
+            try {
+                const response = await fetch(`/portal/api-key-meta/${apiKeyId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: username.trim(), remark: remark, metainfo: metainfo })
+                });
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (!response.ok || !data.success) {
+                    throw new Error(data.message || '保存绑定信息失败');
+                }
+                showToast('绑定信息已保存', 'success');
+                closeApiKeyMetaModal();
+                loadAPIKeysPaginated(apiKeysPage, apiKeysPageSize);
+            } catch (error) {
+                showToast('保存绑定信息失败: ' + error.message, 'error');
+                console.error('Error saving api key meta:', error);
+            }
+        }
+
         // Render API keys table with paginated data
         function renderAPIKeysTablePaginated(keys) {
             const tbody = document.getElementById('api-table-body');
@@ -548,7 +762,8 @@
             tbody.innerHTML = '';
             
             if (!keys || keys.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="12" class="text-center">No API keys found</td></tr>';
+                // 关键词: API Key 列表 colspan 修复, 移除字节流量列后 15 -> 14
+                tbody.innerHTML = '<tr><td colspan="14" class="text-center">No API keys found</td></tr>';
                 return;
             }
             
@@ -556,38 +771,35 @@
                 const row = document.createElement('tr');
                 row.dataset.apiId = key.id;
                 row.dataset.apiStatus = key.active ? 'active' : 'inactive';
-                row.dataset.trafficLimit = key.traffic_limit;
-                row.dataset.trafficUsed = key.traffic_used;
-                row.dataset.trafficEnabled = key.traffic_limit_enable;
+                row.dataset.tokenLimit = key.token_limit || 0;
+                row.dataset.tokenUsed = key.token_used || 0;
+                row.dataset.tokenEnabled = !!key.token_limit_enable;
                 
                 let statusBadge = key.active 
                     ? '<span class="health-badge healthy" style="font-size:12px;">激活</span>'
                     : '<span class="health-badge unhealthy" style="font-size:12px;">禁用</span>';
                 
-                // Format traffic data
-                const inputFormatted = formatBytes(key.input_bytes || 0);
-                const outputFormatted = formatBytes(key.output_bytes || 0);
-                
-                let trafficLimitCell = '';
-                if (key.traffic_limit_enable) {
-                    const percent = key.traffic_limit > 0 ? (key.traffic_used / key.traffic_limit * 100) : 0;
-                    let barColor = '#4caf50';
-                    if (percent > 90) barColor = '#f44336';
-                    else if (percent > 70) barColor = '#ff9800';
-                    
-                    const usedFormatted = formatBytes(key.traffic_used || 0);
-                    const limitFormatted = formatBytes(key.traffic_limit || 0);
-                    
-                    trafficLimitCell = `
-                        <div class="traffic-limit-info" title="已用/限额: ${usedFormatted}/${limitFormatted} (${percent.toFixed(1)}%)">
+                // 字节流量列已彻底移除：统一改用 Token 维度计费/限额，不再展示字节收发量
+                // 关键词: paginated 渲染 Token 用量列, Token 限额列, 字节流量列已移除
+                const tokenUsedRaw = Number(key.token_used) || 0;
+                const tokenLimitRaw = Number(key.token_limit) || 0;
+                const tokenUsedDisplay = formatTokenCount(tokenUsedRaw);
+                let tokenLimitCell = '';
+                if (key.token_limit_enable && tokenLimitRaw > 0) {
+                    const tPercent = (tokenUsedRaw / tokenLimitRaw) * 100;
+                    let tBarColor = '#4caf50';
+                    if (tPercent > 90) tBarColor = '#f44336';
+                    else if (tPercent > 70) tBarColor = '#ff9800';
+                    tokenLimitCell = `
+                        <div class="traffic-limit-info" title="Token 用量: ${tokenUsedRaw}/${tokenLimitRaw} (${tPercent.toFixed(1)}%)">
                             <div class="traffic-progress" style="width: 80px; height: 8px; background: #e0e0e0; border-radius: 4px; overflow: hidden;">
-                                <div style="width: ${Math.min(percent, 100)}%; height: 100%; background: ${barColor};"></div>
+                                <div style="width: ${Math.min(tPercent, 100)}%; height: 100%; background: ${tBarColor};"></div>
                             </div>
-                            <small>${usedFormatted}/${limitFormatted}</small>
+                            <small>${tokenUsedDisplay}/${formatTokenCount(tokenLimitRaw)}</small>
                         </div>
                     `;
                 } else {
-                    trafficLimitCell = '<span style="color: #999;">未限制</span>';
+                    tokenLimitCell = '<span style="color: #999;">未限制</span>';
                 }
                 
                 let actionButtons = key.active
@@ -604,26 +816,26 @@
                     <td class="text-center">${key.id}</td>
                     <td class="text-center">${statusBadge}</td>
                     <td class="copyable api-key-cell" data-full-text="${escapeHtml(key.api_key)}">${escapeHtml(key.display_key)}</td>
-                    <td class="copyable editable-allowed-models" data-api-id="${key.id}" data-current-models="${escapeHtml(key.allowed_models)}" data-full-text="${escapeHtml(key.allowed_models)}" title="右键点击修改允许的模型">${escapeHtml(key.allowed_models)}</td>
+                    <td class="text-center" title="${escapeHtml(key.remark || '')}">
+                        <span>${key.username ? escapeHtml(key.username) : '<span style=\'color:#bbb;\'>-</span>'}</span>
+                        ${key.remark ? `<small style="display:block;color:#888;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(key.remark)}</small>` : ''}
+                    </td>
+                    <td class="copyable editable-allowed-models" data-api-id="${key.id}" data-current-models="${escapeHtml(key.allowed_models)}" data-full-text="${escapeHtml(key.allowed_models)}" title="右键点击修改允许的模型">${renderAllowedModelsCellContent(key.allowed_models)}</td>
                     <td class="text-center">${key.usage_count || 0}</td>
                     <td class="text-center">${key.web_search_count || 0}</td>
                     <td class="text-center">
                         <span class="health-badge healthy">${key.success_count || 0}</span>
                         <span class="health-badge unhealthy">${key.failure_count || 0}</span>
                     </td>
-                    <td class="text-center">
-                        <div class="traffic-data">
-                            <span title="输入流量">↓ ${inputFormatted}</span>
-                            <span title="输出流量">↑ ${outputFormatted}</span>
-                        </div>
-                    </td>
-                    <td class="text-center">${trafficLimitCell}</td>
+                    <td class="text-center" title="Token 计费用量">${tokenUsedDisplay}</td>
+                    <td class="text-center">${tokenLimitCell}</td>
                     <td class="text-center">${escapeHtml(creatorName)}</td>
                     <td>${key.last_used_time || key.created_at || '-'}</td>
                     <td class="text-center">
                         <div style="display: flex; gap: 2px; justify-content: center; flex-wrap: wrap;">
                             ${actionButtons}
-                            <button class="btn btn-sm" onclick="showTrafficLimitDialog(${key.id}, ${key.traffic_limit || 0}, ${key.traffic_used || 0}, ${key.traffic_limit_enable})" title="流量设置" style="padding:2px 4px;font-size:11px;">流量</button>
+                            <button class="btn btn-sm" onclick="showTokenLimitDialog(${key.id}, ${tokenLimitRaw}, ${tokenUsedRaw}, ${!!key.token_limit_enable})" title="Token 限额设置" style="padding:2px 4px;font-size:11px;background:#1976d2;color:#fff;">Token★</button>
+                            <button class="btn btn-sm" onclick="openApiKeyMetaModal(${key.id})" title="编辑绑定用户信息（用户名/备注/metainfo）" style="padding:2px 4px;font-size:11px;background:#6a1b9a;color:#fff;">绑定</button>
                             <button class="btn btn-sm btn-danger" onclick="deleteAPIKey(${key.id})" title="删除" style="padding:2px 4px;font-size:11px;">删除</button>
                         </div>
                     </td>
@@ -750,6 +962,37 @@
             const i = Math.floor(Math.log(bytes) / Math.log(k));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
         }
+
+        // Helper: format raw Token count to human readable (K/M/B/T tokens).
+        // 关键词: formatTokenCount, Token 数千分位/M 单位展示, 与 portal Token 列对齐
+        function formatTokenCount(n) {
+            const num = Number(n) || 0;
+            if (num === 0) return '0';
+            const abs = Math.abs(num);
+            if (abs < 1000) return String(num);
+            if (abs < 1_000_000) return (num / 1000).toFixed(num % 1000 === 0 ? 0 : 1) + 'K';
+            if (abs < 1_000_000_000) return (num / 1_000_000).toFixed(num % 1_000_000 === 0 ? 0 : 2) + 'M';
+            return (num / 1_000_000_000).toFixed(2) + 'B';
+        }
+
+        // 计费 Token 与 RMB 换算：1 RMB = 10M 计费 Token。
+        // updateRMBHint 读取某个「M Token」数值输入框，实时把换算后的 RMB 写入提示元素。
+        // 关键词: updateRMBHint, 1 RMB=10M 计费 Token, 换算文案
+        var BILLING_TOKEN_M_PER_RMB = 10; // 10M 计费 Token / RMB
+        function formatRMBFromTokenM(mTokens) {
+            const m = Number(mTokens) || 0;
+            if (m <= 0) return '不限制 / 不计费';
+            const rmb = m / BILLING_TOKEN_M_PER_RMB;
+            const rmbStr = (rmb % 1 === 0) ? rmb.toFixed(0) : rmb.toFixed(2);
+            return '约合 ' + rmbStr + ' RMB（1 RMB = 10M 计费 Token）';
+        }
+        function updateRMBHint(inputId, hintId) {
+            const input = document.getElementById(inputId);
+            const hint = document.getElementById(hintId);
+            if (!input || !hint) return;
+            const m = parseInt(input.value);
+            hint.textContent = formatRMBFromTokenM(isNaN(m) ? 0 : m);
+        }
         
         // Helper: escape HTML
         function escapeHtml(str) {
@@ -761,7 +1004,56 @@
                 .replace(/"/g, '&quot;')
                 .replace(/'/g, '&#039;');
         }
-        
+
+        // escapeJsInHtmlAttr 生成可安全放入 onclick="fn('<value>')" 这类双引号属性内
+        // 单引号 JS 字符串实参的文本。注意：浏览器会先对属性值做 HTML 实体解码，再把结果
+        // 当成 JS 源码解析，所以单独的 escapeHtml 不足以防御（&#39; 会被解码回 '，仍可闭合
+        // 字符串注入代码）。这里必须两层转义：先做 JS 字符串字面量转义（防闭合单引号/插代码），
+        // 再做 HTML 属性转义（防闭合双引号属性 / 保证解码后还原成预期 JS 源）。
+        // 关键词: escapeJsInHtmlAttr, onclick 内联实参 XSS 防护, 双层转义
+        function escapeJsInHtmlAttr(value) {
+            var s = (value === null || value === undefined) ? '' : String(value);
+            // 1) JS 单引号字符串字面量转义
+            s = s.replace(/\\/g, '\\\\')
+                 .replace(/'/g, "\\'")
+                 .replace(/\r/g, '\\r')
+                 .replace(/\n/g, '\\n')
+                 .replace(/</g, '\\x3C')
+                 .replace(/>/g, '\\x3E');
+            // 2) HTML 双引号属性转义（& 与 " 必须编码；解码后还原为合法 JS 源）
+            s = s.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+            return s;
+        }
+
+        // Render compact allowed-models cell content (used by API key list).
+        // Keeps the cell narrow even with dozens of allowed models, while
+        // exposing the full list via tooltip + count badge. Right-click menu
+        // (editable-allowed-models) and full text copy (data-full-text) on
+        // the parent <td> still work because the tag/structure is preserved
+        // by the caller.
+        function renderAllowedModelsCellContent(allowedModelsString) {
+            const raw = (allowedModelsString || '').toString();
+            const items = raw.split(',').map(s => s.trim()).filter(s => s);
+            if (items.length === 0) {
+                return '<span class="allowed-models-empty" title="未配置任何允许模型">未授权</span>';
+            }
+            const previewCount = 2;
+            const visible = items.slice(0, previewCount);
+            const hidden = items.slice(previewCount);
+            const badges = visible.map(name => {
+                let cls = 'allowed-model-chip';
+                if (name.includes('*')) cls += ' chip-glob';
+                else if (name.endsWith('-free')) cls += ' chip-free';
+                else cls += ' chip-paid';
+                return '<span class="' + cls + '" title="' + escapeHtml(name) + '">' + escapeHtml(name) + '</span>';
+            }).join('');
+            const moreBadge = hidden.length > 0
+                ? '<span class="allowed-model-chip chip-more" title="' + escapeHtml(hidden.join(', ')) + '">+' + hidden.length + '</span>'
+                : '';
+            const countBadge = '<span class="allowed-model-count" title="共 ' + items.length + ' 个允许模型，右键修改">' + items.length + '</span>';
+            return '<div class="allowed-models-wrap">' + countBadge + badges + moreBadge + '</div>';
+        }
+
         // Export pagination functions
         window.loadAPIKeysPaginated = loadAPIKeysPaginated;
         window.changeAPIKeysPage = changeAPIKeysPage;
@@ -776,12 +1068,19 @@
         }
 
         // 标签页切换功能
+        // 关键词: switchTab, sidebar 菜单项激活, 兼容旧 .tab 顶部 tab
         function switchTab(tabId) {
-            // 更新标签页状态
+            // 更新顶部隐藏的 .tab (向后兼容旧选择器), 以及新左侧 .menu-item
             document.querySelectorAll('.tab').forEach(tab => {
                 tab.classList.remove('active');
                 if (tab.getAttribute('data-tab') === tabId) {
                     tab.classList.add('active');
+                }
+            });
+            document.querySelectorAll('.menu-item').forEach(mi => {
+                mi.classList.remove('active');
+                if (mi.getAttribute('data-tab') === tabId) {
+                    mi.classList.add('active');
                 }
             });
 
@@ -789,8 +1088,11 @@
             document.querySelectorAll('.tab-content').forEach(content => {
                 content.classList.remove('active');
             });
-            document.getElementById(tabId).classList.add('active');
-            
+            const target = document.getElementById(tabId);
+            if (target) {
+                target.classList.add('active');
+            }
+
             // Store the active tab ID in localStorage
             localStorage.setItem('activeTabId', tabId);
             console.log(`Switched to tab: ${tabId}, saved to localStorage.`); // Debug log
@@ -819,7 +1121,63 @@
                 refreshAmapKeys();
                 loadAmapConfig();
             }
+            if (tabId === 'rate-limit') {
+                loadRateLimitConfig();
+                loadRateLimitStatus();
+                startRateLimitModelStatsAutoRefresh();
+                // 恢复上次选中的限流子 tab, 默认"频率与速率"
+                let savedSub = 'rl-sub-rate';
+                try { savedSub = localStorage.getItem('rateLimitSubTab') || 'rl-sub-rate'; } catch (e) {}
+                if (!document.getElementById(savedSub)) savedSub = 'rl-sub-rate';
+                switchRateLimitSubTab(savedSub);
+            } else {
+                stopRateLimitModelStatsAutoRefresh();
+            }
+
+            if (tabId === 'dau-cache') {
+                if (typeof refreshDauCacheTab === 'function') {
+                    refreshDauCacheTab();
+                }
+            }
+            // Mirror tab 切换时刷新规则列表
+            // 关键词: switchTab mirror tab 初始化, MirrorMgmt.refresh
+            // 注意: 必须用 window.MirrorMgmt 访问, 不能用裸名 MirrorMgmt;
+            // MirrorMgmt 是文件末尾 const 声明的, 在 TDZ 阶段裸名访问 (即使 typeof)
+            // 会抛 ReferenceError: Cannot access 'MirrorMgmt' before initialization.
+            if (tabId === 'mirror') {
+                if (window.MirrorMgmt && typeof window.MirrorMgmt.refresh === 'function') {
+                    window.MirrorMgmt.refresh();
+                }
+            }
+            // 镜像数据 tab 切换时自动加载最近记录
+            // 关键词: switchTab mirror-records 初始化, MirrorRecords.load
+            if (tabId === 'mirror-records') {
+                if (window.MirrorRecords && typeof window.MirrorRecords.load === 'function') {
+                    window.MirrorRecords.load();
+                }
+            }
         }
+
+        // 限流配置二级 tab 切换
+        // 关键词: rate-limit 子 tab 切换, switchRateLimitSubTab, rl-subpane
+        function switchRateLimitSubTab(paneId) {
+            document.querySelectorAll('.rl-subtab').forEach(function (t) {
+                t.classList.toggle('active', t.getAttribute('data-rlsub') === paneId);
+            });
+            document.querySelectorAll('.rl-subpane').forEach(function (p) {
+                p.classList.toggle('active', p.id === paneId);
+            });
+            try { localStorage.setItem('rateLimitSubTab', paneId); } catch (e) {}
+        }
+
+        // 事件委托绑定限流子 tab 点击, 避免依赖 DOMContentLoaded 加载顺序
+        // 关键词: rate-limit 子 tab 点击绑定, data-rlsub
+        document.addEventListener('click', function (e) {
+            const tab = e.target.closest ? e.target.closest('.rl-subtab') : null;
+            if (!tab) return;
+            const paneId = tab.getAttribute('data-rlsub');
+            if (paneId) switchRateLimitSubTab(paneId);
+        });
 
         // 添加接口表单
         function showAddProviderForm() {
@@ -910,6 +1268,14 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                                     <input type="checkbox" id="noHTTPS" name="noHTTPS"> 不使用HTTPS (适用于本地或内网服务)
                                 </label>
                             </div>
+                        </div>
+                        <div class="form-group">
+                            <div class="checkbox">
+                                <label>
+                                    <input type="checkbox" id="activeCacheControl" name="activeCacheControl"> 启用 Active Cache Control (主动给最末 system 注入 cache_control:ephemeral, 推荐 dashscope/anthropic 等支持 ephemeral 缓存的 provider 打开)
+                                </label>
+                            </div>
+                            <small class="form-text text-muted">打开后, 客户端无 cache_control 时由 aibalance 自动给最末 system 消息注入 baseline ephemeral 标记; 客户端自带 cache_control 时 pass-through 不改写。Tongyi 白名单 model 即使关闭也保留旧行为。</small>
                         </div>
                         <div class="form-group"> <!-- Removed inline flex style -->
                             <button type="button" id="validateConfigBtn" class="btn" style="display: block; width: 100%; margin-bottom: 10px; background-color: #4285f4; color: white; min-width: 120px; height: 40px; font-size: 14px; font-weight: 500; border-radius: 4px; border: none; transition: all 0.3s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 0 15px;">验证配置</button>
@@ -1178,6 +1544,8 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
             const domainOrURL = document.getElementById('domainOrURL').value.trim();
             const apiKeys = document.getElementById('apiKeys').value;
             const noHTTPS = document.getElementById('noHTTPS').checked;
+            const activeCacheControlInput = document.getElementById('activeCacheControl');
+            const activeCacheControl = activeCacheControlInput ? activeCacheControlInput.checked : false;
             const optionalAllowReason = document.getElementById('optionalAllowReason').value;
             
             // 日志输出表单数据（方便调试）
@@ -1189,6 +1557,7 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                 domain_or_url: domainOrURL,
                 api_keys: apiKeys,
                 no_https: noHTTPS ? 'on' : '',
+                active_cache_control: activeCacheControl ? 'on' : '',
                 optional_allow_reason: optionalAllowReason
             });
             
@@ -1222,6 +1591,9 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                 params.append('api_keys', apiKeys);
                 if (noHTTPS) {
                     params.append('no_https', 'on');
+                }
+                if (activeCacheControl) {
+                    params.append('active_cache_control', 'on');
                 }
                 if (optionalAllowReason) {
                     params.append('optional_allow_reason', optionalAllowReason);
@@ -1632,6 +2004,20 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                      tab.classList.remove('active');
                 }
             });
+            // 新左侧 sidebar menu-item 点击也走 switchTab
+            // 关键词: sidebar menu-item 点击绑定, switchTab 入口
+            document.querySelectorAll('.menu-item').forEach(mi => {
+                const currentTabId = mi.getAttribute('data-tab');
+                mi.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    switchTab(currentTabId);
+                });
+                if (currentTabId === initialTabId) {
+                    mi.classList.add('active');
+                } else {
+                    mi.classList.remove('active');
+                }
+            });
 
             document.querySelectorAll('.tab-content').forEach(content => {
                 if (content.id === initialTabId) {
@@ -1656,6 +2042,17 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
             } else if (initialTabId === 'amap') {
                 refreshAmapKeys();
                 loadAmapConfig();
+            } else if (initialTabId === 'rate-limit') {
+                loadRateLimitConfig();
+                loadRateLimitStatus();
+                startRateLimitModelStatsAutoRefresh();
+            } else if (initialTabId === 'mirror') {
+                // mirror tab 在 page refresh 后保持的场景, 也需要主动拉数据
+                // 关键词: DOMContentLoaded initial mirror auto refresh, window.MirrorMgmt
+                // 必须用 window.MirrorMgmt, 不能 typeof MirrorMgmt (TDZ 抛错).
+                if (window.MirrorMgmt && typeof window.MirrorMgmt.refresh === 'function') {
+                    window.MirrorMgmt.refresh();
+                }
             }
             // --- END: Tab Initialization Logic ---
 
@@ -1892,19 +2289,25 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                     iconPath = 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z';
             }
             
+            // 仅图标与关闭按钮是固定模板（无外部数据），可安全用 innerHTML；
+            // message 可能来自外部可控数据（如客户端 IP/错误信息），必须经 textContent 写入，
+            // 严禁拼接进 innerHTML，避免 XSS 打穿管理后台。
+            // 关键词: showToast XSS 防护, message 走 textContent
             toast.innerHTML = `
                 <div class="toast-icon">
                     <svg viewBox="0 0 24 24" width="24" height="24">
                         <path d="${iconPath}"></path>
                     </svg>
     </div>
-                <div class="toast-content">${message}</div>
+                <div class="toast-content"></div>
                 <div class="toast-close" onclick="this.parentElement.remove()">
                     <svg viewBox="0 0 24 24" width="16" height="16">
                         <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"></path>
                     </svg>
                 </div>
             `;
+            const toastContentEl = toast.querySelector('.toast-content');
+            if (toastContentEl) toastContentEl.textContent = (message == null ? '' : String(message));
             
             container.appendChild(toast);
             
@@ -2030,6 +2433,75 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
         }
 
         // 健康检查功能
+        // ==================== Tool Calls Capability Probe ====================
+        // 关键词: aibalance probe tool calls, capability matrix manual trigger
+        let isToolCallsProbeInProgress = false;
+        async function probeAllToolCalls() {
+            if (isToolCallsProbeInProgress) return;
+            isToolCallsProbeInProgress = true;
+            const button = document.getElementById('probe-all-tool-calls-btn');
+            const originalHTML = button ? button.innerHTML : '';
+            if (button) {
+                button.innerHTML = `
+                    <svg viewBox="0 0 24 24" class="rotating" style="width: 16px; height: 16px; margin-right: 6px;">
+                        <path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                    </svg>
+                    探测中...
+                `;
+                button.disabled = true;
+            }
+            try {
+                const response = await fetch('/portal/probe-tool-calls-all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                });
+                if (!response.ok) {
+                    throw new Error('probe request failed: HTTP ' + response.status);
+                }
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.message || 'probe failed');
+                }
+                const results = Array.isArray(data.data) ? data.data : [];
+                let native = 0, react = 0, skipped = 0, failed = 0;
+                results.forEach(item => {
+                    if (item.skipped) { skipped += 1; return; }
+                    if (item.error) { failed += 1; return; }
+                    if (item.round1_mode === 'native' && item.round2_mode === 'native') native += 1;
+                    else react += 1;
+                });
+                showToast(`工具调用能力探测完成: native=${native} react=${react} skipped=${skipped} failed=${failed}`, 'success');
+            } catch (e) {
+                showToast('工具调用能力探测失败: ' + e.message, 'error');
+            } finally {
+                if (button) {
+                    button.innerHTML = originalHTML;
+                    button.disabled = false;
+                }
+                isToolCallsProbeInProgress = false;
+            }
+        }
+
+        async function probeSingleToolCalls(providerId) {
+            try {
+                const response = await fetch(`/portal/probe-tool-calls/${providerId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                });
+                if (!response.ok) {
+                    throw new Error('probe request failed: HTTP ' + response.status);
+                }
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.message || 'probe failed');
+                }
+                const d = data.data || {};
+                showToast(`Provider ${d.wrapper_name || providerId} 探测完成: round1=${d.round1_mode} round2=${d.round2_mode}${d.error ? ' err=' + d.error : ''}`, 'success');
+            } catch (e) {
+                showToast('工具调用能力探测失败: ' + e.message, 'error');
+            }
+        }
+
         async function checkAllProvidersHealth() {
             if (isHealthCheckInProgress) return;
             isHealthCheckInProgress = true;
@@ -2165,14 +2637,23 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                 return;
             }
             
-            modelList.innerHTML = portalAvailableModels.map(model => `
-                <div class="model-item ${portalSelectedModels.has(model) ? 'selected' : ''}" onclick="portalToggleModel('${model}')">
-                    <input type="checkbox" ${portalSelectedModels.has(model) ? 'checked' : ''} onclick="event.stopPropagation(); portalToggleModel('${model}')">
-                    <label>${model}</label>
+            // 模型名通过索引回查（portalToggleModelByIndex），不内联进 onclick 字符串，
+            // 彻底规避模型名含引号导致的属性/处理器注入；展示文本仍走 escapeHtml。
+            // 关键词: portalRenderModelList XSS 防护, 索引法 onclick
+            modelList.innerHTML = portalAvailableModels.map((model, idx) => `
+                <div class="model-item ${portalSelectedModels.has(model) ? 'selected' : ''}" onclick="portalToggleModelByIndex(${idx})">
+                    <input type="checkbox" ${portalSelectedModels.has(model) ? 'checked' : ''} onclick="event.stopPropagation(); portalToggleModelByIndex(${idx})">
+                    <label>${escapeHtml(model)}</label>
                 </div>
             `).join('');
             
             portalUpdateSelectedPreview();
+        }
+
+        // portalToggleModelByIndex 用列表索引回查模型名后再切换选中，避免内联模型名进 onclick。
+        function portalToggleModelByIndex(idx) {
+            const model = portalAvailableModels[idx];
+            if (model != null) portalToggleModel(model);
         }
         
         function portalToggleModel(model) {
@@ -2259,14 +2740,23 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                 return;
             }
             
+            // 读取可选的绑定用户信息（用户名/备注/metainfo）
+            // 关键词: generateNewApiKey username remark metainfo 携带
+            const unameEl = document.getElementById('apiKeyUsernameInput');
+            const remarkEl = document.getElementById('apiKeyRemarkInput');
+            const metaEl = document.getElementById('apiKeyMetaInfoInput');
+            const username = unameEl ? unameEl.value.trim() : '';
+            const remark = remarkEl ? remarkEl.value : '';
+            const metainfo = metaEl ? metaEl.value : '';
+
             try {
                 const response = await fetch('/portal/generate-api-key', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    // 将选中的模型包含在请求体中
-                    body: JSON.stringify({ allowed_models: selectedModels })
+                    // 将选中的模型与绑定信息包含在请求体中
+                    body: JSON.stringify({ allowed_models: selectedModels, username: username, remark: remark, metainfo: metainfo })
                 });
 
                 if (!response.ok) {
@@ -2970,6 +3460,10 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                 if (noHTTPSCheckbox.checked) {
                     params.append('no_https', 'on');
                 }
+                const activeCCInput = document.getElementById('activeCacheControl');
+                if (activeCCInput && activeCCInput.checked) {
+                    params.append('active_cache_control', 'on');
+                }
 
                 const response = await fetch('/portal/validate-provider', {
                     method: 'POST',
@@ -3142,8 +3636,9 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
             const typeName = row.cells[5].getAttribute('data-full-text') || row.cells[5].textContent.trim();     // Cell 6: Type
             const domainOrURL = row.cells[6].getAttribute('data-full-text') || row.cells[6].textContent.trim(); // Cell 7: Domain
             const apiKey = row.cells[7].getAttribute('data-full-text'); // Cell 8: API Key (get full key)
+            const activeCC = row.dataset.activeCacheControl === '1'; // Active Cache Control flag, 见 renderProviders 写入
 
-            console.log(`Extracted data: Wrapper=${wrapperName}, Model=${modelName}, Type=${typeName}, Domain=${domainOrURL}, Key=...${apiKey ? apiKey.slice(-4) : ''}`); // Debug log
+            console.log(`Extracted data: Wrapper=${wrapperName}, Model=${modelName}, Type=${typeName}, Domain=${domainOrURL}, Key=...${apiKey ? apiKey.slice(-4) : ''}, ActiveCC=${activeCC}`); // Debug log
 
             // 切换到 'add' 标签页
             switchTab('add');
@@ -3180,6 +3675,13 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
                 modelInput.value = modelName;
                 domainInput.value = domainOrURL;
                 apiKeysInput.value = apiKey || ''; // 填充 API keys
+
+                // 同步 Active Cache Control 复选框, 让 quickAdd 拷贝原 provider 的设置
+                // 关键词: quickAddProvider activeCacheControl 同步, 主动 cache_control 注入开关
+                const activeCCInput = document.getElementById('activeCacheControl');
+                if (activeCCInput) {
+                    activeCCInput.checked = activeCC;
+                }
 
                 // 设置类型 - 直接使用原始类型值
                 // 如果原始类型存在于选项中，则选择它；否则尝试匹配或保持默认
@@ -3299,14 +3801,23 @@ sk-abcdef1234567890abcdef1234567890"></textarea>
             // Store available models for this modal
             window.editModalAvailableModels = availableModels;
             
-            modelList.innerHTML = availableModels.map(model => `
-                <div class="model-item ${editModalSelectedModels.has(model) ? 'selected' : ''}" onclick="editModalToggleModel('${model}')">
-                    <input type="checkbox" ${editModalSelectedModels.has(model) ? 'checked' : ''} onclick="event.stopPropagation(); editModalToggleModel('${model}')">
-                    <label>${model}</label>
+            // 同 portalRenderModelList：模型名按索引回查，避免内联进 onclick 造成注入。
+            // 关键词: editModalRenderModelList XSS 防护, 索引法 onclick
+            modelList.innerHTML = availableModels.map((model, idx) => `
+                <div class="model-item ${editModalSelectedModels.has(model) ? 'selected' : ''}" onclick="editModalToggleModelByIndex(${idx})">
+                    <input type="checkbox" ${editModalSelectedModels.has(model) ? 'checked' : ''} onclick="event.stopPropagation(); editModalToggleModelByIndex(${idx})">
+                    <label>${escapeHtml(model)}</label>
                 </div>
             `).join('');
             
             editModalUpdateSelectedPreview();
+        }
+
+        // editModalToggleModelByIndex 用索引从当前模型列表回查模型名后切换选中。
+        function editModalToggleModelByIndex(idx) {
+            const list = window.editModalAvailableModels || [];
+            const model = list[idx];
+            if (model != null) editModalToggleModel(model);
         }
         
         function editModalToggleModel(model) {
@@ -3693,18 +4204,16 @@ curl '${metaApiUrl}?name=${modelName}'`;
         }
 
         // Model Metadata Edit Logic
-        function openEditModelModal(name, description, tags, trafficMultiplier) {
+        // wrapper 级仅编辑 描述/标签；传统倍数(字节流量)已彻底移除，Token 计费倍率在「实际模型计费倍率」表设置
+        // 关键词: openEditModelModal wrapper 描述标签, 传统倍数字段已移除
+        function openEditModelModal(name, description, tags) {
             document.getElementById('editModelName').value = name;
             document.getElementById('editModelDescription').value = description;
             document.getElementById('editModelTags').value = tags;
-            
-            // Set traffic multiplier with default value of 1.0
-            const multiplierInput = document.getElementById('editModelTrafficMultiplier');
-            if (multiplierInput) {
-                multiplierInput.value = trafficMultiplier !== undefined ? trafficMultiplier : 1.0;
-            }
-            
-            document.getElementById('editModelMetaModal').style.display = 'block';
+
+            // 修复定位 bug: .delete-confirmation-modal 依赖 flex 居中。
+            // 关键词: editModelMetaModal display flex 居中
+            document.getElementById('editModelMetaModal').style.display = 'flex';
         }
 
         function closeEditModelModal() {
@@ -3715,11 +4224,10 @@ curl '${metaApiUrl}?name=${modelName}'`;
             const name = document.getElementById('editModelName').value;
             const description = document.getElementById('editModelDescription').value;
             const tags = document.getElementById('editModelTags').value;
-            
-            // Get traffic multiplier
-            const multiplierInput = document.getElementById('editModelTrafficMultiplier');
-            const trafficMultiplier = multiplierInput ? parseFloat(multiplierInput.value) || 1.0 : 1.0;
 
+            // wrapper 级仅提交描述/标签；不再提交传统字节倍数（后端缺省时保持原值不变）。
+            // Token 计费倍率在「实际模型计费倍率」表设置。
+            // 关键词: saveModelMeta wrapper 元数据提交, 不含 traffic_multiplier, 不含 token 倍率
             fetch('/portal/update-model-meta', {
                 method: 'POST',
                 headers: {
@@ -3728,8 +4236,7 @@ curl '${metaApiUrl}?name=${modelName}'`;
                 body: JSON.stringify({
                     model_name: name,
                     description: description,
-                    tags: tags,
-                    traffic_multiplier: trafficMultiplier
+                    tags: tags
                 })
             })
             .then(response => response.json())
@@ -3745,6 +4252,259 @@ curl '${metaApiUrl}?name=${modelName}'`;
             .catch(error => {
                 console.error('Error:', error);
                 showToast('保存失败', 'error');
+            });
+        }
+
+        // ==================== 实际模型计费倍率 + 批量应用 ====================
+        // 关键词: 实际模型倍率, 按内部转发名计费, 按模式批量, 勾选批量
+
+        function readMulValue(id) {
+            const el = document.getElementById(id);
+            if (!el) return 0;
+            const v = parseFloat(el.value);
+            return (isNaN(v) || v < 0) ? 0 : v;
+        }
+
+        // ---- 单个实际模型倍率编辑 ----
+        // 关键词: openModelMultiplierModal, 实际模型倍率编辑
+        function openModelMultiplierModal(internal, cfgIn, cfgOut, cfgCc, cfgCh, isFree) {
+            document.getElementById('modelMultiplierInternal').value = internal;
+            const setv = (id, v) => {
+                const el = document.getElementById(id);
+                if (el) el.value = (typeof v === 'number' && v > 0) ? v : 0;
+            };
+            setv('modelMultiplierInput', cfgIn);
+            setv('modelMultiplierOutput', cfgOut);
+            setv('modelMultiplierCacheCreate', cfgCc);
+            setv('modelMultiplierCacheHit', cfgCh);
+            const freeEl = document.getElementById('modelMultiplierIsFree');
+            if (freeEl) freeEl.checked = !!isFree;
+            document.getElementById('modelMultiplierModal').style.display = 'flex';
+        }
+
+        function closeModelMultiplierModal() {
+            document.getElementById('modelMultiplierModal').style.display = 'none';
+        }
+
+        function saveModelMultiplier() {
+            const internal = document.getElementById('modelMultiplierInternal').value;
+            const freeEl = document.getElementById('modelMultiplierIsFree');
+            fetch('/portal/update-model-multiplier', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    internal_model_name: internal,
+                    input_token_multiplier: readMulValue('modelMultiplierInput'),
+                    output_token_multiplier: readMulValue('modelMultiplierOutput'),
+                    cache_creation_multiplier: readMulValue('modelMultiplierCacheCreate'),
+                    cache_hit_multiplier: readMulValue('modelMultiplierCacheHit'),
+                    is_free: freeEl ? !!freeEl.checked : false
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('倍率已保存', 'success');
+                    closeModelMultiplierModal();
+                    setTimeout(() => window.location.reload(), 800);
+                } else {
+                    showToast('保存失败: ' + data.message, 'error');
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showToast('保存失败', 'error');
+            });
+        }
+
+        function clearModelMultiplier() {
+            const internal = document.getElementById('modelMultiplierInternal').value;
+            clearModelMultiplierDirect(internal);
+        }
+
+        // 直接清除某实际模型倍率（表行的「清除」按钮调用）
+        function clearModelMultiplierDirect(internal) {
+            if (!confirm('确定清除该实际模型的计费倍率？清除后将回落到全局默认 / 系统常量。')) {
+                return;
+            }
+            fetch('/portal/delete-model-multiplier', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ internal_model_name: internal })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('倍率已清除', 'success');
+                    if (document.getElementById('modelMultiplierModal').style.display === 'flex') {
+                        closeModelMultiplierModal();
+                    }
+                    setTimeout(() => window.location.reload(), 800);
+                } else {
+                    showToast('清除失败: ' + data.message, 'error');
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showToast('清除失败', 'error');
+            });
+        }
+
+        // ---- 勾选辅助 ----
+        // 关键词: toggleAllActualModels, getSelectedInternalModels, 勾选
+        function toggleAllActualModels(checkbox) {
+            document.querySelectorAll('.actual-model-check').forEach(cb => {
+                cb.checked = checkbox.checked;
+            });
+        }
+
+        function getSelectedInternalModels() {
+            const names = [];
+            document.querySelectorAll('.actual-model-check:checked').forEach(cb => {
+                if (cb.value) names.push(cb.value);
+            });
+            return names;
+        }
+
+        // ---- 全局默认倍率 ----
+        // 关键词: openGlobalDefaultMultiplierModal, 全局默认倍率
+        function openGlobalDefaultMultiplierModal() {
+            const g = (typeof portalData === 'object' && portalData && portalData.global_default_multiplier) || {};
+            const setv = (id, v) => {
+                const el = document.getElementById(id);
+                if (el) el.value = (typeof v === 'number' && v > 0) ? v : 0;
+            };
+            setv('globalDefaultInput', g.input_token_multiplier);
+            setv('globalDefaultOutput', g.output_token_multiplier);
+            setv('globalDefaultCacheCreate', g.cache_creation_multiplier);
+            setv('globalDefaultCacheHit', g.cache_hit_multiplier);
+            document.getElementById('globalDefaultMultiplierModal').style.display = 'flex';
+        }
+
+        function closeGlobalDefaultMultiplierModal() {
+            document.getElementById('globalDefaultMultiplierModal').style.display = 'none';
+        }
+
+        function saveGlobalDefaultMultiplier() {
+            fetch('/portal/set-global-default-multiplier', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    input_token_multiplier: readMulValue('globalDefaultInput'),
+                    output_token_multiplier: readMulValue('globalDefaultOutput'),
+                    cache_creation_multiplier: readMulValue('globalDefaultCacheCreate'),
+                    cache_hit_multiplier: readMulValue('globalDefaultCacheHit')
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('全局默认倍率已保存', 'success');
+                    closeGlobalDefaultMultiplierModal();
+                    setTimeout(() => window.location.reload(), 800);
+                } else {
+                    showToast('保存失败: ' + data.message, 'error');
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showToast('保存失败', 'error');
+            });
+        }
+
+        // ---- 按模式批量应用 ----
+        // 关键词: openPatternMultiplierModal, applyPatternMultiplier, 按模式批量
+        function openPatternMultiplierModal() {
+            document.getElementById('patternMultiplierModal').style.display = 'flex';
+        }
+
+        function closePatternMultiplierModal() {
+            document.getElementById('patternMultiplierModal').style.display = 'none';
+        }
+
+        function applyPatternMultiplier() {
+            const pattern = (document.getElementById('patternMultiplierPattern').value || '').trim();
+            if (!pattern) {
+                showToast('请输入名称模式', 'error');
+                return;
+            }
+            if (!confirm('将把该组倍率应用到所有匹配 "' + pattern + '" 的实际模型，覆盖它们当前的设置。确定继续？')) {
+                return;
+            }
+            fetch('/portal/apply-model-multiplier-by-pattern', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    pattern: pattern,
+                    input_token_multiplier: readMulValue('patternMultiplierInput'),
+                    output_token_multiplier: readMulValue('patternMultiplierOutput'),
+                    cache_creation_multiplier: readMulValue('patternMultiplierCacheCreate'),
+                    cache_hit_multiplier: readMulValue('patternMultiplierCacheHit')
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('已应用到 ' + (data.applied || 0) + ' 个实际模型', 'success');
+                    closePatternMultiplierModal();
+                    setTimeout(() => window.location.reload(), 1000);
+                } else {
+                    showToast('应用失败: ' + data.message, 'error');
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showToast('应用失败', 'error');
+            });
+        }
+
+        // ---- 应用到勾选 ----
+        // 关键词: openSelectedMultiplierModal, applySelectedMultiplier, 勾选批量
+        function openSelectedMultiplierModal() {
+            const names = getSelectedInternalModels();
+            if (names.length === 0) {
+                showToast('请先勾选至少一个实际模型', 'error');
+                return;
+            }
+            const countEl = document.getElementById('selectedMultiplierCount');
+            if (countEl) countEl.textContent = names.length;
+            document.getElementById('selectedMultiplierModal').style.display = 'flex';
+        }
+
+        function closeSelectedMultiplierModal() {
+            document.getElementById('selectedMultiplierModal').style.display = 'none';
+        }
+
+        function applySelectedMultiplier() {
+            const names = getSelectedInternalModels();
+            if (names.length === 0) {
+                showToast('没有勾选任何实际模型', 'error');
+                return;
+            }
+            fetch('/portal/apply-model-multiplier-to-models', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    internal_model_names: names,
+                    input_token_multiplier: readMulValue('selectedMultiplierInput'),
+                    output_token_multiplier: readMulValue('selectedMultiplierOutput'),
+                    cache_creation_multiplier: readMulValue('selectedMultiplierCacheCreate'),
+                    cache_hit_multiplier: readMulValue('selectedMultiplierCacheHit')
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('已应用到 ' + (data.applied || 0) + ' 个实际模型', 'success');
+                    closeSelectedMultiplierModal();
+                    setTimeout(() => window.location.reload(), 1000);
+                } else {
+                    showToast('应用失败: ' + data.message, 'error');
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showToast('应用失败', 'error');
             });
         }
 
@@ -4019,6 +4779,120 @@ curl '${metaApiUrl}?name=${modelName}'`;
             }
         }
 
+        // ==================== API Key Token Limit (recommended) ====================
+        //
+        // 关键词: showTokenLimitDialog saveTokenLimit resetAPIKeyToken,
+        //        API Key Token 维度限额 UI, 推荐使用替代字节限额
+        //
+        // UI 设计：
+        //   1. 限额输入单位为 M tokens（百万）；保存时转换为 raw token；
+        //   2. 顶部明确说明「推荐使用 Token 限额，替代流量限制」；
+        //   3. 支持启用/禁用开关；
+        //   4. 同 modal 提供「重置 Token 用量」入口（沿用 traffic 风格）。
+
+        function showTokenLimitDialog(apiKeyId, currentLimit, currentUsed, enabled) {
+            // 关闭已存在 modal 避免重复（防止快速点击多次）
+            const existing = document.getElementById('tokenLimitModal');
+            if (existing) existing.remove();
+
+            const usedRaw = Number(currentUsed) || 0;
+            const limitRaw = Number(currentLimit) || 0;
+            // 默认以 M 为单位展示；如果限额非 M 的整数倍则显示带小数
+            const limitM = limitRaw > 0 ? (limitRaw / 1_000_000) : 0;
+            const usedDisplay = formatTokenCount(usedRaw);
+            const usedM = (usedRaw / 1_000_000).toFixed(usedRaw === 0 ? 0 : 3);
+
+            const html = `
+                <div id="tokenLimitModal" class="delete-confirmation-modal" style="display: flex;">
+                    <div class="modal-content" style="width: 480px; max-width: 90vw;">
+                        <span class="close-modal" onclick="closeTokenLimitModal()">&times;</span>
+                        <h4>Token 限额设置 <small style="color:#1976d2;font-weight:normal;">（推荐使用，替代字节流量限制）</small></h4>
+                        <div class="form-group">
+                            <label>API Key ID: ${apiKeyId}</label>
+                        </div>
+                        <div class="form-group">
+                            <label>当前已用 Token: <strong>${usedRaw}</strong> (${usedDisplay} ≈ ${usedM} M)</label>
+                        </div>
+                        <div class="form-group">
+                            <label for="tokenLimitMInput">Token 限额（单位：M tokens）:</label>
+                            <input type="number" id="tokenLimitMInput" class="form-control" value="${limitM}" min="0" step="0.1" oninput="updateRMBHint('tokenLimitMInput','tokenLimitRmbHint')">
+                            <small id="tokenLimitRmbHint" style="color:#2e7d32; font-size:12px; display:block; margin-top:4px;"></small>
+                            <small class="form-text text-muted">
+                                设置为 0 表示不限制。Token 维度按上游 SSE 末帧 usage 经四维倍率
+                                加权后累加 (input/output/cache_creation/cache_hit)，更贴近真实计费。
+                            </small>
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="tokenLimitEnableInput" ${enabled ? 'checked' : ''}>
+                                启用 Token 限额
+                            </label>
+                        </div>
+                        <div class="modal-actions">
+                            <button class="btn" onclick="resetAPIKeyToken(${apiKeyId})" style="background:#ff9800;color:#fff;">重置 Token 用量</button>
+                            <span style="flex:1;"></span>
+                            <button class="btn" onclick="closeTokenLimitModal()">取消</button>
+                            <button class="btn btn-primary" onclick="saveTokenLimit(${apiKeyId})">保存</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', html);
+            // 初始化 1 RMB=10M 计费 Token 换算提示
+            updateRMBHint('tokenLimitMInput', 'tokenLimitRmbHint');
+        }
+
+        function closeTokenLimitModal() {
+            const modal = document.getElementById('tokenLimitModal');
+            if (modal) modal.remove();
+        }
+
+        async function saveTokenLimit(apiKeyId) {
+            const limitMRaw = parseFloat(document.getElementById('tokenLimitMInput').value);
+            const limitM = isFinite(limitMRaw) && limitMRaw > 0 ? limitMRaw : 0;
+            // Math.round 用于避免浮点累积误差（例如 1.1 * 1e6 = 1100000.0000001）
+            const limitRaw = Math.round(limitM * 1_000_000);
+            const enabled = document.getElementById('tokenLimitEnableInput').checked;
+
+            try {
+                const response = await fetch(`/portal/api-key-token-limit/${apiKeyId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token_limit: limitRaw, enable: enabled })
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.message || '保存 Token 限额失败');
+                }
+                showToast('Token 限额已保存', 'success');
+                closeTokenLimitModal();
+                setTimeout(() => window.location.reload(), 800);
+            } catch (error) {
+                showToast(`保存失败: ${error.message}`, 'error');
+            }
+        }
+
+        async function resetAPIKeyToken(apiKeyId) {
+            if (!confirm('确定要重置这个 API Key 的 Token 用量计数吗？')) {
+                return;
+            }
+            try {
+                const response = await fetch(`/portal/reset-api-key-token/${apiKeyId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.message || '重置 Token 用量失败');
+                }
+                showToast('Token 用量已重置', 'success');
+                closeTokenLimitModal();
+                setTimeout(() => window.location.reload(), 800);
+            } catch (error) {
+                showToast(`重置失败: ${error.message}`, 'error');
+            }
+        }
+
         // ==================== API Key Pagination Functions ====================
 
         let currentAPIKeyPage = 1;
@@ -4085,7 +4959,7 @@ curl '${metaApiUrl}?name=${modelName}'`;
                         }
                     </td>
                     <td class="copyable api-key-cell" data-full-text="${key.api_key}">${key.display_key}</td>
-                    <td class="copyable editable-allowed-models" data-api-id="${key.id}" data-current-models="${key.allowed_models}" data-full-text="${key.allowed_models}" title="右键点击修改允许的模型">${key.allowed_models}</td>
+                    <td class="copyable editable-allowed-models" data-api-id="${key.id}" data-current-models="${escapeHtml(key.allowed_models)}" data-full-text="${escapeHtml(key.allowed_models)}" title="右键点击修改允许的模型">${renderAllowedModelsCellContent(key.allowed_models)}</td>
                     <td class="text-center">${key.usage_count}</td>
                     <td class="text-center">${key.web_search_count || 0}</td>
                     <td class="text-center">
@@ -4350,15 +5224,27 @@ curl '${metaApiUrl}?name=${modelName}'`;
                     
                     const widths = JSON.parse(saved);
                     const headers = table.querySelectorAll('thead th');
-                    
+
+                    // 防御：历史 bug 曾把"允许模型"列拖到几千 px，并被
+                    // localStorage 持久化下来。这里在恢复时按 CSS 上限钳制，
+                    // 避免每次刷新都把 #api-table 撑爆。
+                    const apiTableColumnCaps = {
+                        4: 320,  // 允许模型 (0-based index, 第 5 列)
+                    };
+                    const isApiTable = tableId === 'api-table';
+
                     headers.forEach((th, index) => {
                         if (widths[index]) {
-                            const width = widths[index] + 'px';
+                            let w = widths[index];
+                            if (isApiTable && apiTableColumnCaps[index] && w > apiTableColumnCaps[index]) {
+                                w = apiTableColumnCaps[index];
+                            }
+                            const width = w + 'px';
                             th.style.width = width;
                             th.style.minWidth = width;
                         }
                     });
-                    
+
                     // 同步 tbody 列宽
                     const rows = table.querySelectorAll('tbody tr');
                     rows.forEach(row => {
@@ -4366,7 +5252,11 @@ curl '${metaApiUrl}?name=${modelName}'`;
                             if (widths[index]) {
                                 const cell = row.children[index];
                                 if (cell) {
-                                    const width = widths[index] + 'px';
+                                    let w = widths[index];
+                                    if (isApiTable && apiTableColumnCaps[index] && w > apiTableColumnCaps[index]) {
+                                        w = apiTableColumnCaps[index];
+                                    }
+                                    const width = w + 'px';
                                     cell.style.width = width;
                                     cell.style.minWidth = width;
                                 }
@@ -4553,6 +5443,29 @@ curl '${metaApiUrl}?name=${modelName}'`;
             document.getElementById('opsUserCredentialsModal').style.display = 'none';
         }
         
+        // 显示可复制的敏感结果弹窗（如重置后的新密码 / 新 OPS Key）
+        // 关键词: showSecretResult 可复制结果弹窗, 替代 alert 不可复制问题, 自动选中便于复制
+        function showSecretResult(title, label, value) {
+            document.getElementById('secretResultTitle').textContent = title;
+            document.getElementById('secretResultLabel').textContent = label + ':';
+            const input = document.getElementById('secretResultValue');
+            input.value = value;
+            document.getElementById('secretResultModal').style.display = 'flex';
+            // 自动聚焦并选中，方便直接 Ctrl/Cmd+C 复制
+            setTimeout(function() { input.focus(); input.select(); }, 50);
+        }
+
+        // 关闭敏感结果弹窗
+        function closeSecretResultModal() {
+            document.getElementById('secretResultModal').style.display = 'none';
+        }
+
+        // 复制敏感结果弹窗中的值
+        function copySecretResult() {
+            const value = document.getElementById('secretResultValue').value;
+            copyToClipboard(value);
+        }
+
         // 复制 OPS 凭据
         function copyOpsCredentials() {
             const username = document.getElementById('createdOpsUsername').value;
@@ -4634,8 +5547,8 @@ curl '${metaApiUrl}?name=${modelName}'`;
             tbody.innerHTML = opsUsersData.map(user => `
                 <tr>
                     <td>${user.id}</td>
-                    <td>${user.username}</td>
-                    <td><span style="background: #e3f2fd; color: #1565c0; padding: 2px 8px; border-radius: 4px; font-size: 12px;">${user.role.toUpperCase()}</span></td>
+                    <td>${escapeHtml(user.username)}</td>
+                    <td><span style="background: #e3f2fd; color: #1565c0; padding: 2px 8px; border-radius: 4px; font-size: 12px;">${escapeHtml(String(user.role || '').toUpperCase())}</span></td>
                     <td>
                         <span style="background: ${user.active ? '#d4edda' : '#f8d7da'}; color: ${user.active ? '#155724' : '#721c24'}; padding: 2px 8px; border-radius: 4px; font-size: 12px;">
                             ${user.active ? '激活' : '禁用'}
@@ -4737,7 +5650,7 @@ curl '${metaApiUrl}?name=${modelName}'`;
                 const data = await response.json();
                 
                 if (data.success) {
-                    alert('Password reset successfully!\n\nNew Password: ' + data.new_password);
+                    showSecretResult('密码重置成功', '新密码', data.new_password);
                     refreshOpsUsers();
                 } else {
                     showToast(data.error || 'Failed to reset password', 'error');
@@ -4760,7 +5673,7 @@ curl '${metaApiUrl}?name=${modelName}'`;
                 const data = await response.json();
                 
                 if (data.success) {
-                    alert('OPS Key reset successfully!\n\nNew OPS Key: ' + data.new_ops_key);
+                    showSecretResult('OPS Key 重置成功', '新 OPS Key', data.new_ops_key);
                     refreshOpsUsers();
                 } else {
                     showToast(data.error || 'Failed to reset OPS Key', 'error');
@@ -4860,16 +5773,19 @@ curl '${metaApiUrl}?name=${modelName}'`;
                 'change_password': '修改密码'
             };
             
+            // 日志各字段（操作者名/目标/详情/IP）可能含用户可控内容（如绑定用户名、X-Forwarded-For），
+            // 一律 escapeHtml 后再渲染，title 属性同样转义，避免存储型 XSS 打穿后台。
+            // 关键词: renderOpsLogsTable XSS 防护, detail/ip 转义
             tbody.innerHTML = opsLogsData.map(log => `
                 <tr>
-                    <td>${log.id}</td>
-                    <td>${log.operator_name}</td>
-                    <td><span style="background: #e3f2fd; color: #1565c0; padding: 2px 8px; border-radius: 4px; font-size: 12px;">${actionLabels[log.action] || log.action}</span></td>
-                    <td>${log.target_type}</td>
-                    <td>${log.target_id}</td>
-                    <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${log.detail}">${log.detail || '-'}</td>
-                    <td>${log.ip_address || '-'}</td>
-                    <td>${log.created_at}</td>
+                    <td>${escapeHtml(log.id)}</td>
+                    <td>${escapeHtml(log.operator_name)}</td>
+                    <td><span style="background: #e3f2fd; color: #1565c0; padding: 2px 8px; border-radius: 4px; font-size: 12px;">${escapeHtml(actionLabels[log.action] || log.action)}</span></td>
+                    <td>${escapeHtml(log.target_type)}</td>
+                    <td>${escapeHtml(log.target_id)}</td>
+                    <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(log.detail || '')}">${escapeHtml(log.detail) || '-'}</td>
+                    <td>${escapeHtml(log.ip_address) || '-'}</td>
+                    <td>${escapeHtml(log.created_at)}</td>
                 </tr>
             `).join('');
         }
@@ -5264,119 +6180,168 @@ curl '${metaApiUrl}?name=${modelName}'`;
         }
         
         // ==================== 暴露删除和操作相关的全局函数 ====================
+        //
+        // 历史教训: 这块原本是大段 `window.X = X;` 直接赋值. 任意一个标识符未声明
+        // (例如曾经的 selectAllProviders / selectAllAPIKeys 占位名) 都会抛
+        // ReferenceError, 把整段顶层脚本执行掐断, 后果是:
+        //   - 后续所有 expose 不再绑定
+        //   - MirrorMgmt 等模块都不会被装配到 window
+        //   - HTML 内联 onclick="MirrorMgmt.xxx()" 全部 ReferenceError
+        //
+        // 解决方案: 用 __exposeFn(name, () => X) 形式. 由于 getter 是 lazy 求值,
+        // 内部出现 ReferenceError 只会被自身 try-catch 兜底, 不影响其他行.
+        // 同时 console.warn 出来便于排查到底哪个函数还没实现.
+        //
+        // 关键词: portal.js __exposeFn defensive global binding, ReferenceError safe,
+        // top-level script abort 防御, window inline onclick 绑定保护
+        function __exposeFn(name, getter) {
+            try {
+                const v = getter();
+                if (typeof v !== 'undefined') {
+                    window[name] = v;
+                }
+            } catch (e) {
+                console.warn('[expose] skip ' + name + ': ' + ((e && e.message) || e));
+            }
+        }
+
         // Provider 相关
-        window.confirmDeleteSelected = confirmDeleteSelected;
-        window.deleteProvider = deleteProvider;
-        window.deleteMultipleProviders = deleteMultipleProviders;
-        window.checkSingleProvider = checkSingleProvider;
-        window.checkAllProvidersHealth = checkAllProvidersHealth;
-        window.checkSelectedProvider = checkSelectedProvider;
-        window.selectAllProviders = selectAllProviders;
-        window.updateDeleteSelectedButton = updateDeleteSelectedButton;
-        
+        __exposeFn('confirmDeleteSelected', () => confirmDeleteSelected);
+        __exposeFn('deleteProvider', () => deleteProvider);
+        __exposeFn('deleteMultipleProviders', () => deleteMultipleProviders);
+        __exposeFn('checkSingleProvider', () => checkSingleProvider);
+        __exposeFn('checkAllProvidersHealth', () => checkAllProvidersHealth);
+        __exposeFn('checkSelectedProvider', () => checkSelectedProvider);
+        __exposeFn('selectAllProviders', () => selectAllProviders);
+        __exposeFn('probeAllToolCalls', () => probeAllToolCalls);
+        __exposeFn('probeSingleToolCalls', () => probeSingleToolCalls);
+        __exposeFn('updateDeleteSelectedButton', () => updateDeleteSelectedButton);
+
         // API Key 相关
-        window.confirmDeleteSelectedAPI = confirmDeleteSelectedAPI;
-        window.confirmDeleteSelectedAPIKeys = confirmDeleteSelectedAPI; // 别名，兼容 HTML 中的调用
-        window.deleteAPIKey = deleteAPIKey;
-        window.deleteMultipleAPIKeys = deleteMultipleAPIKeys;
-        window.toggleAPIKeyStatus = toggleAPIKeyStatus;
-        window.confirmDisableSelectedAPI = confirmDisableSelectedAPI;
-        window.confirmEnableSelectedAPI = confirmEnableSelectedAPI;
-        window.disableMultipleAPIKeys = disableMultipleAPIKeys;
-        window.enableMultipleAPIKeys = enableMultipleAPIKeys;
-        window.toggleSelectAllAPI = toggleSelectAllAPI;
-        window.selectAllAPIKeys = selectAllAPIKeys;
-        window.updateDeleteSelectedAPIButton = updateDeleteSelectedAPIButton;
-        
+        __exposeFn('confirmDeleteSelectedAPI', () => confirmDeleteSelectedAPI);
+        __exposeFn('confirmDeleteSelectedAPIKeys', () => confirmDeleteSelectedAPI); // 别名，兼容 HTML 中的调用
+        __exposeFn('deleteAPIKey', () => deleteAPIKey);
+        __exposeFn('deleteMultipleAPIKeys', () => deleteMultipleAPIKeys);
+        __exposeFn('toggleAPIKeyStatus', () => toggleAPIKeyStatus);
+        __exposeFn('confirmDisableSelectedAPI', () => confirmDisableSelectedAPI);
+        __exposeFn('confirmEnableSelectedAPI', () => confirmEnableSelectedAPI);
+        __exposeFn('disableMultipleAPIKeys', () => disableMultipleAPIKeys);
+        __exposeFn('enableMultipleAPIKeys', () => enableMultipleAPIKeys);
+        __exposeFn('toggleSelectAllAPI', () => toggleSelectAllAPI);
+        __exposeFn('selectAllAPIKeys', () => selectAllAPIKeys);
+        __exposeFn('updateDeleteSelectedAPIButton', () => updateDeleteSelectedAPIButton);
+        // API Key 绑定用户信息编辑 + 用户名过滤
+        __exposeFn('openApiKeyMetaModal', () => openApiKeyMetaModal);
+        __exposeFn('closeApiKeyMetaModal', () => closeApiKeyMetaModal);
+        __exposeFn('saveApiKeyMeta', () => saveApiKeyMeta);
+        __exposeFn('applyApiKeyUsernameFilter', () => applyApiKeyUsernameFilter);
+        __exposeFn('clearApiKeyUsernameFilter', () => clearApiKeyUsernameFilter);
+
         // 流量限制相关
-        window.showTrafficLimitDialog = showTrafficLimitDialog;
-        window.showTrafficLimitModal = showTrafficLimitDialog; // 别名
-        window.closeTrafficLimitModal = closeTrafficLimitModal;
-        window.saveTrafficLimit = saveTrafficLimit;
-        window.closeTrafficLimitDialog = closeTrafficLimitModal; // 别名
-        window.resetApiKeyTraffic = resetApiKeyTraffic;
-        
+        __exposeFn('showTrafficLimitDialog', () => showTrafficLimitDialog);
+        __exposeFn('showTrafficLimitModal', () => showTrafficLimitDialog); // 别名
+        __exposeFn('closeTrafficLimitModal', () => closeTrafficLimitModal);
+        __exposeFn('saveTrafficLimit', () => saveTrafficLimit);
+        __exposeFn('closeTrafficLimitDialog', () => closeTrafficLimitModal); // 别名
+        // 修正：之前赋值的是不存在的标识符 resetApiKeyTraffic（小写 pi），
+        // 函数实际定义为 resetAPIKeyTraffic（大写 API）。统一指向真实函数。
+        // 关键词: resetAPIKeyTraffic 名称大小写修复
+        __exposeFn('resetApiKeyTraffic', () => resetAPIKeyTraffic);
+        __exposeFn('resetAPIKeyTraffic', () => resetAPIKeyTraffic);
+
+        // Token 限额相关（推荐使用，替代字节限额）
+        // 关键词: window.showTokenLimitDialog window.saveTokenLimit window.resetAPIKeyToken
+        __exposeFn('showTokenLimitDialog', () => showTokenLimitDialog);
+        __exposeFn('closeTokenLimitModal', () => closeTokenLimitModal);
+        __exposeFn('saveTokenLimit', () => saveTokenLimit);
+        __exposeFn('resetAPIKeyToken', () => resetAPIKeyToken);
+        __exposeFn('formatTokenCount', () => formatTokenCount);
+        // 1 RMB=10M 计费 Token 实时换算提示
+        __exposeFn('updateRMBHint', () => updateRMBHint);
+        // 模型级免费 Token 覆盖行的金额限制换算提示
+        __exposeFn('updateFreeTokenRowRMB', () => updateFreeTokenRowRMB);
+
         // 内存和系统监控相关
-        window.showMemoryDialog = showMemoryDialog;
-        window.closeMemoryDialog = closeMemoryDialog;
-        window.fetchMemoryStats = fetchMemoryStats;
-        window.forceGC = forceGC;
-        window.fetchGoroutineDump = fetchGoroutineDump;
-        
+        __exposeFn('showMemoryDialog', () => showMemoryDialog);
+        __exposeFn('closeMemoryDialog', () => closeMemoryDialog);
+        __exposeFn('fetchMemoryStats', () => fetchMemoryStats);
+        __exposeFn('forceGC', () => forceGC);
+        __exposeFn('fetchGoroutineDump', () => fetchGoroutineDump);
+
         // 筛选相关
-        window.filterProviders = filterProviders;
-        window.filterApiKeys = filterApiKeys;
-        
+        __exposeFn('filterProviders', () => filterProviders);
+        __exposeFn('filterApiKeys', () => filterApiKeys);
+
         // 其他操作函数
-        window.showToast = showToast;
-        window.hideContextMenu = hideContextMenu;
-        window.copyToClipboard = copyToClipboard;
-        window.generateNewApiKey = generateNewApiKey;
-        window.confirmAndGenerateApiKey = confirmAndGenerateApiKey;
-        window.showApiKeySuccessModal = showApiKeySuccessModal;
-        window.closeApiKeySuccessModal = closeApiKeySuccessModal;
-        window.copyGeneratedApiKey = copyGeneratedApiKey;
-        
+        __exposeFn('showToast', () => showToast);
+        __exposeFn('hideContextMenu', () => hideContextMenu);
+        __exposeFn('copyToClipboard', () => copyToClipboard);
+        __exposeFn('generateNewApiKey', () => generateNewApiKey);
+        __exposeFn('confirmAndGenerateApiKey', () => confirmAndGenerateApiKey);
+        __exposeFn('showApiKeySuccessModal', () => showApiKeySuccessModal);
+        __exposeFn('closeApiKeySuccessModal', () => closeApiKeySuccessModal);
+        __exposeFn('copyGeneratedApiKey', () => copyGeneratedApiKey);
+
         // 模型相关
-        window.openEditModelModal = openEditModelModal;
-        window.showCurlCommand = showCurlCommand;
-        if (typeof closeEditModelModal === 'function') window.closeEditModelModal = closeEditModelModal;
-        if (typeof saveModelMetadata === 'function') window.saveModelMetadata = saveModelMetadata;
-        if (typeof closeCurlModal === 'function') window.closeCurlModal = closeCurlModal;
-        if (typeof copyCurlCommand === 'function') window.copyCurlCommand = copyCurlCommand;
-        
+        __exposeFn('openEditModelModal', () => openEditModelModal);
+        __exposeFn('showCurlCommand', () => showCurlCommand);
+        __exposeFn('closeEditModelModal', () => closeEditModelModal);
+        __exposeFn('saveModelMetadata', () => saveModelMetadata);
+        __exposeFn('closeCurlModal', () => closeCurlModal);
+        __exposeFn('copyCurlCommand', () => copyCurlCommand);
+
         // 右键菜单相关（Provider）
-        window.quickAddProvider = quickAddProvider;
-        window.copySimilarProviderKeys = copySimilarProviderKeys;
-        window.deleteSelectedProvider = deleteSelectedProvider;
-        window.showContextMenu = showContextMenu;
-        window.initializeContextMenu = initializeContextMenu;
-        
+        __exposeFn('quickAddProvider', () => quickAddProvider);
+        __exposeFn('copySimilarProviderKeys', () => copySimilarProviderKeys);
+        __exposeFn('deleteSelectedProvider', () => deleteSelectedProvider);
+        __exposeFn('showContextMenu', () => showContextMenu);
+        __exposeFn('initializeContextMenu', () => initializeContextMenu);
+
         // 同类供应商 Keys 弹窗相关
-        if (typeof showSimilarKeysModal === 'function') window.showSimilarKeysModal = showSimilarKeysModal;
-        if (typeof closeCopySimilarKeysModal === 'function') window.closeCopySimilarKeysModal = closeCopySimilarKeysModal;
-        if (typeof copySimilarKeysToClipboard === 'function') window.copySimilarKeysToClipboard = copySimilarKeysToClipboard;
-        
+        __exposeFn('showSimilarKeysModal', () => showSimilarKeysModal);
+        __exposeFn('closeCopySimilarKeysModal', () => closeCopySimilarKeysModal);
+        __exposeFn('copySimilarKeysToClipboard', () => copySimilarKeysToClipboard);
+
         // 右键菜单相关（API Key）
-        window.triggerEditAllowedModelsFromContextMenu = triggerEditAllowedModelsFromContextMenu;
-        if (typeof showEditAllowedModelsModal === 'function') window.showEditAllowedModelsModal = showEditAllowedModelsModal;
-        if (typeof closeEditAllowedModelsModal === 'function') window.closeEditAllowedModelsModal = closeEditAllowedModelsModal;
-        if (typeof saveEditedAllowedModels === 'function') window.saveEditedAllowedModels = saveEditedAllowedModels;
-        
+        __exposeFn('triggerEditAllowedModelsFromContextMenu', () => triggerEditAllowedModelsFromContextMenu);
+        __exposeFn('showEditAllowedModelsModal', () => showEditAllowedModelsModal);
+        __exposeFn('closeEditAllowedModelsModal', () => closeEditAllowedModelsModal);
+        __exposeFn('saveEditedAllowedModels', () => saveEditedAllowedModels);
+
         // Tab 切换
-        if (typeof openTab === 'function') window.openTab = openTab;
-        if (typeof switchTab === 'function') window.switchTab = switchTab;
-        
+        __exposeFn('openTab', () => openTab);
+        __exposeFn('switchTab', () => switchTab);
+
         // 关闭 API Key 成功模态框
-        if (typeof closeApiKeyModal === 'function') window.closeApiKeyModal = closeApiKeyModal;
-        
+        __exposeFn('closeApiKeyModal', () => closeApiKeyModal);
+
         // OPS 用户管理相关
-        window.showCreateOpsUserModal = showCreateOpsUserModal;
-        window.closeCreateOpsUserModal = closeCreateOpsUserModal;
-        window.createOpsUser = createOpsUser;
-        window.closeOpsUserCredentialsModal = closeOpsUserCredentialsModal;
-        window.copyOpsCredentials = copyOpsCredentials;
-        window.refreshOpsUsers = refreshOpsUsers;
-        window.deleteOpsUser = deleteOpsUser;
-        window.toggleOpsUserStatus = toggleOpsUserStatus;
-        window.resetOpsUserPassword = resetOpsUserPassword;
-        window.resetOpsUserKey = resetOpsUserKey;
-        
+        __exposeFn('showCreateOpsUserModal', () => showCreateOpsUserModal);
+        __exposeFn('closeCreateOpsUserModal', () => closeCreateOpsUserModal);
+        __exposeFn('createOpsUser', () => createOpsUser);
+        __exposeFn('closeOpsUserCredentialsModal', () => closeOpsUserCredentialsModal);
+        __exposeFn('copyOpsCredentials', () => copyOpsCredentials);
+        __exposeFn('refreshOpsUsers', () => refreshOpsUsers);
+        __exposeFn('deleteOpsUser', () => deleteOpsUser);
+        __exposeFn('toggleOpsUserStatus', () => toggleOpsUserStatus);
+        __exposeFn('resetOpsUserPassword', () => resetOpsUserPassword);
+        __exposeFn('resetOpsUserKey', () => resetOpsUserKey);
+
         // OPS 日志相关
-        window.refreshOpsLogs = refreshOpsLogs;
-        window.filterOpsLogs = filterOpsLogs;
-        
+        __exposeFn('refreshOpsLogs', () => refreshOpsLogs);
+        __exposeFn('filterOpsLogs', () => filterOpsLogs);
+
         // Web Search Keys 相关
-        window.refreshWebSearchKeys = refreshWebSearchKeys;
-        window.showAddWebSearchKeyModal = showAddWebSearchKeyModal;
-        window.closeAddWebSearchKeyModal = closeAddWebSearchKeyModal;
-        window.submitAddWebSearchKey = submitAddWebSearchKey;
-        window.toggleWebSearchKeyStatus = toggleWebSearchKeyStatus;
-        window.resetWebSearchKeyHealth = resetWebSearchKeyHealth;
-        window.deleteWebSearchKey = deleteWebSearchKey;
-        window.testWebSearchKey = testWebSearchKey;
-        window.saveWebSearchConfig = saveWebSearchConfig;
-        window.loadWebSearchConfig = loadWebSearchConfig;
+        __exposeFn('refreshWebSearchKeys', () => refreshWebSearchKeys);
+        __exposeFn('showAddWebSearchKeyModal', () => showAddWebSearchKeyModal);
+        __exposeFn('closeAddWebSearchKeyModal', () => closeAddWebSearchKeyModal);
+        __exposeFn('submitAddWebSearchKey', () => submitAddWebSearchKey);
+        __exposeFn('toggleWebSearchKeyStatus', () => toggleWebSearchKeyStatus);
+        __exposeFn('resetWebSearchKeyHealth', () => resetWebSearchKeyHealth);
+        __exposeFn('deleteWebSearchKey', () => deleteWebSearchKey);
+        __exposeFn('testWebSearchKey', () => testWebSearchKey);
+        __exposeFn('saveWebSearchConfig', () => saveWebSearchConfig);
+        __exposeFn('loadWebSearchConfig', () => loadWebSearchConfig);
 
         // ========== Amap Key Management Functions ==========
 
@@ -5716,3 +6681,2415 @@ curl '${metaApiUrl}?name=${modelName}'`;
         window.checkAllAmapKeys = checkAllAmapKeys;
         window.loadAmapConfig = loadAmapConfig;
         window.saveAmapConfig = saveAmapConfig;
+
+        // ==================== Rate Limit Config ====================
+
+        // 自定义 429 文案：后端 custom_429_kind_defaults（各 limit_kind 的默认文案/中文名/触发原因）缓存
+        // 关键词: custom429KindDefaults, custom_429_kind_defaults 缓存
+        let custom429KindDefaults = [];
+
+        // 渲染「自定义 429 文案」各 limit_kind 编辑器：展示中文名/触发原因/默认文案，并提供可编辑覆盖框
+        // 关键词: renderCustom429Kinds, 每个 kind 可编辑 + 编辑时可见默认文案
+        function renderCustom429Kinds(defaults, overrides) {
+            const container = document.getElementById('rl-custom429-kinds-list');
+            if (!container) return;
+            overrides = overrides || {};
+            if (!Array.isArray(defaults) || defaults.length === 0) {
+                container.innerHTML = '<small style="color:#999;">无可配置的限流类型</small>';
+                return;
+            }
+            container.innerHTML = defaults.map(function (meta) {
+                const kind = meta.kind || '';
+                const labelZh = meta.label_zh || kind;
+                const type = meta.type || '';
+                const def = meta.default_message || '';
+                const desc = meta.description || '';
+                const dynamicBadge = meta.dynamic
+                    ? '<span style="background:#ff9800;color:#fff;padding:1px 6px;border-radius:8px;font-size:11px;margin-left:6px;" title="动态类型：实际返回会在默认文案后追加运行时数值（如排队位置 / 已用量）">动态</span>'
+                    : '';
+                const ov = overrides[kind] != null ? overrides[kind] : '';
+                return ''
+                    + '<div class="form-group" style="margin-bottom:0;border:1px solid #eee;border-radius:6px;padding:10px;background:#fafafa;">'
+                    +   '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">'
+                    +     '<label style="margin:0;font-weight:600;">' + escapeHtml(labelZh)
+                    +       ' <small style="color:#888;font-weight:normal;">(' + escapeHtml(kind) + (type ? ' &middot; ' + escapeHtml(type) : '') + ')</small>'
+                    +       dynamicBadge
+                    +     '</label>'
+                    +     '<button type="button" class="btn btn-sm" style="font-size:11px;padding:2px 8px;" onclick="applyCustom429Default(\'' + escapeHtml(kind) + '\')" title="将默认文案填入下方编辑框">套用默认</button>'
+                    +   '</div>'
+                    +   (desc ? '<div style="color:#999;font-size:12px;margin:4px 0;">触发原因：' + escapeHtml(desc) + '</div>' : '')
+                    +   '<div style="color:#555;font-size:12px;margin:4px 0;"><span style="color:#1976d2;">默认文案：</span>' + escapeHtml(def) + '</div>'
+                    +   '<textarea id="rl-custom429-kind-' + escapeHtml(kind) + '" class="form-control" rows="2" style="font-size:13px;" placeholder="' + escapeHtml(def) + '">' + escapeHtml(ov) + '</textarea>'
+                    + '</div>';
+            }).join('');
+        }
+
+        // 套用默认：将某个 limit_kind 的默认文案填入对应编辑框（方便在默认基础上微调）
+        // 关键词: applyCustom429Default, 套用默认文案
+        function applyCustom429Default(kind) {
+            const meta = (custom429KindDefaults || []).find(function (m) { return m.kind === kind; });
+            if (!meta) return;
+            const el = document.getElementById('rl-custom429-kind-' + kind);
+            if (el) el.value = meta.default_message || '';
+        }
+
+        async function loadRateLimitConfig() {
+            try {
+                const response = await fetch('/portal/api/rate-limit-config');
+                if (!response.ok) throw new Error('Failed to fetch rate limit config');
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (data.success && data.config) {
+                    const cfg = data.config;
+                    const rpmInput = document.getElementById('rl-default-rpm');
+                    if (rpmInput) rpmInput.value = cfg.default_rpm || 600;
+                    const delayInput = document.getElementById('rl-free-user-delay');
+                    if (delayInput) delayInput.value = cfg.free_user_delay_sec || 0;
+                    const delayMaxInput = document.getElementById('rl-free-user-delay-max');
+                    if (delayMaxInput) delayMaxInput.value = cfg.free_user_delay_max_sec || 0;
+                    const freeOutputTPSInput = document.getElementById('rl-free-output-tps');
+                    if (freeOutputTPSInput) freeOutputTPSInput.value = cfg.free_user_output_tps || 0;
+                    renderModelRPMOverrides(
+                        cfg.model_rpm_overrides || {},
+                        cfg.model_delay_overrides || {},
+                        cfg.model_output_tps_overrides || {}
+                    );
+
+                    // 免费用户 Token 日限额：全局 + 模型级覆盖
+                    // 关键词: loadRateLimitConfig free_user_token_limit_m
+                    const tokLimitInput = document.getElementById('rl-free-token-limit-m-input');
+                    if (tokLimitInput) tokLimitInput.value = (cfg.free_user_token_limit_m == null ? 1200 : cfg.free_user_token_limit_m);
+                    renderFreeTokenModelOverrides(cfg.free_user_token_model_overrides || {});
+
+                    // 付费用户全局日 Token 总额度（第二道硬门），0=不限制
+                    // 关键词: loadRateLimitConfig paid_user_token_limit_m
+                    const paidTokLimitInput = document.getElementById('rl-paid-token-limit-m-input');
+                    if (paidTokLimitInput) paidTokLimitInput.value = (cfg.paid_user_token_limit_m == null ? 0 : cfg.paid_user_token_limit_m);
+
+                    // 刷新 1 RMB=10M 计费 Token 换算提示
+                    updateRMBHint('rl-free-token-limit-m-input', 'rl-free-token-limit-rmb');
+                    updateRMBHint('rl-paid-token-limit-m-input', 'rl-paid-token-limit-rmb');
+
+                    // 软限额阈值 / 软限额 TPS
+                    // 关键词: loadRateLimitConfig free_user_token_soft_limit_m
+                    const softLimitMInput = document.getElementById('rl-free-token-soft-limit-m');
+                    if (softLimitMInput) softLimitMInput.value = cfg.free_user_token_soft_limit_m || 0;
+                    const softLimitTPSInput = document.getElementById('rl-free-soft-limit-tps');
+                    if (softLimitTPSInput) softLimitTPSInput.value = cfg.free_user_soft_limit_tps || 0;
+
+                    // memfit-* 客户端版本控流配置
+                    // 关键词: loadRateLimitConfig memfit_version_gate_enabled, memfit_version_min_build_time
+                    const gateEl = document.getElementById('rl-memfit-version-gate-enabled');
+                    if (gateEl) gateEl.checked = !!cfg.memfit_version_gate_enabled;
+                    const minBtEl = document.getElementById('rl-memfit-version-min-build-time');
+                    if (minBtEl) minBtEl.value = cfg.memfit_version_min_build_time || '';
+
+                    // 自定义 429/错误文案配置：按后端默认列表动态渲染各 kind 编辑器，并回填已保存覆盖
+                    // 关键词: loadRateLimitConfig custom_429_enabled, custom_429_notice, custom_429_kind_defaults
+                    const c429EnabledEl = document.getElementById('rl-custom429-enabled');
+                    if (c429EnabledEl) c429EnabledEl.checked = !!cfg.custom_429_enabled;
+                    const c429NoticeEl = document.getElementById('rl-custom429-notice');
+                    if (c429NoticeEl) c429NoticeEl.value = cfg.custom_429_notice || '';
+                    custom429KindDefaults = Array.isArray(cfg.custom_429_kind_defaults) ? cfg.custom_429_kind_defaults : [];
+                    renderCustom429Kinds(custom429KindDefaults, cfg.custom_429_kind_overrides || {});
+
+                    // 轻量降级规则
+                    // 关键词: loadRateLimitConfig model_downgrade_rules
+                    renderModelDowngradeRules(cfg.model_downgrade_rules || []);
+
+                    // 单 IP 免费模型每日用量限额
+                    // 关键词: loadRateLimitConfig free_user_ip_limit
+                    const ipEnabledEl = document.getElementById('rl-free-ip-limit-enabled');
+                    if (ipEnabledEl) ipEnabledEl.checked = !!cfg.free_user_ip_limit_enable;
+                    const ipReqLimitEl = document.getElementById('rl-free-ip-daily-request-limit');
+                    if (ipReqLimitEl) ipReqLimitEl.value = (cfg.free_user_ip_daily_request_limit == null ? 0 : cfg.free_user_ip_daily_request_limit);
+                    const ipTokLimitEl = document.getElementById('rl-free-ip-daily-token-limit-m');
+                    if (ipTokLimitEl) ipTokLimitEl.value = (cfg.free_user_ip_daily_token_limit_m == null ? 0 : cfg.free_user_ip_daily_token_limit_m);
+
+                    // 刷新免费额度相关「金额限制」换算提示（单 IP 每日 Token 上限 / 软限额阈值）
+                    // 关键词: loadRateLimitConfig 金额限制 RMB 提示, 单 IP Token 上限, 软限额阈值
+                    updateRMBHint('rl-free-ip-daily-token-limit-m', 'rl-free-ip-daily-token-limit-rmb');
+                    updateRMBHint('rl-free-token-soft-limit-m', 'rl-free-token-soft-limit-rmb');
+
+                    // 一键限流 IP 默认参数（RPM / 输出 TPS）
+                    // 关键词: loadRateLimitConfig throttled_ip_default_rpm/tps
+                    const thrRpmEl = document.getElementById('rl-throttled-ip-default-rpm');
+                    if (thrRpmEl) thrRpmEl.value = (cfg.throttled_ip_default_rpm == null ? 3 : cfg.throttled_ip_default_rpm);
+                    const thrTpsEl = document.getElementById('rl-throttled-ip-default-tps');
+                    if (thrTpsEl) thrTpsEl.value = (cfg.throttled_ip_default_tps == null ? 15 : cfg.throttled_ip_default_tps);
+                }
+            } catch (error) {
+                console.error('Error loading rate limit config:', error);
+            }
+        }
+
+        async function saveRateLimitConfig() {
+            const defaultRPM = parseInt(document.getElementById('rl-default-rpm').value) || 600;
+            const freeDelay = parseInt(document.getElementById('rl-free-user-delay').value) || 0;
+            const freeDelayMaxRaw = document.getElementById('rl-free-user-delay-max').value;
+            let freeDelayMax = parseInt(freeDelayMaxRaw);
+            if (isNaN(freeDelayMax) || freeDelayMax < 0) freeDelayMax = 0;
+            const freeOutputTPSRaw = document.getElementById('rl-free-output-tps').value;
+            let freeOutputTPS = parseInt(freeOutputTPSRaw);
+            if (isNaN(freeOutputTPS) || freeOutputTPS < 0) freeOutputTPS = 0;
+            const collected = collectModelRPMOverrides();
+
+            // 免费 Token 限额相关字段
+            // 关键词: saveRateLimitConfig free_user_token_limit_m, model overrides
+            const tokLimitInputEl = document.getElementById('rl-free-token-limit-m-input');
+            let freeTokenLimitM = parseInt(tokLimitInputEl ? tokLimitInputEl.value : '');
+            if (isNaN(freeTokenLimitM) || freeTokenLimitM < 0) freeTokenLimitM = 1200;
+            const freeTokenOverrides = collectFreeTokenModelOverrides();
+
+            // 付费用户全局日 Token 总额度（第二道硬门），0=不限制
+            // 关键词: saveRateLimitConfig paid_user_token_limit_m
+            const paidTokLimitInputEl = document.getElementById('rl-paid-token-limit-m-input');
+            let paidTokenLimitM = parseInt(paidTokLimitInputEl ? paidTokLimitInputEl.value : '');
+            if (isNaN(paidTokenLimitM) || paidTokenLimitM < 0) paidTokenLimitM = 0;
+
+            // 软限额相关字段
+            // 关键词: saveRateLimitConfig free_user_token_soft_limit_m
+            const softLimitMRaw = document.getElementById('rl-free-token-soft-limit-m').value;
+            let softLimitM = parseInt(softLimitMRaw);
+            if (isNaN(softLimitM) || softLimitM < 0) softLimitM = 0;
+            const softLimitTPSRaw = document.getElementById('rl-free-soft-limit-tps').value;
+            let softLimitTPS = parseInt(softLimitTPSRaw);
+            if (isNaN(softLimitTPS) || softLimitTPS < 0) softLimitTPS = 0;
+
+            // memfit-* 客户端版本控流配置
+            // 关键词: saveRateLimitConfig memfit_version_gate_enabled, memfit_version_min_build_time
+            const gateEl = document.getElementById('rl-memfit-version-gate-enabled');
+            const minBtEl = document.getElementById('rl-memfit-version-min-build-time');
+            const memfitGateEnabled = !!(gateEl && gateEl.checked);
+            const memfitMinBuildTime = minBtEl ? (minBtEl.value || '').trim() : '';
+
+            // 自定义 429/错误文案配置
+            // 关键词: saveRateLimitConfig custom_429_enabled, custom_429_notice, custom_429_kind_overrides
+            const c429EnabledEl = document.getElementById('rl-custom429-enabled');
+            const custom429Enabled = !!(c429EnabledEl && c429EnabledEl.checked);
+            const c429NoticeEl = document.getElementById('rl-custom429-notice');
+            const custom429Notice = c429NoticeEl ? (c429NoticeEl.value || '').trim() : '';
+            const custom429KindOverrides = {};
+            (custom429KindDefaults || []).forEach(function (meta) {
+                const el = document.getElementById('rl-custom429-kind-' + meta.kind);
+                if (el) {
+                    const v = (el.value || '').trim();
+                    if (v !== '') custom429KindOverrides[meta.kind] = v;
+                }
+            });
+
+            // 轻量降级规则（空列表表示显式关闭降级）
+            // 关键词: saveRateLimitConfig model_downgrade_rules
+            const modelDowngradeRules = collectModelDowngradeRules();
+
+            // 单 IP 免费模型每日用量限额
+            // 关键词: saveRateLimitConfig free_user_ip_limit
+            const ipEnabledEl = document.getElementById('rl-free-ip-limit-enabled');
+            const freeIPLimitEnable = !!(ipEnabledEl && ipEnabledEl.checked);
+            const ipReqLimitRaw = document.getElementById('rl-free-ip-daily-request-limit');
+            let freeIPDailyRequestLimit = parseInt(ipReqLimitRaw ? ipReqLimitRaw.value : '');
+            if (isNaN(freeIPDailyRequestLimit) || freeIPDailyRequestLimit < 0) freeIPDailyRequestLimit = 0;
+            const ipTokLimitRaw = document.getElementById('rl-free-ip-daily-token-limit-m');
+            let freeIPDailyTokenLimitM = parseInt(ipTokLimitRaw ? ipTokLimitRaw.value : '');
+            if (isNaN(freeIPDailyTokenLimitM) || freeIPDailyTokenLimitM < 0) freeIPDailyTokenLimitM = 0;
+
+            // 一键限流 IP 默认参数（RPM / 输出 TPS），<=0 由后端按 3/15 兜底
+            // 关键词: saveRateLimitConfig throttled_ip_default_rpm/tps
+            const thrRpmRaw = document.getElementById('rl-throttled-ip-default-rpm');
+            let throttledIPDefaultRPM = parseInt(thrRpmRaw ? thrRpmRaw.value : '');
+            if (isNaN(throttledIPDefaultRPM) || throttledIPDefaultRPM < 0) throttledIPDefaultRPM = 0;
+            const thrTpsRaw = document.getElementById('rl-throttled-ip-default-tps');
+            let throttledIPDefaultTPS = parseInt(thrTpsRaw ? thrTpsRaw.value : '');
+            if (isNaN(throttledIPDefaultTPS) || throttledIPDefaultTPS < 0) throttledIPDefaultTPS = 0;
+
+            try {
+                const response = await fetch('/portal/api/rate-limit-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        default_rpm: defaultRPM,
+                        free_user_delay_sec: freeDelay,
+                        free_user_delay_max_sec: freeDelayMax,
+                        model_rpm_overrides: collected.rpm,
+                        model_delay_overrides: collected.delay,
+                        free_user_token_limit_m: freeTokenLimitM,
+                        free_user_token_model_overrides: freeTokenOverrides,
+                        paid_user_token_limit_m: paidTokenLimitM,
+                        free_user_output_tps: freeOutputTPS,
+                        model_output_tps_overrides: collected.tps,
+                        free_user_token_soft_limit_m: softLimitM,
+                        free_user_soft_limit_tps: softLimitTPS,
+                        memfit_version_gate_enabled: memfitGateEnabled,
+                        memfit_version_min_build_time: memfitMinBuildTime,
+                        custom_429_enabled: custom429Enabled,
+                        custom_429_notice: custom429Notice,
+                        custom_429_kind_overrides: custom429KindOverrides,
+                        model_downgrade_rules: modelDowngradeRules,
+                        free_user_ip_limit_enable: freeIPLimitEnable,
+                        free_user_ip_daily_request_limit: freeIPDailyRequestLimit,
+                        free_user_ip_daily_token_limit_m: freeIPDailyTokenLimitM,
+                        throttled_ip_default_rpm: throttledIPDefaultRPM,
+                        throttled_ip_default_tps: throttledIPDefaultTPS
+                    })
+                });
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (data.success) {
+                    showToast('限流配置已保存', 'success');
+                    loadRateLimitStatus();
+                } else {
+                    showToast(data.message || '保存失败', 'error');
+                }
+            } catch (error) {
+                console.error('Error saving rate limit config:', error);
+                showToast('保存限流配置失败', 'error');
+            }
+        }
+
+        async function loadRateLimitStatus() {
+            try {
+                const response = await fetch('/portal/api/rate-limit-status');
+                if (!response.ok) throw new Error('Failed to fetch rate limit status');
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (data.success) {
+                    const queueEl = document.getElementById('rl-queue-count');
+                    if (queueEl) queueEl.textContent = data.queue_count || 0;
+                    const rpmEl = document.getElementById('rl-effective-rpm');
+                    if (rpmEl) rpmEl.textContent = data.default_rpm || '--';
+
+                    // 免费用户 Token 用量快照
+                    // 关键词: loadRateLimitStatus free_user_token_usage 实时显示
+                    const usage = data.free_user_token_usage || {};
+                    const global = usage.global || {};
+                    const usedMText = (typeof global.used_m === 'number') ? global.used_m.toFixed(2) : '--';
+                    const limitMText = (typeof global.limit_m === 'number') ? String(global.limit_m) : '--';
+                    const topUsedEl = document.getElementById('rl-free-token-used-m');
+                    if (topUsedEl) topUsedEl.textContent = usedMText;
+                    const topLimitEl = document.getElementById('rl-free-token-limit-m');
+                    if (topLimitEl) topLimitEl.textContent = limitMText;
+                    const resetEl = document.getElementById('rl-free-token-reset-date');
+                    if (resetEl) resetEl.textContent = usage.reset_date || '--';
+                    const blockUsedEl = document.getElementById('rl-free-token-global-used');
+                    if (blockUsedEl) blockUsedEl.textContent = usedMText;
+                    const blockLimitEl = document.getElementById('rl-free-token-global-limit');
+                    if (blockLimitEl) blockLimitEl.textContent = limitMText;
+
+                    // 付费用户全局日 Token 总额度快照（第二道硬门）
+                    // 关键词: loadRateLimitStatus paid_user_token_usage 实时显示
+                    const paidUsage = data.paid_user_token_usage || {};
+                    const paidUsedMText = (typeof paidUsage.used_m === 'number') ? paidUsage.used_m.toFixed(2) : '--';
+                    const paidLimitMText = (typeof paidUsage.limit_m === 'number')
+                        ? (paidUsage.limit_m > 0 ? String(paidUsage.limit_m) : '不限制')
+                        : '--';
+                    const paidUsedEl = document.getElementById('rl-paid-token-global-used');
+                    if (paidUsedEl) paidUsedEl.textContent = paidUsedMText;
+                    const paidLimitEl = document.getElementById('rl-paid-token-global-limit');
+                    if (paidLimitEl) paidLimitEl.textContent = paidLimitMText;
+
+                    // 单 IP 免费模型用量快照（多少人在用 + Top IP 榜）
+                    // 关键词: loadRateLimitStatus free_ip_usage 渲染
+                    renderFreeIPUsage(data.free_ip_usage || {});
+                }
+            } catch (error) {
+                console.error('Error loading rate limit status:', error);
+            }
+            // Clicking "刷新状态" should refresh hot-model stats as well.
+            loadRateLimitModelStats();
+            // 同步刷新客户端版本统计（memfit 版本控流）
+            // 关键词: loadRateLimitStatus 关联刷新 loadClientVersionStats
+            loadClientVersionStats();
+        }
+
+        // renderFreeIPUsage 渲染「今日免费 IP 用量」面板：多少 IP 在用 + Top 榜（仅 >10M）+ 一键限流。
+        // 关键词: renderFreeIPUsage, 单 IP 免费用量, 防盗刷面板, 一键限流
+        function renderFreeIPUsage(usage) {
+            const countEl = document.getElementById('rl-free-ip-distinct-count');
+            if (countEl) countEl.textContent = (typeof usage.distinct_ip_count === 'number') ? usage.distinct_ip_count : '--';
+            const dateEl = document.getElementById('rl-free-ip-reset-date');
+            if (dateEl) dateEl.textContent = usage.reset_date || '--';
+
+            // 已限流 IP 列表（独立于今日用量榜，可随时解除）
+            renderThrottledIPList(Array.isArray(usage.throttled_ips) ? usage.throttled_ips : []);
+
+            const tbody = document.getElementById('rl-free-ip-usage-tbody');
+            if (!tbody) return;
+            const top = Array.isArray(usage.top) ? usage.top : [];
+            if (top.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="padding: 12px; text-align: center; color: #999;">今日暂无加权 Token 超过 10M 的免费 IP</td></tr>';
+                bindFreeIPActionButtons();
+                return;
+            }
+            tbody.innerHTML = top.map(it => {
+                const ip = escapeHtml(it.ip || '');
+                const req = Number(it.request_count) || 0;
+                const usedMNum = (typeof it.used_m === 'number') ? it.used_m : 0;
+                const usedM = usedMNum.toFixed(3);
+                // 加权 Token 折算 RMB：1 RMB = 10M 计费 Token（BILLING_TOKEN_M_PER_RMB）。
+                const rmb = '¥' + (usedMNum / BILLING_TOKEN_M_PER_RMB).toFixed(2);
+                const throttled = !!it.throttled;
+                const btn = throttled
+                    ? '<button class="rl-ip-unthrottle-btn btn" data-ip="' + ip + '" style="height:26px; font-size:12px; background:#c62828; color:#fff;">解除</button>'
+                    : '<button class="rl-ip-throttle-btn btn" data-ip="' + ip + '" style="height:26px; font-size:12px; background:#ef6c00; color:#fff;">限流</button>';
+                const tag = throttled ? ' <span style="color:#c62828; font-size:11px;">(已限流)</span>' : '';
+                // 该 IP 用得最多的 TOP3 模型（小字子行）。
+                // 数量(M) 用原始 Token（used_m，含不计费模型）；金额(¥) 用加权 Token（weighted_m）折算，
+                // 不计费模型 weighted_m=0 -> ¥0.00（计数量、不算钱）。
+                // 关键词: renderFreeIPUsage top_models, per-IP TOP3 模型子行, 数量 vs 金额
+                const models = Array.isArray(it.top_models) ? it.top_models : [];
+                let modelsRow = '';
+                if (models.length > 0) {
+                    const chips = models.map(function (m, mi) {
+                        const name = escapeHtml(m.model || '');
+                        const mm = (typeof m.used_m === 'number') ? m.used_m : 0;
+                        const mReq = Number(m.request_count) || 0;
+                        // 金额按加权 Token 折算；旧数据无 weighted_m 时回退 0（避免把数量误当金额）。
+                        const wM = (typeof m.weighted_m === 'number') ? m.weighted_m : 0;
+                        const mRmb = '¥' + (wM / BILLING_TOKEN_M_PER_RMB).toFixed(2);
+                        const free = wM <= 0;
+                        const rank = 'TOP' + (mi + 1);
+                        return '<span style="display:inline-block; margin:2px 6px 2px 0; padding:1px 6px; background:#f1f8ff; border:1px solid #cfe3ff; border-radius:10px; color:#37474f;">'
+                            + '<span style="color:#90a4ae;">' + rank + ' </span>'
+                            + '<code style="color:#1565c0;">' + name + '</code> · ' + mm.toFixed(2) + 'M · ' + mReq + '次 · '
+                            + '<span style="color:' + (free ? '#2e7d32' : '#1565c0') + ';">' + mRmb + (free ? ' 不计费' : '') + '</span>'
+                            + '</span>';
+                    }).join('');
+                    modelsRow = '<tr><td colspan="5" style="padding: 0 10px 8px 22px; border-bottom: 1px solid #e1f5fe; font-size: 11px; color:#789;">'
+                        + '<span style="color:#90a4ae;">TOP 模型(数量): </span>' + chips
+                        + '</td></tr>';
+                }
+                return '<tr>'
+                    + '<td style="padding: 6px 10px; border-bottom: 1px solid #e1f5fe;"><code>' + ip + '</code>' + tag + '</td>'
+                    + '<td style="padding: 6px 10px; border-bottom: 1px solid #e1f5fe; text-align: right;">' + req + '</td>'
+                    + '<td style="padding: 6px 10px; border-bottom: 1px solid #e1f5fe; text-align: right;">' + usedM + '</td>'
+                    + '<td style="padding: 6px 10px; border-bottom: 1px solid #e1f5fe; text-align: right; color:#1565c0;">' + rmb + '</td>'
+                    + '<td style="padding: 6px 10px; border-bottom: 1px solid #e1f5fe; text-align: center;">' + btn + '</td>'
+                    + '</tr>'
+                    + modelsRow;
+            }).join('');
+            bindFreeIPActionButtons();
+        }
+
+        // renderThrottledIPList 渲染「已限流 IP」列表（带 RPM/TPS 与解除按钮）；空列表时隐藏整块。
+        // 关键词: renderThrottledIPList, 已限流 IP 列表, 解除限流
+        function renderThrottledIPList(list) {
+            const wrap = document.getElementById('rl-throttled-ip-wrap');
+            const listEl = document.getElementById('rl-throttled-ip-list');
+            const countEl = document.getElementById('rl-throttled-ip-count');
+            if (!wrap || !listEl) return;
+            if (!list.length) {
+                wrap.style.display = 'none';
+                listEl.innerHTML = '';
+                if (countEl) countEl.textContent = '0';
+                return;
+            }
+            wrap.style.display = 'block';
+            if (countEl) countEl.textContent = String(list.length);
+            listEl.innerHTML = list.map(it => {
+                const ip = escapeHtml(it.ip || '');
+                const rpm = Number(it.rpm) || 0;
+                const tps = Number(it.tps) || 0;
+                const reason = it.reason ? (' · ' + escapeHtml(it.reason)) : '';
+                return '<div style="display:flex; align-items:center; gap:10px; font-size:12px; background:#ffebee; border:1px solid #ffcdd2; border-radius:4px; padding:4px 8px;">'
+                    + '<code style="flex:0 0 auto;">' + ip + '</code>'
+                    + '<span style="color:#555;">RPM ' + rpm + ' · TPS ' + tps + reason + '</span>'
+                    + '<button class="rl-ip-unthrottle-btn btn" data-ip="' + ip + '" style="margin-left:auto; height:24px; font-size:11px; background:#c62828; color:#fff;">解除</button>'
+                    + '</div>';
+            }).join('');
+            bindFreeIPActionButtons();
+        }
+
+        // bindFreeIPActionButtons 给「限流 / 解除」按钮绑定点击事件（用 onclick 赋值，幂等可重复调用）。
+        // 关键词: bindFreeIPActionButtons, 一键限流按钮绑定
+        function bindFreeIPActionButtons() {
+            document.querySelectorAll('.rl-ip-throttle-btn').forEach(function (b) {
+                b.onclick = function () { throttleIP(this.getAttribute('data-ip')); };
+            });
+            document.querySelectorAll('.rl-ip-unthrottle-btn').forEach(function (b) {
+                b.onclick = function () { unthrottleIP(this.getAttribute('data-ip')); };
+            });
+        }
+
+        // throttleIP 一键限流某 IP：后端按配置默认 RPM/TPS 套用。
+        // 关键词: throttleIP, 一键限流 IP 请求
+        async function throttleIP(ip) {
+            if (!ip) return;
+            if (!confirm('确定要限流 IP ' + ip + ' 吗？\n该 IP 的请求频率(RPM)与输出速率(TPS)将被压到配置的默认值，且持久保留直到手动解除。')) return;
+            try {
+                const response = await fetch('/portal/api/throttle-ip', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip: ip })
+                });
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (data.success) {
+                    showToast('已限流 IP ' + ip + '（RPM ' + data.rpm + ' / TPS ' + data.tps + '）', 'success');
+                    loadRateLimitStatus();
+                } else {
+                    showToast(data.error || '限流失败', 'error');
+                }
+            } catch (e) {
+                console.error('throttleIP failed:', e);
+                showToast('限流请求失败', 'error');
+            }
+        }
+
+        // unthrottleIP 解除某 IP 的限流。
+        // 关键词: unthrottleIP, 解除限流请求
+        async function unthrottleIP(ip) {
+            if (!ip) return;
+            if (!confirm('确定要解除对 IP ' + ip + ' 的限流吗？')) return;
+            try {
+                const response = await fetch('/portal/api/unthrottle-ip', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip: ip })
+                });
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (data.success) {
+                    showToast('已解除 IP ' + ip + ' 的限流', 'success');
+                    loadRateLimitStatus();
+                } else {
+                    showToast(data.error || '解除失败', 'error');
+                }
+            } catch (e) {
+                console.error('unthrottleIP failed:', e);
+                showToast('解除限流请求失败', 'error');
+            }
+        }
+
+        // ==================== Memfit Client Version Stats ====================
+        // 关键词: loadClientVersionStats memfit 客户端版本 Top20 渲染
+        function escapeHtml(s) {
+            if (s == null) return '';
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        async function loadClientVersionStats() {
+            const tbody = document.getElementById('rl-client-version-table-body');
+            if (!tbody) return;
+            try {
+                const response = await fetch('/portal/api/client-version-stats?limit=20');
+                if (!response.ok) throw new Error('Failed to fetch client version stats');
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (!data.success) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="padding: 12px; text-align: center; color: #c62828;">加载失败</td></tr>';
+                    return;
+                }
+                const totalEl = document.getElementById('rl-client-version-total');
+                if (totalEl) totalEl.textContent = '共 ' + (data.total || 0) + ' 条';
+                const items = Array.isArray(data.items) ? data.items : [];
+                if (items.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="padding: 12px; text-align: center; color: #999;">暂无 memfit-* 客户端版本上报记录</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = items.map(it => {
+                    const ver = escapeHtml(it.version || '');
+                    const bt = escapeHtml(it.build_time || '');
+                    const fs = escapeHtml(it.first_seen_text || '');
+                    const ls = escapeHtml(it.last_seen_text || '');
+                    const cnt = Number(it.request_count) || 0;
+                    return '<tr>'
+                        + '<td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0;"><code>' + ver + '</code></td>'
+                        + '<td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0; font-family: monospace; color: #555;">' + (bt || '-') + '</td>'
+                        + '<td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0;">' + fs + '</td>'
+                        + '<td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0;">' + ls + '</td>'
+                        + '<td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0; text-align: right;">' + cnt + '</td>'
+                        + '</tr>';
+                }).join('');
+            } catch (error) {
+                console.error('Error loading client version stats:', error);
+                tbody.innerHTML = '<tr><td colspan="5" style="padding: 12px; text-align: center; color: #c62828;">加载失败</td></tr>';
+            }
+        }
+
+        // clearClientVersionStats 二次确认后调用后端清空接口, 成功后刷新表格.
+        // 关键词: clearClientVersionStats, portal 清空客户端版本记录前端
+        async function clearClientVersionStats() {
+            if (!confirm('确认清空所有客户端版本记录？此操作不可恢复（数据会被硬删除）。')) return;
+            try {
+                const response = await fetch('/portal/api/client-version-stats/clear', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'}
+                });
+                if (!response.ok) {
+                    alert('清空失败: HTTP ' + response.status);
+                    return;
+                }
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (!data.success) {
+                    alert('清空失败: ' + (data.error || '未知错误'));
+                    return;
+                }
+                alert('已清空 ' + (data.removed || 0) + ' 条客户端版本记录');
+                loadClientVersionStats();
+            } catch (error) {
+                console.error('clearClientVersionStats failed:', error);
+                alert('清空失败: ' + error);
+            }
+        }
+
+        // ===== Hot-model RPM stats (cross-apiKey aggregated, recent 60s) =====
+        // NOTE: use `var` and a shared threshold helper instead of a
+        // top-level `const` to avoid any TDZ risk (observed in production
+        // when other init paths reach these functions before the declaration
+        // line is executed, e.g. via cached page state).
+        var rateLimitModelStatsTimer = null;
+        function getRateLimitModelMinRPM() { return 3; }
+
+        async function loadRateLimitModelStats() {
+            const tbody = document.getElementById('rl-model-stats-tbody');
+            if (!tbody) return;
+            const minRPM = getRateLimitModelMinRPM();
+            try {
+                const response = await fetch('/portal/api/rate-limit-model-stats?min_rpm=' + minRPM);
+                if (!response.ok) throw new Error('Failed to fetch model RPM stats');
+                const data = await response.json();
+                if (isAuthError(data)) { handleAuthError(); return; }
+                if (!data.success) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="padding: 12px; text-align: center; color: #c62828;">加载失败</td></tr>';
+                    return;
+                }
+                const windowEl = document.getElementById('rl-model-window');
+                if (windowEl && data.window_seconds) windowEl.textContent = data.window_seconds;
+                const minEl = document.getElementById('rl-model-min-rpm');
+                if (minEl && (data.min_rpm || data.min_rpm === 0)) minEl.textContent = data.min_rpm;
+
+                const models = Array.isArray(data.models) ? data.models : [];
+                if (models.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="padding: 12px; text-align: center; color: #999;">当前没有模型 RPM ≥ ' + (data.min_rpm || minRPM) + '</td></tr>';
+                } else {
+                    tbody.innerHTML = models.map(m => {
+                        const effective = Number(m.effective_rpm) || 0;
+                        const rpm = Number(m.rpm) || 0;
+                        let ratioText = '--';
+                        let color = '#555';
+                        if (effective > 0) {
+                            const ratio = rpm / effective;
+                            ratioText = (ratio * 100).toFixed(1) + '%';
+                            if (ratio >= 0.9) color = '#c62828';
+                            else if (ratio >= 0.6) color = '#ef6c00';
+                            else color = '#2e7d32';
+                        }
+                        const modelName = String(m.model == null ? '' : m.model)
+                            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                        return '<tr>' +
+                            '<td style="padding: 8px 10px; border-bottom: 1px solid #f0e4c0; font-family: monospace;">' + modelName + '</td>' +
+                            '<td style="padding: 8px 10px; border-bottom: 1px solid #f0e4c0; text-align: right; font-family: monospace;"><strong>' + rpm + '</strong></td>' +
+                            '<td style="padding: 8px 10px; border-bottom: 1px solid #f0e4c0; text-align: right; font-family: monospace;">' + (effective > 0 ? effective : '--') + '</td>' +
+                            '<td style="padding: 8px 10px; border-bottom: 1px solid #f0e4c0; text-align: right; font-family: monospace; color: ' + color + ';">' + ratioText + '</td>' +
+                            '</tr>';
+                    }).join('');
+                }
+
+                const updatedEl = document.getElementById('rl-model-updated-at');
+                if (updatedEl) {
+                    const now = new Date();
+                    const pad = n => String(n).padStart(2, '0');
+                    updatedEl.textContent = '更新于 ' + pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+                }
+            } catch (error) {
+                console.error('Error loading model RPM stats:', error);
+                if (tbody) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="padding: 12px; text-align: center; color: #c62828;">加载异常: ' + (error.message || 'unknown') + '</td></tr>';
+                }
+            }
+        }
+
+        // Start / stop the 10s auto-refresh based on whether the rate-limit
+        // tab is the active tab. We also stop when the page is hidden so
+        // background tabs don't waste bandwidth.
+        function startRateLimitModelStatsAutoRefresh() {
+            stopRateLimitModelStatsAutoRefresh();
+            loadRateLimitModelStats();
+            rateLimitModelStatsTimer = setInterval(() => {
+                if (document.hidden) return;
+                loadRateLimitModelStats();
+            }, 10000);
+        }
+
+        function stopRateLimitModelStatsAutoRefresh() {
+            if (rateLimitModelStatsTimer) {
+                clearInterval(rateLimitModelStatsTimer);
+                rateLimitModelStatsTimer = null;
+            }
+        }
+
+        // 关键词: renderModelRPMOverrides RPM + 延迟区间 + TPS, 老数据兼容
+        function renderModelRPMOverrides(rpmOverrides, delayOverrides, tpsOverrides) {
+            const container = document.getElementById('rl-model-overrides-list');
+            if (!container) return;
+            container.innerHTML = '';
+            rpmOverrides = rpmOverrides || {};
+            delayOverrides = delayOverrides || {};
+            tpsOverrides = tpsOverrides || {};
+            const modelSet = new Set([
+                ...Object.keys(rpmOverrides),
+                ...Object.keys(delayOverrides),
+                ...Object.keys(tpsOverrides)
+            ]);
+            if (modelSet.size === 0) {
+                container.innerHTML = '<p style="color: #999; font-size: 13px;">暂无模型级覆盖配置。</p>';
+                return;
+            }
+            Array.from(modelSet).sort().forEach((model, idx) => {
+                const rpm = rpmOverrides[model];
+                // 兼容老数据：delayOverrides[m] 可能是数字或 {min,max} 对象。
+                let delayMin = '';
+                let delayMax = '';
+                const raw = delayOverrides[model];
+                if (raw !== undefined && raw !== null) {
+                    if (typeof raw === 'number') {
+                        delayMin = raw;
+                        delayMax = 0;
+                    } else if (typeof raw === 'object') {
+                        if (raw.min !== undefined && raw.min !== null) delayMin = raw.min;
+                        if (raw.max !== undefined && raw.max !== null) delayMax = raw.max;
+                    }
+                }
+                const tps = tpsOverrides[model];
+                appendModelRPMRow(container, model, rpm, delayMin, delayMax, tps, idx);
+            });
+        }
+
+        // 关键词: appendModelRPMRow 5 列布局, 模型/RPM/延迟Min/延迟Max/TPS
+        function appendModelRPMRow(container, model, rpm, delayMin, delayMax, tps, idx) {
+            const row = document.createElement('div');
+            row.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;';
+            row.className = 'rl-model-row';
+            const rpmVal = (rpm === undefined || rpm === null || rpm === '') ? '' : rpm;
+            const delayMinVal = (delayMin === undefined || delayMin === null || delayMin === '') ? '' : delayMin;
+            const delayMaxVal = (delayMax === undefined || delayMax === null || delayMax === '') ? '' : delayMax;
+            const tpsVal = (tps === undefined || tps === null || tps === '') ? '' : tps;
+            row.innerHTML = `
+                <input type="text" class="form-control rl-model-name" value="${model || ''}" placeholder="模型名称（对外）" style="flex: 1; min-width: 180px; font-family: monospace; font-size: 13px; padding: 6px 10px;">
+                <input type="number" class="form-control rl-model-rpm" value="${rpmVal}" placeholder="RPM" min="1" title="模型 RPM 上限（留空使用全局默认）" style="width: 90px; font-family: monospace; font-size: 13px; padding: 6px 10px;">
+                <input type="number" class="form-control rl-model-delay-min" value="${delayMinVal}" placeholder="延迟Min" min="0" title="延迟最小值（秒）；留空使用全局默认" style="width: 100px; font-family: monospace; font-size: 13px; padding: 6px 10px;">
+                <input type="number" class="form-control rl-model-delay-max" value="${delayMaxVal}" placeholder="延迟Max" min="0" title="延迟最大值（秒）；留空或 0 时按老语义 N~2N（N=Min）" style="width: 100px; font-family: monospace; font-size: 13px; padding: 6px 10px;">
+                <input type="number" class="form-control rl-model-tps" value="${tpsVal}" placeholder="TPS" min="0" title="输出 TPS 限速（token/s）；留空或 0 表示不限速" style="width: 90px; font-family: monospace; font-size: 13px; padding: 6px 10px;">
+                <button class="btn btn-danger" onclick="this.parentElement.remove()" style="height: 32px; font-size: 12px; padding: 4px 10px;">删除</button>
+            `;
+            container.appendChild(row);
+        }
+
+        function addModelRPMOverride() {
+            const container = document.getElementById('rl-model-overrides-list');
+            if (!container) return;
+            const placeholder = container.querySelector('p');
+            if (placeholder) placeholder.remove();
+            appendModelRPMRow(container, '', '', '', '', '', container.children.length);
+        }
+
+        // 关键词: collectModelRPMOverrides 收集 RPM + 延迟区间 + TPS
+        function collectModelRPMOverrides() {
+            const rpm = {};
+            const delay = {};
+            const tps = {};
+            document.querySelectorAll('.rl-model-row').forEach(row => {
+                const name = row.querySelector('.rl-model-name').value.trim();
+                if (!name) return;
+                const rpmRaw = row.querySelector('.rl-model-rpm').value;
+                const delayMinRaw = row.querySelector('.rl-model-delay-min').value;
+                const delayMaxRaw = row.querySelector('.rl-model-delay-max').value;
+                const tpsRaw = row.querySelector('.rl-model-tps').value;
+                const rpmVal = parseInt(rpmRaw);
+                if (rpmRaw !== '' && !isNaN(rpmVal) && rpmVal > 0) {
+                    rpm[name] = rpmVal;
+                }
+                const dmin = parseInt(delayMinRaw);
+                const dmax = parseInt(delayMaxRaw);
+                const hasMin = (delayMinRaw !== '' && !isNaN(dmin) && dmin >= 0);
+                const hasMax = (delayMaxRaw !== '' && !isNaN(dmax) && dmax >= 0);
+                if (hasMin || hasMax) {
+                    delay[name] = {
+                        min: hasMin ? dmin : 0,
+                        max: hasMax ? dmax : 0
+                    };
+                }
+                const tpsVal = parseInt(tpsRaw);
+                if (tpsRaw !== '' && !isNaN(tpsVal) && tpsVal > 0) {
+                    tps[name] = tpsVal;
+                }
+            });
+            return { rpm: rpm, delay: delay, tps: tps };
+        }
+
+        // ==================== Lightweight model downgrade rules ====================
+        // 关键词: 模型用途降级规则, tier/from/to, X-Yak-AI-Model-Usage-Type 保护用量
+
+        function renderModelDowngradeRules(rules) {
+            const container = document.getElementById('rl-downgrade-rules-list');
+            if (!container) return;
+            container.innerHTML = '';
+            rules = Array.isArray(rules) ? rules : [];
+            if (rules.length === 0) {
+                container.innerHTML = '<p style="color: #999; font-size: 13px;">暂无降级规则（保存后表示关闭降级）。</p>';
+                return;
+            }
+            rules.forEach((rule, idx) => {
+                const r = rule || {};
+                appendModelDowngradeRow(container, r.tier || '', r.from || '', r.to || '', idx);
+            });
+        }
+
+        // tier 用途类型：空字符串表示「任意」，其余对齐 consts.Tier*。
+        // 关键词: appendModelDowngradeRow tier 下拉, from/to 模型
+        function appendModelDowngradeRow(container, tier, from, to, idx) {
+            const row = document.createElement('div');
+            row.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;';
+            row.className = 'rl-downgrade-row';
+            const tierOptions = [
+                { v: '', label: '任意' },
+                { v: 'lightweight', label: '快速 lightweight' },
+                { v: 'intelligent', label: '高质 intelligent' },
+                { v: 'vision', label: '视觉 vision' }
+            ];
+            const optsHtml = tierOptions.map(function (o) {
+                const sel = (o.v === (tier || '')) ? ' selected' : '';
+                return '<option value="' + o.v + '"' + sel + '>' + o.label + '</option>';
+            }).join('');
+            const fromVal = (from || '').replace(/"/g, '&quot;');
+            const toVal = (to || '').replace(/"/g, '&quot;');
+            row.innerHTML =
+                '<select class="form-control rl-downgrade-tier" title="客户端上报的模型用途类型；任意表示不限 tier" style="width: 160px; font-size: 13px; padding: 6px 10px;">' + optsHtml + '</select>' +
+                '<input type="text" class="form-control rl-downgrade-from" value="' + fromVal + '" placeholder="源模型（对外，如 memfit-standard-free）" style="flex: 1; min-width: 200px; font-family: monospace; font-size: 13px; padding: 6px 10px;">' +
+                '<span style="color: #888; font-size: 13px;">→</span>' +
+                '<input type="text" class="form-control rl-downgrade-to" value="' + toVal + '" placeholder="目标模型（如 memfit-light-free）" style="flex: 1; min-width: 180px; font-family: monospace; font-size: 13px; padding: 6px 10px;">' +
+                '<button class="btn btn-danger" onclick="this.parentElement.remove()" style="height: 32px; font-size: 12px; padding: 4px 10px;">删除</button>';
+            container.appendChild(row);
+        }
+
+        function addModelDowngradeRule() {
+            const container = document.getElementById('rl-downgrade-rules-list');
+            if (!container) return;
+            const placeholder = container.querySelector('p');
+            if (placeholder) placeholder.remove();
+            appendModelDowngradeRow(container, '', '', '', container.children.length);
+        }
+
+        // collectModelDowngradeRules 收集降级规则数组；from/to 任一为空的行被丢弃。
+        // 关键词: collectModelDowngradeRules tier/from/to 数组
+        function collectModelDowngradeRules() {
+            const out = [];
+            document.querySelectorAll('.rl-downgrade-row').forEach(row => {
+                const tier = (row.querySelector('.rl-downgrade-tier').value || '').trim();
+                const from = (row.querySelector('.rl-downgrade-from').value || '').trim();
+                const to = (row.querySelector('.rl-downgrade-to').value || '').trim();
+                if (!from || !to) return;
+                out.push({ tier: tier, from: from, to: to });
+            });
+            return out;
+        }
+
+        // ==================== Free user Token quota model overrides ====================
+        // 关键词: 免费用户 Token 限额 模型覆盖, exempt 复选框
+
+        function renderFreeTokenModelOverrides(overrides) {
+            const container = document.getElementById('rl-free-token-model-overrides-list');
+            if (!container) return;
+            container.innerHTML = '';
+            overrides = overrides || {};
+            const keys = Object.keys(overrides).sort();
+            if (keys.length === 0) {
+                container.innerHTML = '<p style="color: #999; font-size: 13px;">暂无模型级覆盖配置。</p>';
+                return;
+            }
+            keys.forEach((model, idx) => {
+                const ov = overrides[model] || {};
+                appendFreeTokenModelOverrideRow(container, model, ov.limit_m || 0, !!ov.exempt, idx);
+            });
+        }
+
+        function appendFreeTokenModelOverrideRow(container, model, limitM, exempt, idx) {
+            const row = document.createElement('div');
+            row.style.cssText = 'display: flex; gap: 10px; align-items: center; margin-bottom: 8px;';
+            row.className = 'rl-free-token-row';
+            const limitVal = (limitM === undefined || limitM === null || limitM === '') ? '' : limitM;
+            row.innerHTML =
+                '<input type="text" class="form-control rl-free-token-name" value="' + (model || '').replace(/"/g, '&quot;') + '" placeholder="模型名称（对外，例如 memfit-light-free）" style="flex: 1; font-family: monospace; font-size: 13px; padding: 6px 10px;">' +
+                '<input type="number" class="form-control rl-free-token-limit-m" value="' + limitVal + '" placeholder="限额(M)" min="0" title="该模型独立桶限额（M Token）；留空或 0 = 与全局共享池合并" oninput="updateFreeTokenRowRMB(this)" style="width: 130px; font-family: monospace; font-size: 13px; padding: 6px 10px;">' +
+                '<small class="rl-free-token-rmb" title="金额限制：1 RMB = 10M 计费 Token" style="font-size: 11px; color: #1565c0; white-space: nowrap; min-width: 64px;"></small>' +
+                '<label style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: #555; padding: 0 6px; white-space: nowrap;">' +
+                '<input type="checkbox" class="rl-free-token-exempt"' + (exempt ? ' checked' : '') + ' title="勾选表示该模型完全豁免计费（不进入任何桶）"> 不计费' +
+                '</label>' +
+                '<button class="btn btn-danger" onclick="this.parentElement.remove()" style="height: 32px; font-size: 12px; padding: 4px 10px;">删除</button>';
+            container.appendChild(row);
+            // 初始化该行「金额限制」换算提示
+            updateFreeTokenRowRMB(row.querySelector('.rl-free-token-limit-m'));
+        }
+
+        // updateFreeTokenRowRMB 把某个模型级覆盖行的「限额(M)」换算成 RMB 写到同行提示里。
+        // 1 RMB = 10M 计费 Token（BILLING_TOKEN_M_PER_RMB）。0 / 空 = 不显示金额。
+        // 关键词: updateFreeTokenRowRMB, 模型级覆盖金额限制
+        function updateFreeTokenRowRMB(inputEl) {
+            if (!inputEl) return;
+            const row = inputEl.closest ? inputEl.closest('.rl-free-token-row') : null;
+            if (!row) return;
+            const span = row.querySelector('.rl-free-token-rmb');
+            if (!span) return;
+            const m = parseInt(inputEl.value);
+            const mm = isNaN(m) ? 0 : m;
+            span.textContent = mm > 0 ? ('≈ ¥' + (mm / BILLING_TOKEN_M_PER_RMB).toFixed(2)) : '';
+        }
+
+        function addFreeTokenModelOverride() {
+            const container = document.getElementById('rl-free-token-model-overrides-list');
+            if (!container) return;
+            const placeholder = container.querySelector('p');
+            if (placeholder) placeholder.remove();
+            appendFreeTokenModelOverrideRow(container, '', '', false, container.children.length);
+        }
+
+        function collectFreeTokenModelOverrides() {
+            const out = {};
+            document.querySelectorAll('.rl-free-token-row').forEach(row => {
+                const name = row.querySelector('.rl-free-token-name').value.trim();
+                if (!name) return;
+                const limitRaw = row.querySelector('.rl-free-token-limit-m').value;
+                const exempt = row.querySelector('.rl-free-token-exempt').checked;
+                let limitM = parseInt(limitRaw);
+                if (isNaN(limitM) || limitM < 0) limitM = 0;
+                out[name] = { limit_m: limitM, exempt: !!exempt };
+            });
+            return out;
+        }
+
+        // Rate Limit exports
+        window.loadRateLimitConfig = loadRateLimitConfig;
+        window.saveRateLimitConfig = saveRateLimitConfig;
+        window.applyCustom429Default = applyCustom429Default;
+        window.loadRateLimitStatus = loadRateLimitStatus;
+        window.loadRateLimitModelStats = loadRateLimitModelStats;
+        window.startRateLimitModelStatsAutoRefresh = startRateLimitModelStatsAutoRefresh;
+        window.stopRateLimitModelStatsAutoRefresh = stopRateLimitModelStatsAutoRefresh;
+        // memfit-* 客户端版本统计导出
+        // 关键词: window.loadClientVersionStats memfit 客户端版本控流
+        window.loadClientVersionStats = loadClientVersionStats;
+        // 关键词: window.clearClientVersionStats 清空客户端版本记录
+        window.clearClientVersionStats = clearClientVersionStats;
+        window.addModelRPMOverride = addModelRPMOverride;
+        window.addFreeTokenModelOverride = addFreeTokenModelOverride;
+        // 模型用途降级规则导出
+        // 关键词: window.addModelDowngradeRule 轻量降级规则
+        window.addModelDowngradeRule = addModelDowngradeRule;
+
+        // ==================== DAU & Cache Stats ====================
+        // 关键词: DAU 与缓存 tab 渲染, 纯 SVG 折线, 无外部库依赖
+
+        function dauCacheFormatNumber(n) {
+            if (n === null || n === undefined || isNaN(n)) return '0';
+            return Number(n).toLocaleString();
+        }
+
+        function dauCacheFormatRatio(r) {
+            if (r === null || r === undefined || isNaN(r)) return '0.00%';
+            return (r * 100).toFixed(2) + '%';
+        }
+
+        function dauCacheEscapeHtml(s) {
+            if (s === null || s === undefined) return '';
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // drawLineChart 在指定 SVG 节点里绘制多条折线。
+        // series: [{label, color, points:[number,...]}]，所有 series 必须等长。
+        // labels: x 轴对应的字符串（一般为 date），与 points 等长。
+        // 关键词: drawLineChart, 纯 SVG 折线, 自适应坐标
+        function drawLineChart(svgId, series, labels, options) {
+            const svg = document.getElementById(svgId);
+            if (!svg) return;
+            options = options || {};
+            const formatY = options.formatY || dauCacheFormatNumber;
+
+            // 清空旧内容
+            while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+            const vbParts = (svg.getAttribute('viewBox') || '0 0 1200 240').split(/\s+/).map(Number);
+            const W = vbParts[2] || 1200;
+            const H = vbParts[3] || 240;
+            const padL = 60, padR = 140, padT = 20, padB = 30;
+            const innerW = W - padL - padR;
+            const innerH = H - padT - padB;
+
+            const cleanSeries = (series || []).filter(s => s && s.points && s.points.length > 0);
+            if (cleanSeries.length === 0 || (labels || []).length === 0) {
+                const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                t.setAttribute('x', W / 2);
+                t.setAttribute('y', H / 2);
+                t.setAttribute('text-anchor', 'middle');
+                t.setAttribute('fill', '#999');
+                t.setAttribute('font-size', '14');
+                t.textContent = '暂无数据';
+                svg.appendChild(t);
+                return;
+            }
+
+            const n = labels.length;
+            let maxY = 0;
+            cleanSeries.forEach(s => {
+                s.points.forEach(v => {
+                    const num = Number(v) || 0;
+                    if (num > maxY) maxY = num;
+                });
+            });
+            if (maxY <= 0) maxY = 1;
+            // 留 10% 顶部空间
+            const yMax = maxY * 1.1;
+
+            // axis frame
+            const ns = 'http://www.w3.org/2000/svg';
+            const frame = document.createElementNS(ns, 'rect');
+            frame.setAttribute('x', padL);
+            frame.setAttribute('y', padT);
+            frame.setAttribute('width', innerW);
+            frame.setAttribute('height', innerH);
+            frame.setAttribute('fill', 'none');
+            frame.setAttribute('stroke', '#ddd');
+            frame.setAttribute('stroke-width', '1');
+            svg.appendChild(frame);
+
+            // y grid + labels (5 段)
+            for (let i = 0; i <= 4; i++) {
+                const yVal = yMax * (1 - i / 4);
+                const yPos = padT + (innerH * i / 4);
+                const grid = document.createElementNS(ns, 'line');
+                grid.setAttribute('x1', padL);
+                grid.setAttribute('x2', padL + innerW);
+                grid.setAttribute('y1', yPos);
+                grid.setAttribute('y2', yPos);
+                grid.setAttribute('stroke', '#eee');
+                grid.setAttribute('stroke-width', '1');
+                svg.appendChild(grid);
+
+                const lbl = document.createElementNS(ns, 'text');
+                lbl.setAttribute('x', padL - 6);
+                lbl.setAttribute('y', yPos + 4);
+                lbl.setAttribute('text-anchor', 'end');
+                lbl.setAttribute('fill', '#666');
+                lbl.setAttribute('font-size', '11');
+                lbl.textContent = formatY(yVal);
+                svg.appendChild(lbl);
+            }
+
+            // x labels: 首/中/尾 三个
+            const xIdxs = n === 1 ? [0] : [0, Math.floor((n - 1) / 2), n - 1];
+            xIdxs.forEach(idx => {
+                const xPos = n === 1 ? padL + innerW / 2 : padL + (innerW * idx / (n - 1));
+                const t = document.createElementNS(ns, 'text');
+                t.setAttribute('x', xPos);
+                t.setAttribute('y', padT + innerH + 18);
+                t.setAttribute('text-anchor', 'middle');
+                t.setAttribute('fill', '#666');
+                t.setAttribute('font-size', '11');
+                t.textContent = labels[idx] || '';
+                svg.appendChild(t);
+            });
+
+            const xPosOf = (idx) => n === 1 ? padL + innerW / 2 : padL + (innerW * idx / (n - 1));
+            const yPosOf = (val) => padT + innerH * (1 - (Number(val) || 0) / yMax);
+
+            // 折线 + 图例
+            cleanSeries.forEach((s, sIdx) => {
+                const color = s.color || '#4285f4';
+                const points = s.points;
+                let d = '';
+                for (let i = 0; i < points.length; i++) {
+                    const x = xPosOf(i);
+                    const y = yPosOf(points[i]);
+                    d += (i === 0 ? 'M' : 'L') + x.toFixed(2) + ',' + y.toFixed(2) + ' ';
+                }
+                const path = document.createElementNS(ns, 'path');
+                path.setAttribute('d', d.trim());
+                path.setAttribute('fill', 'none');
+                path.setAttribute('stroke', color);
+                path.setAttribute('stroke-width', '1.6');
+                path.setAttribute('stroke-linejoin', 'round');
+                svg.appendChild(path);
+
+                const legendY = padT + 14 + sIdx * 18;
+                const swatch = document.createElementNS(ns, 'rect');
+                swatch.setAttribute('x', padL + innerW + 14);
+                swatch.setAttribute('y', legendY - 8);
+                swatch.setAttribute('width', 12);
+                swatch.setAttribute('height', 12);
+                swatch.setAttribute('fill', color);
+                svg.appendChild(swatch);
+
+                const legendText = document.createElementNS(ns, 'text');
+                legendText.setAttribute('x', padL + innerW + 32);
+                legendText.setAttribute('y', legendY + 2);
+                legendText.setAttribute('fill', '#333');
+                legendText.setAttribute('font-size', '11');
+                legendText.textContent = s.label || ('series ' + (sIdx + 1));
+                svg.appendChild(legendText);
+            });
+        }
+
+        // ============ 模型堆叠图辅助函数 ============
+        // 关键词: dau-cache 模型堆叠, pivotModelTrend, drawStackedAreaChart
+
+        // MODEL_PRIORITY_ORDER 是堆叠/图例的优先级关键字, 命中前缀的模型先排.
+        // 顺序: standard -> basic -> light -> max, 其余按总量降序.
+        // 关键词: MODEL_PRIORITY_ORDER, 模型堆叠优先级 standard basic light max
+        var MODEL_PRIORITY_ORDER = ['standard', 'basic', 'light', 'max'];
+
+        // STACK_COLORS 是堆叠/多线图的默认色板, 与 sidebar 配色协调.
+        // 关键词: STACK_COLORS 模型堆叠色板
+        var STACK_COLORS = [
+            '#1565c0', '#558b2f', '#ef6c00', '#c2185b', '#4527a0', '#00695c',
+            '#f9a825', '#6a1b9a', '#00838f', '#283593', '#bf360c', '#37474f',
+            '#827717', '#ad1457', '#ffb300'
+        ];
+
+        // pickColor 按索引循环取色, 「其他」固定灰色.
+        function pickColor(idx, isOther) {
+            if (isOther) return '#9e9e9e';
+            return STACK_COLORS[idx % STACK_COLORS.length];
+        }
+
+        // modelPriorityRank 返回模型名的优先级 (越小越靠前). 未命中返回 999.
+        // 用小写包含匹配, 兼容 memfit-standard-free / memfit-basic-free 等命名.
+        // 关键词: modelPriorityRank, 模型排序 standard basic light max
+        function modelPriorityRank(name) {
+            var lower = String(name || '').toLowerCase();
+            for (var i = 0; i < MODEL_PRIORITY_ORDER.length; i++) {
+                if (lower.indexOf(MODEL_PRIORITY_ORDER[i]) >= 0) return i;
+            }
+            return 999;
+        }
+
+        // pivotModelTrend 把后端扁平行 [{date, model, <metric>}, ...] 透视成:
+        //   { labels: [date,...]                   // 全 days 日期轴 (升序)
+        //     series: [{label, color, points:[number,...], total}, ...]  // 每模型一条
+        //   }
+        // 处理:
+        //   - 自建 days 长度的日期轴, 缺失日期补 0
+        //   - 模型排序: 先按 MODEL_PRIORITY_ORDER 命中, 然后按 total 降序
+        //   - 超过 topN 的模型并入 "其他"
+        // 关键词: pivotModelTrend, 透视聚合 + 优先级排序 + Top-N 其他
+        function pivotModelTrend(rows, metricKey, options) {
+            options = options || {};
+            var days = options.days || 180;
+            var topN = options.topN || 8;
+            var endDate = options.endDate ? new Date(options.endDate) : new Date();
+
+            // 1. 构造连续日期轴 (从 days-1 天前到 endDate)
+            var labels = [];
+            var dateIdx = {};
+            for (var i = days - 1; i >= 0; i--) {
+                var d = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate() - i);
+                var key = d.getFullYear() + '-' +
+                    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+                    String(d.getDate()).padStart(2, '0');
+                dateIdx[key] = labels.length;
+                labels.push(key);
+            }
+
+            // 2. 透视: model -> points[days]
+            var modelMap = {}; // name -> {points:Array(days).fill(0), total:0}
+            (rows || []).forEach(function (r) {
+                if (!r) return;
+                var name = r.model || '(unknown)';
+                var date = r.date;
+                var idx = dateIdx[date];
+                if (idx === undefined) return;
+                var v = Number(r[metricKey]) || 0;
+                if (!modelMap[name]) {
+                    modelMap[name] = { points: new Array(days).fill(0), total: 0 };
+                }
+                modelMap[name].points[idx] += v;
+                modelMap[name].total += v;
+            });
+
+            // 3. 排序: 优先级在前, 同优先级按 total 降序, 同 total 按名字字典序
+            var allModels = Object.keys(modelMap).map(function (name) {
+                return {
+                    name: name,
+                    total: modelMap[name].total,
+                    points: modelMap[name].points,
+                    rank: modelPriorityRank(name)
+                };
+            }).filter(function (m) { return m.total > 0; }); // 跳过完全 0 的模型
+            allModels.sort(function (a, b) {
+                if (a.rank !== b.rank) return a.rank - b.rank;
+                if (b.total !== a.total) return b.total - a.total;
+                return a.name.localeCompare(b.name);
+            });
+
+            // 4. Top-N 截断 + "其他" 聚合
+            var series = [];
+            var keep = allModels.slice(0, topN);
+            var rest = allModels.slice(topN);
+            keep.forEach(function (m, idx) {
+                series.push({
+                    label: m.name,
+                    color: pickColor(idx, false),
+                    points: m.points,
+                    total: m.total
+                });
+            });
+            if (rest.length > 0) {
+                var merged = new Array(days).fill(0);
+                var mergedTotal = 0;
+                rest.forEach(function (m) {
+                    for (var i = 0; i < days; i++) merged[i] += m.points[i] || 0;
+                    mergedTotal += m.total;
+                });
+                series.push({
+                    label: '其他 (' + rest.length + ' 个模型)',
+                    color: pickColor(0, true),
+                    points: merged,
+                    total: mergedTotal
+                });
+            }
+
+            return { labels: labels, series: series };
+        }
+
+        // drawStackedAreaChart 在 SVG 上绘制线性堆叠面积图.
+        // series 顺序 = 堆叠从底向上的顺序; 同时绘制顶部"总和"线方便读总量.
+        // 关键词: drawStackedAreaChart, 线性堆叠面积图, 纯 SVG
+        function drawStackedAreaChart(svgId, series, labels, options) {
+            var svg = document.getElementById(svgId);
+            if (!svg) return;
+            options = options || {};
+            var formatY = options.formatY || dauCacheFormatNumber;
+
+            while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+            var vb = (svg.getAttribute('viewBox') || '0 0 1400 240').split(/\s+/).map(Number);
+            var W = vb[2] || 1400, H = vb[3] || 240;
+            var padL = 60, padR = 220, padT = 18, padB = 30;
+            var innerW = W - padL - padR;
+            var innerH = H - padT - padB;
+            var ns = 'http://www.w3.org/2000/svg';
+
+            var clean = (series || []).filter(function (s) { return s && s.points && s.points.length > 0; });
+            var n = (labels || []).length;
+            if (clean.length === 0 || n === 0) {
+                var t = document.createElementNS(ns, 'text');
+                t.setAttribute('x', W / 2);
+                t.setAttribute('y', H / 2);
+                t.setAttribute('text-anchor', 'middle');
+                t.setAttribute('fill', '#999');
+                t.setAttribute('font-size', '14');
+                t.textContent = '暂无数据';
+                svg.appendChild(t);
+                return;
+            }
+
+            // 计算每日堆叠总和 (= y 轴最大值参考)
+            var stackTotals = new Array(n).fill(0);
+            clean.forEach(function (s) {
+                for (var i = 0; i < n; i++) stackTotals[i] += (Number(s.points[i]) || 0);
+            });
+            var maxY = 0;
+            for (var i = 0; i < n; i++) { if (stackTotals[i] > maxY) maxY = stackTotals[i]; }
+            if (maxY <= 0) maxY = 1;
+            var yMax = maxY * 1.1;
+
+            // 坐标帧 + 网格 + Y 标签 (5 段)
+            var frame = document.createElementNS(ns, 'rect');
+            frame.setAttribute('x', padL); frame.setAttribute('y', padT);
+            frame.setAttribute('width', innerW); frame.setAttribute('height', innerH);
+            frame.setAttribute('fill', 'none'); frame.setAttribute('stroke', '#ddd');
+            svg.appendChild(frame);
+            for (var g = 0; g <= 4; g++) {
+                var yVal = yMax * (1 - g / 4);
+                var yPos = padT + innerH * g / 4;
+                var grid = document.createElementNS(ns, 'line');
+                grid.setAttribute('x1', padL); grid.setAttribute('x2', padL + innerW);
+                grid.setAttribute('y1', yPos); grid.setAttribute('y2', yPos);
+                grid.setAttribute('stroke', '#eee'); grid.setAttribute('stroke-width', '1');
+                svg.appendChild(grid);
+                var lbl = document.createElementNS(ns, 'text');
+                lbl.setAttribute('x', padL - 6); lbl.setAttribute('y', yPos + 4);
+                lbl.setAttribute('text-anchor', 'end');
+                lbl.setAttribute('fill', '#666'); lbl.setAttribute('font-size', '11');
+                lbl.textContent = formatY(yVal);
+                svg.appendChild(lbl);
+            }
+            // X 标签: 首/四分位/中/三分位/尾 5 个 (长窗口下更易读)
+            var xIdxs = n === 1 ? [0] : [0, Math.floor((n - 1) / 4), Math.floor((n - 1) / 2), Math.floor((n - 1) * 3 / 4), n - 1];
+            xIdxs.forEach(function (idx) {
+                var xPos = n === 1 ? padL + innerW / 2 : padL + innerW * idx / (n - 1);
+                var tt = document.createElementNS(ns, 'text');
+                tt.setAttribute('x', xPos); tt.setAttribute('y', padT + innerH + 18);
+                tt.setAttribute('text-anchor', 'middle');
+                tt.setAttribute('fill', '#666'); tt.setAttribute('font-size', '11');
+                tt.textContent = labels[idx] || '';
+                svg.appendChild(tt);
+            });
+
+            var xPosOf = function (i) { return n === 1 ? padL + innerW / 2 : padL + innerW * i / (n - 1); };
+            var yPosOf = function (v) { return padT + innerH * (1 - (Number(v) || 0) / yMax); };
+
+            // 自底向上累加, 每层用 polygon 填充 (lower-bound 上一层 cumulative).
+            var lower = new Array(n).fill(0);
+            clean.forEach(function (s, sIdx) {
+                var color = s.color || pickColor(sIdx, false);
+                var upper = new Array(n);
+                for (var i = 0; i < n; i++) upper[i] = lower[i] + (Number(s.points[i]) || 0);
+
+                var pts = [];
+                for (var i2 = 0; i2 < n; i2++) {
+                    pts.push(xPosOf(i2).toFixed(2) + ',' + yPosOf(upper[i2]).toFixed(2));
+                }
+                for (var j = n - 1; j >= 0; j--) {
+                    pts.push(xPosOf(j).toFixed(2) + ',' + yPosOf(lower[j]).toFixed(2));
+                }
+                var poly = document.createElementNS(ns, 'polygon');
+                poly.setAttribute('points', pts.join(' '));
+                poly.setAttribute('fill', color);
+                poly.setAttribute('fill-opacity', '0.85');
+                poly.setAttribute('stroke', color);
+                poly.setAttribute('stroke-width', '0.6');
+                poly.setAttribute('stroke-opacity', '0.9');
+                svg.appendChild(poly);
+
+                // 图例: 右侧栏, 显示总量
+                var legendY = padT + 14 + sIdx * 18;
+                if (legendY < padT + innerH - 4) {
+                    var swatch = document.createElementNS(ns, 'rect');
+                    swatch.setAttribute('x', padL + innerW + 14);
+                    swatch.setAttribute('y', legendY - 8);
+                    swatch.setAttribute('width', 12); swatch.setAttribute('height', 12);
+                    swatch.setAttribute('fill', color);
+                    svg.appendChild(swatch);
+                    var lt = document.createElementNS(ns, 'text');
+                    lt.setAttribute('x', padL + innerW + 32);
+                    lt.setAttribute('y', legendY + 2);
+                    lt.setAttribute('fill', '#333');
+                    lt.setAttribute('font-size', '11');
+                    var totalText = s.total != null ? ' (' + dauCacheFormatNumber(s.total) + ')' : '';
+                    lt.textContent = (s.label || ('series ' + (sIdx + 1))) + totalText;
+                    svg.appendChild(lt);
+                }
+
+                lower = upper;
+            });
+
+            // 顶部"总和"虚线 (堆叠最高 = 当日总量)
+            var topPath = '';
+            for (var k = 0; k < n; k++) {
+                topPath += (k === 0 ? 'M' : 'L') + xPosOf(k).toFixed(2) + ',' + yPosOf(stackTotals[k]).toFixed(2) + ' ';
+            }
+            var top = document.createElementNS(ns, 'path');
+            top.setAttribute('d', topPath.trim());
+            top.setAttribute('fill', 'none');
+            top.setAttribute('stroke', '#212121');
+            top.setAttribute('stroke-width', '1');
+            top.setAttribute('stroke-dasharray', '4,3');
+            top.setAttribute('opacity', '0.55');
+            svg.appendChild(top);
+        }
+
+        // formatBytesHuman 把字节数格式化成 KB/MB/GB/TB.
+        // 关键词: formatBytesHuman, dau-cache 磁盘 KPI
+        function formatBytesHuman(n) {
+            n = Number(n) || 0;
+            if (n < 1024) return n + ' B';
+            var units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+            var u = -1;
+            do { n /= 1024; u++; } while (n >= 1024 && u < units.length - 1);
+            return n.toFixed(n >= 10 ? 0 : 1) + ' ' + units[u];
+        }
+
+        // renderDiskCard 渲染顶部信息条的「磁盘可用」KPI 卡。
+        // 主数字 = 可用空间; 副行 = 已用百分比 + 总量; 按已用百分比染色; path 进 title.
+        // 关键词: renderDiskCard, 顶部磁盘 KPI 渲染, disk_info
+        function renderDiskCard(disk) {
+            disk = disk || {};
+            const card = document.getElementById('disk-card');
+            const freeEl = document.getElementById('disk-free-display');
+            const subEl = document.getElementById('disk-sub');
+            if (!card || !freeEl || !subEl) return;
+            if (disk.available) {
+                const usedPct = Number(disk.used_percent) || 0;
+                freeEl.textContent = formatBytesHuman(disk.free || 0);
+                subEl.textContent = '已用 ' + usedPct.toFixed(1) + '% / 总 ' + formatBytesHuman(disk.total || 0);
+                card.title = '路径: ' + (disk.path || '-') +
+                    '\n总: ' + formatBytesHuman(disk.total || 0) +
+                    '\n可用: ' + formatBytesHuman(disk.free || 0) +
+                    '\n已用: ' + formatBytesHuman(disk.used || 0) + ' (' + usedPct.toFixed(2) + '%)';
+                // 按已用百分比染色 (仅染主数字, 卡片底色保持与其他卡一致)
+                let fg = '#2c3e50';
+                if (usedPct >= 90) fg = '#c62828';
+                else if (usedPct >= 75) fg = '#ef6c00';
+                freeEl.style.color = fg;
+            } else {
+                freeEl.textContent = 'N/A';
+                freeEl.style.color = '#999';
+                subEl.textContent = disk.path ? disk.path : '暂不可用';
+                card.title = '磁盘信息暂不可用';
+            }
+        }
+
+        // renderStorageCard 渲染顶部信息条的「存储采集数据」KPI 卡。
+        // 主数字 = 已落盘条数; 副行 = 占用大小; 未启用/未装配时显示「未启用」。
+        // 关键词: renderStorageCard, 顶部存储 KPI 渲染, storage_info
+        function renderStorageCard(storage) {
+            storage = storage || {};
+            const card = document.getElementById('storage-card');
+            const recEl = document.getElementById('storage-records-display');
+            const subEl = document.getElementById('storage-sub');
+            if (!card || !recEl || !subEl) return;
+            if (storage.available) {
+                const records = Number(storage.records) || 0;
+                const bytes = Number(storage.bytes) || 0;
+                recEl.textContent = records.toLocaleString() + ' 条';
+                recEl.style.color = '#1565c0';
+                subEl.textContent = '占用 ' + formatBytesHuman(bytes);
+                card.title = '已采集落盘 ' + records.toLocaleString() + ' 条 / 占用 ' + formatBytesHuman(bytes);
+            } else {
+                recEl.textContent = '未启用';
+                recEl.style.color = '#999';
+                subEl.textContent = '在「流量镜像」中开启落盘';
+                card.title = '数据落盘未启用';
+            }
+        }
+
+        // renderDauCacheTab 把后端 portal data 一次性渲染到 dau-cache tab 的所有节点。
+        // 关键词: renderDauCacheTab, KPI 数字 + 三张折线 + 拆分表
+        function renderDauCacheTab(data) {
+            if (!data) return;
+            const setText = (id, text) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = text;
+            };
+
+            const todayDate = data.today_date || '';
+            setText('dc-date', todayDate);
+
+            const breakdown = data.today_dau_breakdown || {api_key:0, free_trace:0, free_ip:0, total:0};
+            setText('dc-dau-total', dauCacheFormatNumber(breakdown.total || data.today_dau || 0));
+            setText('dc-dau-apikey', dauCacheFormatNumber(breakdown.api_key || 0));
+            setText('dc-dau-trace', dauCacheFormatNumber(breakdown.free_trace || 0));
+            setText('dc-dau-ip', dauCacheFormatNumber(breakdown.free_ip || 0));
+
+            const summaries = data.daily_summary_60_days || [];
+            const todaySummary = summaries.find(s => s.date === todayDate) || {};
+            const todayReqs = todaySummary.total_requests || 0;
+            const totalDauNum = breakdown.total || data.today_dau || 0;
+            setText('dc-req-total', dauCacheFormatNumber(todayReqs));
+            const avg = totalDauNum > 0 ? (todayReqs / totalDauNum) : 0;
+            setText('dc-avg-per-user', avg.toFixed(2));
+
+            const cacheStats = data.today_cache_stats || {};
+            setText('dc-cache-ratio', dauCacheFormatRatio(cacheStats.hit_ratio || 0));
+
+            // 60 天日活折线
+            const dauList = data.dau_60_days || [];
+            const dauLabels = dauList.map(d => d.date);
+            drawLineChart('dc-chart-dau', [
+                {label: 'API Key', color: '#558b2f', points: dauList.map(d => d.api_key || 0)},
+                {label: 'Free Trace', color: '#ef6c00', points: dauList.map(d => d.free_trace || 0)},
+                {label: 'Free IP', color: '#c2185b', points: dauList.map(d => d.free_ip || 0)},
+                {label: 'Total', color: '#1565c0', points: dauList.map(d => d.total || 0)},
+            ], dauLabels);
+
+            // 60 天单用户平均请求折线（需 join summary + dau）
+            const dauByDate = {};
+            dauList.forEach(d => { dauByDate[d.date] = d.total || 0; });
+            const summaryLabels = summaries.map(s => s.date);
+            const avgPoints = summaries.map(s => {
+                const tot = dauByDate[s.date] || 0;
+                return tot > 0 ? ((s.total_requests || 0) / tot) : 0;
+            });
+            drawLineChart('dc-chart-avg', [
+                {label: 'requests / user', color: '#00695c', points: avgPoints},
+            ], summaryLabels, {formatY: v => Number(v).toFixed(2)});
+
+            // ============ 180 天按模型堆叠图 ============
+            // 关键词: dau-cache 180 天堆叠图渲染, model_trend_180_days
+            const modelRows = data.model_trend_180_days || [];
+            const tokenStack = pivotModelTrend(modelRows, 'total_tokens', {days: 180, topN: 8, endDate: todayDate});
+            drawStackedAreaChart('dc-chart-token-stack', tokenStack.series, tokenStack.labels);
+
+            const reqStack = pivotModelTrend(modelRows, 'request_count', {days: 180, topN: 8, endDate: todayDate});
+            drawStackedAreaChart('dc-chart-req-stack', reqStack.series, reqStack.labels);
+
+            const promptStack = pivotModelTrend(modelRows, 'prompt_tokens', {days: 180, topN: 8, endDate: todayDate});
+            drawStackedAreaChart('dc-chart-prompt-stack', promptStack.series, promptStack.labels);
+
+            // 60 天缓存命中比例: 平均线 + 每模型命中比例多线 (取近 60 天窗口的同一份 modelRows 透视)
+            // 关键词: dau-cache 缓存命中多线, 平均 + per-model hit ratio
+            const trend = data.cache_trend_60_days || [];
+            const trendLabels = trend.map(t => t.date);
+            const promptPivot60 = pivotModelTrend(modelRows, 'prompt_tokens', {days: 60, topN: 6, endDate: todayDate});
+            const cachedPivot60 = pivotModelTrend(modelRows, 'cached_tokens', {days: 60, topN: 6, endDate: todayDate});
+            // 用同样的模型集合 (以 prompt 为准) 求 cached/prompt 比例点
+            const cachedByModel = {};
+            cachedPivot60.series.forEach(s => { cachedByModel[s.label] = s.points; });
+            const cacheSeries = [
+                {label: 'avg hit ratio', color: '#212121', points: trend.map(t => t.hit_ratio || 0)},
+            ];
+            promptPivot60.series.forEach((s, i) => {
+                const cp = cachedByModel[s.label] || [];
+                const ratios = s.points.map((p, idx) => {
+                    const c = Number(cp[idx]) || 0;
+                    return p > 0 ? (c / p) : 0;
+                });
+                cacheSeries.push({label: s.label, color: pickColor(i, s.label.indexOf('其他') === 0), points: ratios});
+            });
+            drawLineChart('dc-chart-cache', cacheSeries, promptPivot60.labels, {
+                formatY: v => (v * 100).toFixed(2) + '%'
+            });
+
+            // 今日拆分表
+            const tbody = document.getElementById('dc-breakdown-body');
+            if (tbody) {
+                const rows = data.today_cache_breakdown || [];
+                if (rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="9" style="padding: 12px; text-align: center; color: #999;">今日尚无 usage 数据</td></tr>';
+                } else {
+                    tbody.innerHTML = rows.map(r => `
+                        <tr>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0;">${dauCacheEscapeHtml(r.wrapper_name)}</td>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0;">${dauCacheEscapeHtml(r.model_name)}</td>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0;">${dauCacheEscapeHtml(r.provider_type_name)}</td>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0;">${dauCacheEscapeHtml(r.provider_domain)}</td>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0; font-family: monospace;">${dauCacheEscapeHtml(r.api_key_shrink)}</td>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0; text-align: right;">${dauCacheFormatNumber(r.request_count)}</td>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0; text-align: right;">${dauCacheFormatNumber(r.prompt_tokens)}</td>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0; text-align: right;">${dauCacheFormatNumber(r.cached_tokens)}</td>
+                            <td style="padding: 6px 10px; border-bottom: 1px solid #f0f0f0; text-align: right;">${dauCacheFormatRatio(r.hit_ratio)}</td>
+                        </tr>
+                    `).join('');
+                }
+            }
+        }
+
+        // refreshDauCacheTab 主动重新拉一次 portal data 并仅刷新 dau-cache 视图。
+        // 关键词: refreshDauCacheTab, tab 切到日活与缓存时主动拉新
+        async function refreshDauCacheTab() {
+            try {
+                const response = await authFetch('/portal/api/data');
+                if (!response) return;
+                const data = await response.json();
+                if (checkAuthInResponse(data)) return;
+                portalData = data;
+                renderDauCacheTab(data);
+                const todayDauEl = document.getElementById('stat-today-dau');
+                if (todayDauEl) {
+                    todayDauEl.textContent = (data.today_dau || 0).toLocaleString();
+                }
+            } catch (e) {
+                console.error('refreshDauCacheTab failed:', e);
+            }
+        }
+
+        // ==================== 图表点击放大 (lightbox) ====================
+        // 把被点图表盒子内的 SVG 克隆进放大弹窗, 设为 100% 充满, 标题取同格的标题.
+        // 克隆而非移动: 原图保持不动, 关闭弹窗直接清空克隆即可.
+        // 关键词: enlargeChart 图表放大, closeChartZoom, chart-zoom-modal lightbox
+        function enlargeChart(box) {
+            if (!box) return;
+            const svg = box.querySelector('svg');
+            const modal = document.getElementById('chart-zoom-modal');
+            const body = document.getElementById('chart-zoom-body');
+            const titleEl = document.getElementById('chart-zoom-title');
+            if (!svg || !modal || !body) return;
+            // 标题: 同 cell 内的 .dc-chart-title 文本
+            let title = '图表';
+            const cell = box.closest('.dc-chart-cell');
+            if (cell) {
+                const t = cell.querySelector('.dc-chart-title');
+                if (t) title = t.textContent.trim();
+            }
+            if (titleEl) titleEl.textContent = title;
+            // 克隆并放大: 去掉固定 height, 由 CSS 充满弹窗
+            const clone = svg.cloneNode(true);
+            clone.setAttribute('width', '100%');
+            clone.setAttribute('height', '100%');
+            body.innerHTML = '';
+            body.appendChild(clone);
+            modal.classList.add('open');
+        }
+
+        function closeChartZoom(evt) {
+            // 点遮罩或关闭按钮才关; 点内容区 (inner) 已 stopPropagation
+            const modal = document.getElementById('chart-zoom-modal');
+            if (!modal) return;
+            modal.classList.remove('open');
+            const body = document.getElementById('chart-zoom-body');
+            if (body) body.innerHTML = '';
+        }
+
+        // 事件委托: 点击任意 .dc-chart-box 触发放大 (图表会被重绘, 委托更稳妥)
+        document.addEventListener('click', function (e) {
+            const box = e.target.closest && e.target.closest('.dc-chart-box');
+            if (box) enlargeChart(box);
+        });
+        // Esc 关闭放大弹窗
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') closeChartZoom();
+        });
+
+        window.enlargeChart = enlargeChart;
+        window.closeChartZoom = closeChartZoom;
+        window.drawLineChart = drawLineChart;
+        window.drawStackedAreaChart = drawStackedAreaChart;
+        window.pivotModelTrend = pivotModelTrend;
+        window.formatBytesHuman = formatBytesHuman;
+        window.renderDiskCard = renderDiskCard;
+        window.renderStorageCard = renderStorageCard;
+        window.renderDauCacheTab = renderDauCacheTab;
+        window.refreshDauCacheTab = refreshDauCacheTab;
+
+        // ==================== Mirror Rules 管理 ====================
+        // 关键词: MirrorMgmt UI, mirror rules portal frontend, AiMirrorRule CRUD,
+        //         window scope assignment, IIFE 立即写 window 防 TDZ
+        //
+        // 设计:
+        //  - 单例对象, 状态 (cache / edit) 都挂在 MirrorMgmt 上, 避免全局变量污染.
+        //  - fetch 调用都加 same-origin, 错误统一 toast.
+        //  - 试运行结果直接渲染到弹窗内的结果区, 不另开浮层.
+        //  - 直接 window.MirrorMgmt = (...)() 不使用 const, 这样:
+        //      a) HTML inline onclick="MirrorMgmt..." 立刻能解析到 (走 window)
+        //      b) 其他代码 typeof MirrorMgmt 不会因 const TDZ 抛错
+        //      c) 这块 IIFE 出错或前面 top-level 中断时, window.MirrorMgmt 仍为 undefined
+        //         而不是处于 "已声明未初始化" 的死状态
+        window.MirrorMgmt = (function() {
+            const condLabels = {
+                'always':                '每次请求',
+                'action_eq':             '@action 等于',
+                'any_toolcall':          '任意 tool_calls',
+                'action_call_tool_eq':   '@action+工具名',
+            };
+            // fallbackDefaultScript: 当 /portal/api/mirror-rules/_meta 拉取失败时的最后一道兜底.
+            // 真实的默认脚本由后端 DefaultMirrorScript() 提供 (含 if YAK_MAIN 自测块).
+            // 关键词: mirror fallback default script, _meta 拉取失败兜底
+            const fallbackDefaultScript = [
+                '// aibalance mirror callback (fallback template).',
+                '// 关键词: aibalance mirror callback, handle(data) entry',
+                'func handle(data) {',
+                '    log.info(sprint("mirror got req: model=%v action=%v dur=%vms",',
+                '        data.model, data.action, data["duration_ms"]))',
+                '}',
+                '',
+                'if YAK_MAIN {',
+                '    handle({"req_id": "local-test", "model": "demo", "action": ""})',
+                '}',
+                ''
+            ].join('\n');
+
+            const state = {
+                cache: [],
+                meta: null,       // { default_script, data_spec, condition_types }
+                metaLoading: null // in-flight promise, 防止并发重复拉取
+            };
+
+            // ensureMeta 把 _meta 接口结果缓存到 state.meta, 并按需懒加载.
+            // 关键词: ensureMeta, mirror meta 懒加载缓存, default_script data_spec
+            async function ensureMeta() {
+                if (state.meta) return state.meta;
+                if (state.metaLoading) return state.metaLoading;
+                state.metaLoading = (async () => {
+                    try {
+                        const resp = await fetch('/portal/api/mirror-rules/_meta', {credentials: 'same-origin'});
+                        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                        const j = await resp.json();
+                        state.meta = {
+                            default_script: j.default_script || fallbackDefaultScript,
+                            data_spec:      Array.isArray(j.data_spec) ? j.data_spec : [],
+                            condition_types: Array.isArray(j.condition_types) ? j.condition_types : [],
+                        };
+                    } catch (e) {
+                        console.warn('mirror: load meta failed, use fallback', e);
+                        state.meta = {
+                            default_script: fallbackDefaultScript,
+                            data_spec: [],
+                            condition_types: [],
+                        };
+                    } finally {
+                        state.metaLoading = null;
+                    }
+                    return state.meta;
+                })();
+                return state.metaLoading;
+            }
+
+            function getDefaultScript() {
+                return (state.meta && state.meta.default_script) || fallbackDefaultScript;
+            }
+
+            // renderDataSpec 把后端给的 spec 渲染到弹窗右侧的帮助面板.
+            // 关键词: renderDataSpec, mirror data spec 字段表渲染
+            function renderDataSpec() {
+                const host = document.getElementById('mirrorDataSpecHost');
+                if (!host) return;
+                const spec = (state.meta && state.meta.data_spec) || [];
+                if (!spec.length) {
+                    host.innerHTML = '<div style="color:#888; padding:12px; font-size:12px;">未获取到字段说明.</div>';
+                    return;
+                }
+                const html = spec.map(f => {
+                    const name = escapeHtml(f.name || '');
+                    const type = escapeHtml(f.type || '');
+                    const desc = escapeHtml(f.description || '');
+                    const example = escapeHtml(f.example || '');
+                    return `<div class="mirror-spec-entry">
+                        <div class="mirror-spec-entry-head">
+                            <span class="mirror-spec-name">${name}</span>
+                            <span class="mirror-spec-type">${type}</span>
+                        </div>
+                        <div class="mirror-spec-desc">${desc}</div>
+                        ${example ? `<div class="mirror-spec-example">${example}</div>` : ''}
+                    </div>`;
+                }).join('');
+                host.innerHTML = html;
+            }
+
+            async function refresh() {
+                try {
+                    const resp = await fetch('/portal/api/mirror-rules', {credentials: 'same-origin'});
+                    if (!resp.ok) {
+                        throw new Error('HTTP ' + resp.status);
+                    }
+                    const j = await resp.json();
+                    state.cache = j.rules || [];
+                    renderTable(state.cache);
+                    renderKpi(state.cache);
+                } catch (e) {
+                    console.error('mirror: refresh failed', e);
+                    showToast('加载镜像规则失败: ' + (e.message || e), 'error');
+                }
+                // 顺带刷新落盘设置与实时用量。
+                loadStorageConfig();
+            }
+
+            // GiB 与字节互转辅助 (1 GiB = 1<<30)。
+            const GIB = 1024 * 1024 * 1024;
+            function fmtBytes(n) {
+                n = Number(n) || 0;
+                if (n >= GIB) return (n / GIB).toFixed(2) + ' GiB';
+                if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(2) + ' MiB';
+                if (n >= 1024) return (n / 1024).toFixed(2) + ' KiB';
+                return n + ' B';
+            }
+
+            // loadStorageConfig 读取落盘配置 + 实时计数, 填充到 mirror tab 的「数据落盘设置」卡。
+            // 关键词: loadStorageConfig, 落盘配置读取
+            async function loadStorageConfig() {
+                try {
+                    const resp = await fetch('/portal/api/mirror-storage-config', {credentials: 'same-origin'});
+                    if (!resp.ok) return;
+                    const j = await resp.json();
+                    if (!j || !j.success) return;
+                    const en = document.getElementById('mirror-storage-enabled');
+                    if (en) en.checked = !!j.enabled;
+                    const maxEl = document.getElementById('mirror-storage-max-gib');
+                    if (maxEl) maxEl.value = ((Number(j.max_bytes) || 0) / GIB).toFixed(2);
+                    const recEl = document.getElementById('mirror-storage-reclaim-gib');
+                    if (recEl) recEl.value = ((Number(j.reclaim_bytes) || 0) / GIB).toFixed(2);
+                    const secEl = document.getElementById('mirror-storage-check-sec');
+                    if (secEl) secEl.value = Number(j.check_interval_sec) || 60;
+                    const recordsEl = document.getElementById('mirror-storage-records');
+                    if (recordsEl) recordsEl.textContent = (Number(j.records) || 0).toLocaleString();
+                    const bytesEl = document.getElementById('mirror-storage-bytes');
+                    if (bytesEl) bytesEl.textContent = fmtBytes(j.bytes);
+                } catch (e) {
+                    console.error('mirror: loadStorageConfig failed', e);
+                }
+            }
+
+            // saveStorageConfig 保存落盘配置 (GiB 转字节后提交)。
+            // 关键词: saveStorageConfig, 落盘配置保存
+            async function saveStorageConfig() {
+                const en = document.getElementById('mirror-storage-enabled');
+                const maxEl = document.getElementById('mirror-storage-max-gib');
+                const recEl = document.getElementById('mirror-storage-reclaim-gib');
+                const secEl = document.getElementById('mirror-storage-check-sec');
+                const maxGib = parseFloat(maxEl && maxEl.value) || 0;
+                const recGib = parseFloat(recEl && recEl.value) || 0;
+                const sec = parseInt(secEl && secEl.value, 10) || 0;
+                const body = {
+                    enabled: !!(en && en.checked),
+                    max_bytes: Math.round(maxGib * GIB),
+                    reclaim_bytes: Math.round(recGib * GIB),
+                    check_interval_sec: sec,
+                };
+                try {
+                    const resp = await fetch('/portal/api/mirror-storage-config', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        credentials: 'same-origin',
+                        body: JSON.stringify(body),
+                    });
+                    const j = await resp.json();
+                    if (isAuthError(j)) { handleAuthError(); return; }
+                    if (j && j.success) {
+                        showToast('落盘设置已保存', 'success');
+                        loadStorageConfig();
+                    } else {
+                        showToast((j && (j.message || j.error)) || '保存失败', 'error');
+                    }
+                } catch (e) {
+                    console.error('mirror: saveStorageConfig failed', e);
+                    showToast('保存落盘设置失败', 'error');
+                }
+            }
+
+            function renderKpi(rules) {
+                let enabled = 0, total = 0, success = 0, failDrop = 0;
+                rules.forEach(r => {
+                    if (r.enabled) enabled++;
+                    total += r.total_triggered || 0;
+                    success += r.total_success || 0;
+                    failDrop += (r.total_failed || 0) + (r.total_dropped || 0);
+                });
+                const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v.toLocaleString(); };
+                set('mirror-enabled-count', enabled);
+                set('mirror-total-triggered', total);
+                set('mirror-total-success', success);
+                set('mirror-total-fail-drop', failDrop);
+            }
+
+            function renderTable(rules) {
+                const tbody = document.getElementById('mirror-rules-tbody');
+                if (!tbody) return;
+                if (!rules.length) {
+                    tbody.innerHTML = '<tr><td colspan="9" style="padding: 14px; text-align: center; color: #999;">尚未配置任何镜像规则.</td></tr>';
+                    return;
+                }
+                const rows = rules.map(r => {
+                    const condText = (condLabels[r.condition_type] || r.condition_type) +
+                        (r.action_name ? ' [' + escapeHtml(r.action_name) + ']' : '') +
+                        (r.tool_name ? ' / tool=' + escapeHtml(r.tool_name) : '');
+                    const stats = `${r.total_triggered || 0} / ${r.total_success || 0} / ${r.total_failed || 0} / ${r.total_dropped || 0}`;
+                    const queueState = `${r.queue_length || 0} / ${r.queue_capacity || r.queue_size || 0}`;
+                    const last = r.last_triggered_at || '-';
+                    const enabledHtml = r.enabled
+                        ? '<span class="mirror-status-badge enabled">已启用</span>'
+                        : '<span class="mirror-status-badge disabled">已禁用</span>';
+                    return `
+                        <tr>
+                            <td>${r.id}</td>
+                            <td>${escapeHtml(r.name || '')}</td>
+                            <td>${enabledHtml}</td>
+                            <td>${condText}</td>
+                            <td>${r.concurrency}</td>
+                            <td><span class="mirror-stats-mini">${queueState}</span></td>
+                            <td><span class="mirror-stats-mini">${stats}</span></td>
+                            <td>${escapeHtml(last)}</td>
+                            <td>
+                                <button class="btn btn-sm" onclick="MirrorMgmt.openEditModal(${r.id})">编辑</button>
+                                <button class="btn btn-sm" onclick="MirrorMgmt.toggle(${r.id}, ${!r.enabled})">${r.enabled ? '停用' : '启用'}</button>
+                                <button class="btn btn-sm" onclick="MirrorMgmt.viewLogs(${r.id})">日志</button>
+                                <button class="btn btn-sm btn-danger" onclick="MirrorMgmt.del(${r.id})">删除</button>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+                tbody.innerHTML = rows;
+            }
+
+            function escapeHtml(s) {
+                return String(s == null ? '' : s)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
+
+            function showToast(msg, type) {
+                if (typeof window.showToast === 'function') {
+                    window.showToast(msg, type || 'info');
+                } else {
+                    console.log('[toast]', msg);
+                }
+            }
+
+            async function openCreateModal() {
+                await ensureMeta();
+                fillModal({
+                    id: 0,
+                    name: '',
+                    enabled: true,
+                    condition_type: 'always',
+                    action_name: '',
+                    tool_name: '',
+                    callback_script: getDefaultScript(),
+                    concurrency: 4,
+                    queue_size: 1024,
+                    timeout_ms: 30000,
+                });
+                document.getElementById('mirrorRuleModalTitle').textContent = '新增镜像规则';
+                document.getElementById('mirrorRuleModal').style.display = 'flex';
+                renderDataSpec();
+            }
+
+            async function openEditModal(id) {
+                const r = state.cache.find(x => x.id === id);
+                if (!r) {
+                    showToast('未找到规则 id=' + id, 'error');
+                    return;
+                }
+                await ensureMeta();
+                fillModal(r);
+                document.getElementById('mirrorRuleModalTitle').textContent = '编辑镜像规则 #' + id;
+                document.getElementById('mirrorRuleModal').style.display = 'flex';
+                renderDataSpec();
+            }
+
+            // resetToDefaultScript 让用户一键把脚本恢复成后端定义的默认模板.
+            // 关键词: resetToDefaultScript, mirror 脚本恢复默认
+            async function resetToDefaultScript() {
+                await ensureMeta();
+                if (!confirm('确定要把当前脚本恢复成默认模板吗? 此操作会覆盖现有内容.')) return;
+                document.getElementById('mirrorRuleScript').value = getDefaultScript();
+            }
+
+            function fillModal(r) {
+                document.getElementById('mirrorRuleId').value = r.id || 0;
+                document.getElementById('mirrorRuleName').value = r.name || '';
+                document.getElementById('mirrorRuleEnabled').checked = !!r.enabled;
+                document.getElementById('mirrorRuleCondition').value = r.condition_type || 'always';
+                document.getElementById('mirrorRuleAction').value = r.action_name || '';
+                document.getElementById('mirrorRuleTool').value = r.tool_name || '';
+                document.getElementById('mirrorRuleScript').value = r.callback_script || getDefaultScript();
+                document.getElementById('mirrorRuleConcurrency').value = r.concurrency || 4;
+                document.getElementById('mirrorRuleQueueSize').value = r.queue_size || 1024;
+                document.getElementById('mirrorRuleTimeoutMs').value = r.timeout_ms || 30000;
+                const resultEl = document.getElementById('mirrorRuleTestResult');
+                if (resultEl) { resultEl.style.display = 'none'; resultEl.innerHTML = ''; resultEl.className = 'mirror-test-result'; }
+                onConditionChange();
+            }
+
+            function closeModal() {
+                document.getElementById('mirrorRuleModal').style.display = 'none';
+            }
+
+            // onConditionChange 根据条件类型切换可见字段, 同时根据语义动态更新
+            // Action 字段的 (必填/可选) 标签 + placeholder + 帮助文案.
+            //
+            // 语义:
+            //   action_eq            => Action 名称 *必填* (规则核心)
+            //   action_call_tool_eq  => Action 名称 *可选过滤器*, 留空匹配三种 call-tool 类
+            //                          (call-tool / directly_call_tool / require_tool)
+            //
+            // 关键词: mirror onConditionChange, Action 名称 必填/可选 切换,
+            //        action_call_tool_eq 可选过滤器 UI 提示
+            function onConditionChange() {
+                const cond = document.getElementById('mirrorRuleCondition').value;
+                const showAction = (cond === 'action_eq' || cond === 'action_call_tool_eq');
+                const showTool   = (cond === 'action_call_tool_eq');
+                document.querySelectorAll('.mirror-cond-action').forEach(el => el.style.display = showAction ? '' : 'none');
+                document.querySelectorAll('.mirror-cond-tool').forEach(el => el.style.display = showTool ? '' : 'none');
+
+                const actionInput = document.getElementById('mirrorRuleAction');
+                const actionHint  = document.getElementById('mirrorRuleActionLabelHint');
+                const actionHelp  = document.getElementById('mirrorRuleActionHelp');
+                if (!actionInput || !actionHint || !actionHelp) return;
+
+                if (cond === 'action_eq') {
+                    actionHint.textContent = '* 必填';
+                    actionHint.className = 'mirror-label-hint required';
+                    actionInput.placeholder = '例如: directly_answer / call-tool / require_tool';
+                    actionHelp.innerHTML = '必填: 完全匹配响应中解析出的 <code>@action</code> 字段.';
+                } else if (cond === 'action_call_tool_eq') {
+                    actionHint.textContent = '(可选过滤器)';
+                    actionHint.className = 'mirror-label-hint optional';
+                    actionInput.placeholder = '留空 = 三种 call-tool 类全匹配; 填了 = 只匹配该 action';
+                    actionHelp.innerHTML = '可选: 留空时, <code>call-tool</code> / <code>directly_call_tool</code> / <code>require_tool</code> 三种 action 都会被通配; 填了则只精确匹配该 action.';
+                } else {
+                    actionHint.textContent = '';
+                    actionHint.className = 'mirror-label-hint';
+                    actionInput.placeholder = '';
+                    actionHelp.innerHTML = '';
+                }
+            }
+
+            function collectFormPayload() {
+                return {
+                    name: document.getElementById('mirrorRuleName').value.trim(),
+                    enabled: document.getElementById('mirrorRuleEnabled').checked,
+                    condition_type: document.getElementById('mirrorRuleCondition').value,
+                    action_name: document.getElementById('mirrorRuleAction').value.trim(),
+                    tool_name: document.getElementById('mirrorRuleTool').value.trim(),
+                    callback_script: document.getElementById('mirrorRuleScript').value,
+                    concurrency: parseInt(document.getElementById('mirrorRuleConcurrency').value || '4', 10),
+                    queue_size: parseInt(document.getElementById('mirrorRuleQueueSize').value || '1024', 10),
+                    timeout_ms: parseInt(document.getElementById('mirrorRuleTimeoutMs').value || '30000', 10),
+                };
+            }
+
+            async function save() {
+                const id = parseInt(document.getElementById('mirrorRuleId').value || '0', 10);
+                const payload = collectFormPayload();
+                if (!payload.name) {
+                    showToast('名称必填', 'error');
+                    return;
+                }
+                if (!payload.callback_script.trim()) {
+                    showToast('回调脚本必填', 'error');
+                    return;
+                }
+                try {
+                    let resp;
+                    if (id > 0) {
+                        resp = await fetch('/portal/api/mirror-rules/' + id, {
+                            method: 'PUT',
+                            credentials: 'same-origin',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(payload),
+                        });
+                    } else {
+                        resp = await fetch('/portal/api/mirror-rules', {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(payload),
+                        });
+                    }
+                    const j = await resp.json();
+                    if (!resp.ok || j.error) {
+                        throw new Error(j.error || ('HTTP ' + resp.status));
+                    }
+                    showToast(id > 0 ? '已更新' : '已创建', 'success');
+                    closeModal();
+                    refresh();
+                } catch (e) {
+                    showToast('保存失败: ' + (e.message || e), 'error');
+                }
+            }
+
+            async function toggle(id, enabled) {
+                try {
+                    const resp = await fetch('/portal/api/mirror-rules/' + id + '/toggle', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({enabled: enabled}),
+                    });
+                    const j = await resp.json();
+                    if (!resp.ok || j.error) {
+                        throw new Error(j.error || ('HTTP ' + resp.status));
+                    }
+                    showToast(enabled ? '已启用' : '已禁用', 'success');
+                    refresh();
+                } catch (e) {
+                    showToast('切换失败: ' + (e.message || e), 'error');
+                }
+            }
+
+            async function del(id) {
+                if (!confirm('确定要删除该镜像规则 (id=' + id + ')?')) return;
+                try {
+                    const resp = await fetch('/portal/api/mirror-rules/' + id, {
+                        method: 'DELETE',
+                        credentials: 'same-origin',
+                    });
+                    const j = await resp.json();
+                    if (!resp.ok || j.error) {
+                        throw new Error(j.error || ('HTTP ' + resp.status));
+                    }
+                    showToast('已删除', 'success');
+                    refresh();
+                } catch (e) {
+                    showToast('删除失败: ' + (e.message || e), 'error');
+                }
+            }
+
+            // fmtSaveBytes 把字节数格式化为人类可读单位 (B/KiB/MiB).
+            function fmtSaveBytes(n) {
+                n = Number(n) || 0;
+                if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(2) + ' MiB';
+                if (n >= 1024) return (n / 1024).toFixed(2) + ' KiB';
+                return n + ' B';
+            }
+
+            // renderTestSaveBlock 渲染试运行里 save() 的调用反馈块:
+            //   - 没调 save(): 中性提示。
+            //   - 调了但落盘未启用: 黄色提示 (生产也不会落盘, 引导去开启)。
+            //   - 调了且已启用: 绿色提示 (生产会落盘, 试运行本身不写)。
+            // 关键词: renderTestSaveBlock, save 试运行反馈
+            function renderTestSaveBlock(j) {
+                const calls = Number(j.save_calls) || 0;
+                const bytes = Number(j.save_bytes) || 0;
+                const enabled = !!j.save_enabled;
+                if (calls === 0) {
+                    return '<div class="mirror-test-save" style="border-left-color:#64748b;">'
+                        + '<div style="color:#94a3b8;">save(): 本次脚本未调用 save()，不会落盘归档。</div>'
+                        + '</div>';
+                }
+                const head = enabled
+                    ? '<span style="color:#34d399; font-weight:600;">save() 已调用 ' + calls + ' 次</span> <span style="color:#cbd5e1;">将写入 ' + escapeHtml(fmtSaveBytes(bytes)) + '</span> <span style="color:#94a3b8;">(试运行不实际写盘)</span>'
+                    : '<span style="color:#fbbf24; font-weight:600;">save() 已调用 ' + calls + ' 次</span> <span style="color:#cbd5e1;">将写入 ' + escapeHtml(fmtSaveBytes(bytes)) + '</span>';
+                const hint = enabled
+                    ? '<div style="color:#94a3b8; font-size:11px; margin-top:2px;">落盘已启用：生产环境命中此规则时会把内容写入归档。</div>'
+                    : '<div style="color:#fbbf24; font-size:11px; margin-top:2px;">注意：落盘当前<strong>未启用</strong>，生产环境也不会真正写入。请到「流量镜像 → 数据落盘设置」勾选「启用 save() 落盘」。</div>';
+                let preview = '';
+                if (j.save_preview) {
+                    preview = '<div style="color:#94a3b8; font-size:11px; margin-top:6px;">// save() 首次写入内容预览:</div>'
+                        + '<pre class="mirror-test-save-preview">' + escapeHtml(j.save_preview) + '</pre>';
+                }
+                const border = enabled ? '#34d399' : '#fbbf24';
+                return '<div class="mirror-test-save" style="border-left-color:' + border + ';">'
+                    + '<div>' + head + '</div>' + hint + preview
+                    + '</div>';
+            }
+
+            // testCurrent 调用后端 /test 接口同步跑一次脚本, 把结果按 success/fail
+            // 分别用绿色/红色头条 + JSON body 渲染. 关键词: mirror testCurrent, 试运行结果美化
+            async function testCurrent() {
+                const id = parseInt(document.getElementById('mirrorRuleId').value || '0', 10);
+                const payload = collectFormPayload();
+                const url = '/portal/api/mirror-rules/' + (id > 0 ? id : '0') + '/test';
+                const resultEl = document.getElementById('mirrorRuleTestResult');
+                if (resultEl) {
+                    resultEl.style.display = '';
+                    resultEl.className = 'mirror-test-result';
+                    resultEl.innerHTML = '<div class="mirror-test-result-head"><span style="color:#fbbf24;">Running...</span></div>';
+                }
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            script: payload.callback_script,
+                            snapshot: {}
+                        }),
+                    });
+                    const j = await resp.json();
+                    if (!resultEl) return;
+                    const executed = !!j.executed;
+                    const dur = (j.duration_ms == null ? '-' : j.duration_ms) + ' ms';
+                    const tag = executed
+                        ? '<span class="mirror-test-status-ok">SUCCESS</span>'
+                        : '<span class="mirror-test-status-fail">FAILED</span>';
+                    const errLine = j.error
+                        ? '<div style="color:#f87171; margin-bottom:6px;">error: ' + escapeHtml(j.error) + '</div>'
+                        : '';
+                    const snapText = j.snapshot ? JSON.stringify(j.snapshot, null, 2) : '';
+                    // save() 调用反馈: 让用户知道 save 调没调、会写多少、生产是否会真落盘。
+                    // 关键词: testCurrent save 反馈展示
+                    const saveBlock = renderTestSaveBlock(j);
+                    resultEl.className = 'mirror-test-result' + (executed ? '' : '');
+                    resultEl.innerHTML = `
+                        <div class="mirror-test-result-head">
+                            ${tag}<span style="color:#cbd5e1;">duration=${escapeHtml(String(dur))}</span>
+                        </div>
+                        ${errLine}
+                        ${saveBlock}
+                        <div style="color:#94a3b8; font-size:11px; margin-top:6px;">// sample snapshot passed to handle(data):</div>
+                        <div>${escapeHtml(snapText)}</div>
+                    `;
+                } catch (e) {
+                    if (resultEl) {
+                        resultEl.className = 'mirror-test-result error';
+                        resultEl.innerHTML = '<div class="mirror-test-result-head"><span class="mirror-test-status-fail">FAILED</span></div>' +
+                            '<div>试运行失败: ' + escapeHtml(e.message || String(e)) + '</div>';
+                    }
+                }
+            }
+
+            async function viewLogs(id) {
+                const r = state.cache.find(x => x.id === id);
+                document.getElementById('mirrorLogsRuleName').textContent = r ? r.name : ('#' + id);
+                const list = document.getElementById('mirrorLogsList');
+                if (list) list.innerHTML = '<div style="color:#999; padding: 12px;">Loading...</div>';
+                document.getElementById('mirrorLogsModal').style.display = 'flex';
+                try {
+                    const resp = await fetch('/portal/api/mirror-rules/' + id + '/logs', {credentials: 'same-origin'});
+                    const j = await resp.json();
+                    if (!resp.ok || j.error) {
+                        throw new Error(j.error || ('HTTP ' + resp.status));
+                    }
+                    const logs = j.logs || [];
+                    if (!logs.length) {
+                        list.innerHTML = '<div style="color:#999; padding: 12px;">尚无调用记录.</div>';
+                        return;
+                    }
+                    list.innerHTML = logs.map(l => {
+                        const cls = l.success ? 'success' : 'failure';
+                        const tag = l.success ? '<span style="color:#2e7d32; font-weight:600;">SUCCESS</span>' : '<span style="color:#c62828; font-weight:600;">FAILED</span>';
+                        // save() 反馈: 这次调了几次 / 落盘几次 / 字节数, 让生产环境也能确认。
+                        // 关键词: viewLogs save_calls 展示
+                        const calls = Number(l.save_calls) || 0;
+                        const persisted = Number(l.save_persisted) || 0;
+                        const sbytes = Number(l.save_bytes) || 0;
+                        let saveLine = '';
+                        if (calls > 0) {
+                            const ok = persisted > 0;
+                            const color = ok ? '#2e7d32' : '#ef6c00';
+                            const fmt = (sbytes >= 1024 * 1024) ? (sbytes / (1024 * 1024)).toFixed(2) + ' MiB'
+                                : (sbytes >= 1024) ? (sbytes / 1024).toFixed(2) + ' KiB' : sbytes + ' B';
+                            saveLine = '<div style="color:' + color + ';">save: 调用 ' + calls + ' 次 / 落盘 ' + persisted + ' 次 / ' + escapeHtml(fmt)
+                                + (ok ? '' : '（未落盘，可能落盘未启用）') + '</div>';
+                        }
+                        return `<div class="mirror-log-entry ${cls}">
+                            <div>${escapeHtml(l.timestamp || '')} | req_id=${escapeHtml(l.req_id || '')} | dur=${l.duration_ms || 0}ms | ${tag}</div>
+                            ${l.error_message ? '<div style="color:#c62828;">' + escapeHtml(l.error_message) + '</div>' : ''}
+                            ${saveLine}
+                            ${l.stdout ? '<div style="color:#555;">stdout: ' + escapeHtml(l.stdout) + '</div>' : ''}
+                        </div>`;
+                    }).join('');
+                } catch (e) {
+                    if (list) list.innerHTML = '<div style="color:#c62828; padding: 12px;">加载日志失败: ' + escapeHtml(e.message || String(e)) + '</div>';
+                }
+            }
+
+            function closeLogs() {
+                document.getElementById('mirrorLogsModal').style.display = 'none';
+            }
+
+            return {
+                refresh: refresh,
+                openCreateModal: openCreateModal,
+                openEditModal: openEditModal,
+                closeModal: closeModal,
+                onConditionChange: onConditionChange,
+                save: save,
+                toggle: toggle,
+                del: del,
+                testCurrent: testCurrent,
+                resetToDefaultScript: resetToDefaultScript,
+                viewLogs: viewLogs,
+                closeLogs: closeLogs,
+                saveStorageConfig: saveStorageConfig,
+            };
+        })();
+
+        // MirrorRecords: 「镜像数据」页面逻辑, 加载最近落盘记录并人性化展示.
+        // 关键词: MirrorRecords, 最近落盘记录查看, 人性化字段 + 原始 JSON 折叠
+        const MirrorRecords = (function () {
+            let seq = 0;
+
+            // tsHuman 把毫秒时间戳转成本地可读时间.
+            function tsHuman(ms) {
+                const n = Number(ms) || 0;
+                if (n <= 0) return '-';
+                try { return new Date(n).toLocaleString(); } catch (e) { return String(n); }
+            }
+
+            // pickUserMessage 从 request_messages 里取最后一条 user 文本片段.
+            function pickUserMessage(rec) {
+                const msgs = rec && rec.request_messages;
+                if (!Array.isArray(msgs) || !msgs.length) return '';
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                    const m = msgs[i] || {};
+                    const role = (m.role || '').toLowerCase();
+                    if (role === 'user' && m.content) return String(m.content);
+                }
+                const last = msgs[msgs.length - 1] || {};
+                return last.content ? String(last.content) : '';
+            }
+
+            function clip(s, n) {
+                s = (s == null) ? '' : String(s);
+                if (s.length <= n) return s;
+                return s.slice(0, n) + '…';
+            }
+
+            // asText 把任意值转纯文本: 字符串原样, 其它 JSON 缩进序列化。
+            function asText(v) {
+                if (v == null) return '';
+                if (typeof v === 'string') return v;
+                try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); }
+            }
+
+            // buildRequestText 把 request_messages 渲染成可读纯文本 (按 role 分段)。
+            // 关键词: buildRequestText, 请求纯文本对照
+            function buildRequestText(rec) {
+                const msgs = rec && rec.request_messages;
+                if (!Array.isArray(msgs) || !msgs.length) return '(no request_messages)';
+                return msgs.map(function (m) {
+                    m = m || {};
+                    const role = m.role || 'unknown';
+                    let block = '===== ' + role + ' =====\n' + asText(m.content);
+                    if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+                        block += '\n[tool_calls]\n' + asText(m.tool_calls);
+                    }
+                    return block;
+                }).join('\n\n');
+            }
+
+            // buildResponseText 把响应渲染成可读纯文本 (reasoning + answer + tool_calls)。
+            // 关键词: buildResponseText, 响应纯文本对照
+            function buildResponseText(rec) {
+                const parts = [];
+                if (rec.response_reason) {
+                    parts.push('===== reasoning =====\n' + asText(rec.response_reason));
+                }
+                parts.push('===== answer =====\n' + asText(rec.response_text));
+                if (Array.isArray(rec.tool_calls) && rec.tool_calls.length) {
+                    parts.push('===== tool_calls =====\n' + asText(rec.tool_calls));
+                }
+                return parts.join('\n\n');
+            }
+
+            // copyEl 复制某个元素的纯文本内容到剪贴板, 并在按钮上给出短暂反馈。
+            // 关键词: copyEl, 一键复制, navigator.clipboard 带 textarea 兜底
+            function copyEl(id, btn) {
+                const el = document.getElementById(id);
+                if (!el) return;
+                const text = el.textContent || '';
+                const feedback = function (ok) {
+                    if (!btn) return;
+                    const orig = btn.getAttribute('data-label') || btn.textContent;
+                    btn.setAttribute('data-label', orig);
+                    btn.textContent = ok ? '已复制' : '复制失败';
+                    setTimeout(function () { btn.textContent = orig; }, 1500);
+                };
+                const fallback = function () {
+                    try {
+                        const ta = document.createElement('textarea');
+                        ta.value = text;
+                        ta.style.position = 'fixed';
+                        ta.style.opacity = '0';
+                        document.body.appendChild(ta);
+                        ta.focus();
+                        ta.select();
+                        const ok = document.execCommand('copy');
+                        document.body.removeChild(ta);
+                        feedback(ok);
+                    } catch (e) { feedback(false); }
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(function () { feedback(true); }, fallback);
+                } else {
+                    fallback();
+                }
+            }
+
+            // toggleEl 通用展开/收起: 切换目标元素显隐并在触发器上切换文案。
+            // 关键词: toggleEl, 通用展开收起
+            function toggleEl(id, el, showLabel, hideLabel) {
+                const target = document.getElementById(id);
+                if (!target) return;
+                const show = target.style.display === 'none' || target.style.display === '';
+                target.style.display = show ? 'flex' : 'none';
+                if (el && showLabel && hideLabel) el.textContent = show ? hideLabel : showLabel;
+            }
+
+            // renderRecord 把一条记录渲染为一张卡: 人性化关键字段 + 可展开原始 JSON.
+            function renderRecord(rec, idx) {
+                const id = 'mirror-rec-raw-' + (seq++) ;
+                const model = escapeHtml(rec.model || rec.type_name || '(未知模型)');
+                const action = rec.action ? escapeHtml(rec.action) : '';
+                const ts = escapeHtml(tsHuman(rec.timestamp_ms));
+                const free = rec.is_free_model ? '免费' : '计费';
+                const stream = rec.stream ? '流式' : '非流式';
+                const dur = (Number(rec.duration_ms) || 0);
+                const inB = (Number(rec.input_bytes) || 0);
+                const outB = (Number(rec.output_bytes) || 0);
+                const toolCalls = Array.isArray(rec.tool_calls) ? rec.tool_calls.length : 0;
+                const userMsg = escapeHtml(clip(pickUserMessage(rec), 200));
+                const respText = escapeHtml(clip(rec.response_text, 200));
+
+                let usageStr = '';
+                if (rec.usage && typeof rec.usage === 'object') {
+                    const pt = rec.usage.prompt_tokens || rec.usage.PromptTokens || 0;
+                    const ct = rec.usage.completion_tokens || rec.usage.CompletionTokens || 0;
+                    const tt = rec.usage.total_tokens || rec.usage.TotalTokens || 0;
+                    if (pt || ct || tt) usageStr = 'tokens ' + pt + '/' + ct + ' (合计 ' + tt + ')';
+                }
+
+                let raw = '';
+                try { raw = JSON.stringify(rec, null, 2); } catch (e) { raw = String(rec); }
+
+                // 请求/响应对照: 纯文本代码块, 各带一键复制, 便于核对真实内容。
+                // 关键词: renderRecord 请求/响应对照, 纯文本 + 复制
+                const s = (seq++);
+                const cmpId = 'mirror-rec-cmp-' + s;
+                const reqId = 'mirror-rec-req-' + s;
+                const respId = 'mirror-rec-resp-' + s;
+                const reqFull = escapeHtml(buildRequestText(rec));
+                const respFull = escapeHtml(buildResponseText(rec));
+                const compareBlock = '<div id="' + cmpId + '" class="mirror-rec-compare" style="display:none;">'
+                    + '<div class="mirror-rec-col">'
+                    +   '<div class="mirror-rec-col-head"><span>Request</span>'
+                    +     '<button class="mirror-rec-copy-btn" onclick="MirrorRecords.copyEl(\'' + reqId + '\', this)">复制</button></div>'
+                    +   '<pre id="' + reqId + '" class="mirror-rec-text">' + reqFull + '</pre>'
+                    + '</div>'
+                    + '<div class="mirror-rec-col">'
+                    +   '<div class="mirror-rec-col-head"><span>Response</span>'
+                    +     '<button class="mirror-rec-copy-btn" onclick="MirrorRecords.copyEl(\'' + respId + '\', this)">复制</button></div>'
+                    +   '<pre id="' + respId + '" class="mirror-rec-text">' + respFull + '</pre>'
+                    + '</div>'
+                    + '</div>';
+
+                const chips = [];
+                chips.push('<span class="mirror-rec-chip">' + free + '</span>');
+                chips.push('<span class="mirror-rec-chip">' + stream + '</span>');
+                if (action) chips.push('<span class="mirror-rec-chip" style="background:#fff3e0; border-color:#ffcc80;">action: ' + action + '</span>');
+                if (toolCalls > 0) chips.push('<span class="mirror-rec-chip">tool_calls: ' + toolCalls + '</span>');
+                chips.push('<span class="mirror-rec-chip">耗时 ' + dur + 'ms</span>');
+                chips.push('<span class="mirror-rec-chip">收/发 ' + formatBytesHuman(inB) + ' / ' + formatBytesHuman(outB) + '</span>');
+                if (usageStr) chips.push('<span class="mirror-rec-chip">' + escapeHtml(usageStr) + '</span>');
+
+                return '<div class="mirror-rec-card">'
+                    + '<div class="mirror-rec-head">'
+                    + '<span class="mirror-rec-idx">#' + (idx + 1) + '</span>'
+                    + '<code class="mirror-rec-model">' + model + '</code>'
+                    + '<span class="mirror-rec-ts">' + ts + '</span>'
+                    + '</div>'
+                    + '<div class="mirror-rec-chips">' + chips.join('') + '</div>'
+                    + (userMsg ? '<div class="mirror-rec-line"><span class="mirror-rec-label">请求:</span> ' + userMsg + '</div>' : '')
+                    + (respText ? '<div class="mirror-rec-line"><span class="mirror-rec-label">响应:</span> ' + respText + '</div>' : '')
+                    + '<div class="mirror-rec-toggle-bar">'
+                    +   '<span class="mirror-rec-toggle" onclick="MirrorRecords.toggleEl(\'' + cmpId + '\', this, \'展开 请求/响应对照\', \'收起 请求/响应对照\')">展开 请求/响应对照</span>'
+                    +   '<span class="mirror-rec-toggle" onclick="MirrorRecords.toggleRaw(\'' + id + '\', this)">展开原始 JSON</span>'
+                    + '</div>'
+                    + compareBlock
+                    + '<pre id="' + id + '" class="mirror-rec-raw" style="display:none;">' + escapeHtml(raw) + '</pre>'
+                    + '</div>';
+            }
+
+            function toggleRaw(id, el) {
+                const pre = document.getElementById(id);
+                if (!pre) return;
+                const show = pre.style.display === 'none';
+                pre.style.display = show ? 'block' : 'none';
+                if (el) el.textContent = show ? '收起原始 JSON' : '展开原始 JSON';
+            }
+
+            async function load() {
+                const statusEl = document.getElementById('mirror-records-status');
+                const listEl = document.getElementById('mirror-records-list');
+                const countEl = document.getElementById('mirror-records-count');
+                const n = (countEl && parseInt(countEl.value, 10)) || 20;
+                if (statusEl) statusEl.textContent = '加载中…';
+                if (listEl) listEl.innerHTML = '';
+                try {
+                    const resp = await fetch('/portal/api/mirror-records/recent?n=' + n, {credentials: 'same-origin'});
+                    const j = await resp.json();
+                    if (isAuthError(j)) { handleAuthError(); return; }
+                    if (!j || !j.success) {
+                        if (statusEl) statusEl.textContent = (j && (j.message || j.error)) || '加载失败';
+                        return;
+                    }
+                    const records = Array.isArray(j.records) ? j.records : [];
+                    if (!records.length) {
+                        if (statusEl) statusEl.textContent = '暂无落盘记录 (可能未启用落盘, 或还没有命中的镜像规则调用 save()).';
+                        return;
+                    }
+                    if (statusEl) statusEl.textContent = '共 ' + records.length + ' 条 (最新在前)';
+                    if (listEl) listEl.innerHTML = records.map(renderRecord).join('');
+                } catch (e) {
+                    console.error('mirror-records: load failed', e);
+                    if (statusEl) statusEl.textContent = '加载失败: ' + (e.message || e);
+                }
+            }
+
+            return { load: load, toggleRaw: toggleRaw, toggleEl: toggleEl, copyEl: copyEl };
+        })();
+        window.MirrorRecords = MirrorRecords;

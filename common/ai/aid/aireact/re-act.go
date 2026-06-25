@@ -15,10 +15,10 @@ import (
 	"github.com/yaklang/yaklang/common/ai"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aimem"
+	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
 	"github.com/yaklang/yaklang/common/ai/rag/rag_search_tool"
-	"github.com/yaklang/yaklang/common/aiforge"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
@@ -44,6 +44,7 @@ const (
 	SYNC_TYPE_REACT_REMOVE_TASK         = "react_remove_task"
 	SYNC_TYPE_REACT_CLEAR_TASK          = "react_clear_task"
 	SYNC_TYPE_RECOVERY_PLAN_AND_EXEC    = "recovery_plan_and_exec"
+	SYNC_TYPE_EXECUTE_DETACHED_PLAN     = "execute_detached_plan"
 )
 
 // ReactTaskItem 表示ReAct任务队列中的单个任务
@@ -68,8 +69,9 @@ type ReAct struct {
 	currentIteration            int
 	currentUserInteractiveCount int64 // 当前用户交互次数
 	knowledgeEmitCounter        int   // Counter for knowledge emit events
-	verificationHistoryMutex    sync.Mutex
-	verificationHistory         []*aicommon.VerifySatisfactionResult
+	// verificationHistory 已上移到 aicommon.SessionPromptState 作为 todoJSON 持久态,
+	// 让 loop prompt 与 verify 路径共享同一份增量 TODO 状态; ReAct 内不再保存副本.
+	// 关键词: verificationHistory 迁移, SessionPromptState todoJSON, 单一来源
 
 	config        *aicommon.Config
 	promptManager *PromptManager
@@ -97,7 +99,14 @@ type ReAct struct {
 	wg           *sync.WaitGroup
 	memoryTriage aicommon.MemoryTriage
 
+	midtermRecallMutex           sync.Mutex
+	pendingMidtermTimelineRecall bool
+	pendingMidtermPerception     *midtermPerceptionSnapshot
+
 	pureInvokerMode bool // 纯调用者模式，不启动事件循环和队列处理器
+
+	browserSessionsMu sync.Mutex
+	browserSessionIDs map[string]struct{}
 }
 
 func (r *ReAct) SetCurrentTask(task aicommon.AIStatefulTask) {
@@ -186,7 +195,6 @@ func (r *ReAct) UnregisterMirrorOfAIInputEvent(id string) {
 
 func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 	configLoadingStart := time.Now()
-	opts = append(opts, aicommon.WithAIBlueprintManager(aiforge.NewForgeFactory()))
 	cfg := aicommon.NewConfig(context.Background(), opts...)
 
 	// Extract built-in skills to ~/yakit-projects/ai-skills/ only when auto-skills
@@ -215,14 +223,18 @@ func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 		saveTimelineThrottle: utils.NewThrottleEx(3, true, true),
 		artifacts:            nil, // lazy: created in ensureWorkDirectory
 		wg:                   new(sync.WaitGroup),
+		browserSessionIDs:    make(map[string]struct{}),
 	}
 
+	cfg.SetBrowserSessionTracker(react)
+
 	if cfg.PersistentSessionId != "" && cfg.GetDB() != nil {
-		meta, err := yakit.EnsureAISessionMeta(cfg.GetDB(), cfg.PersistentSessionId)
+		meta, err := yakit.EnsureAISessionMeta(cfg.GetDB(), cfg.PersistentSessionId, cfg.SessionSource)
 		if err != nil {
 			log.Warnf("ensure ai session meta failed for %s: %v", cfg.PersistentSessionId, err)
 		} else if meta != nil && strings.TrimSpace(meta.Title) != "" {
 			cfg.SetConfig("session_title", meta.Title)
+			cfg.SetSessionTitle(meta.Title)
 			cfg.SetConfig(sessionTitleGeneratedKey, true)
 			react.Emitter.EmitSessionTitle(meta.Title)
 		}
@@ -250,6 +262,16 @@ func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 
 	log.Infof("memory triage id: %s", react.memoryTriage.GetSessionID())
 
+	if cfg.TimelineArchiveStore == nil && strings.TrimSpace(cfg.PersistentSessionId) != "" {
+		midtermSessionID := aimem.PersistentSessionToMidtermMemorySessionID(cfg.PersistentSessionId)
+		midtermStore, err := aimem.NewAIMemoryForQuery(midtermSessionID, aimem.WithDatabase(cfg.GetDB()))
+		if err != nil {
+			log.Warnf("create timeline archive store failed for session %s: %v", cfg.PersistentSessionId, err)
+		} else {
+			cfg.TimelineArchiveStore = midtermStore
+			log.Infof("timeline archive store ready for persistent session %s", cfg.PersistentSessionId)
+		}
+	}
 	cfg.EnhanceKnowledgeManager.SetEmitter(cfg.Emitter)
 	if cfg.Timeline == nil {
 		cfg.Timeline = aicommon.NewTimeline(cfg, nil)
@@ -267,8 +289,114 @@ func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 	}
 	react.promptManager = NewPromptManager(react, workdir)
 
+	cfg.SetHotpatchCurrentTaskIdResolver(func() string {
+		return react.GetCurrentTaskId()
+	})
+
+	cfg.SetCapabilityHotpatchHandler(func(enable bool, caps []aicommon.EnabledCapability) {
+		loop := react.GetCurrentLoop()
+		if loop == nil {
+			return
+		}
+		ecm := loop.GetExtraCapabilities()
+		if ecm == nil {
+			return
+		}
+		toolMgr := react.config.GetAiToolManager()
+
+		for _, cap := range caps {
+			switch cap.Type {
+			case aicommon.EnabledCapabilityTypeTool, aicommon.EnabledCapabilityTypePlugin, aicommon.EnabledCapabilityTypeMCPTool:
+				if toolMgr == nil {
+					continue
+				}
+				// Hotpatch affects prompt-level suggestions only: resolve tool object from current manager snapshot.
+				if enable {
+					if tool, err := toolMgr.GetToolByName(cap.Name); err == nil && tool != nil {
+						ecm.AddTools(tool)
+					}
+				} else {
+					ecm.RemoveToolByName(cap.Name)
+				}
+			case aicommon.EnabledCapabilityTypeForge:
+				if enable {
+					reactloops.LoadEnabledForges(react.config, loop, []string{cap.Name})
+				} else {
+					ecm.RemoveForgeByName(cap.Name)
+				}
+			case aicommon.EnabledCapabilityTypeSkill:
+				// Hotpatch skill is inventory-only. We do NOT load/unload SKILLS_CONTEXT here.
+				if enable {
+					ecm.AddSkills(reactloops.ExtraSkillInfo{Name: cap.Name})
+				} else {
+					ecm.RemoveSkillByName(cap.Name)
+				}
+			}
+		}
+	})
+
+	cfg.SetSkillHotloadHandler(func(skillNames []string) {
+		if len(skillNames) == 0 {
+			return
+		}
+		if loop := react.GetCurrentLoop(); loop != nil {
+			if mgr := loop.GetSkillsContextManager(); mgr != nil {
+				results := mgr.LoadSkills(skillNames)
+				for name, err := range results {
+					if err != nil {
+						log.Warnf("hotload skill %q failed: %v", name, err)
+					}
+				}
+			}
+		}
+	})
+
+	cfg.SetForgeHotloadHandler(func(forgeNames []string) {
+		if len(forgeNames) == 0 {
+			return
+		}
+		if loop := react.GetCurrentLoop(); loop != nil {
+			reactloops.LoadEnabledForges(react.config, loop, forgeNames)
+		}
+	})
+
+	cfg.SetSkillUnloadHandler(func(skillNames []string) {
+		if len(skillNames) == 0 {
+			return
+		}
+		if loop := react.GetCurrentLoop(); loop != nil {
+			if mgr := loop.GetSkillsContextManager(); mgr != nil {
+				for _, name := range skillNames {
+					if mgr.UnloadSkill(name) {
+						log.Infof("hot-unload skill %q from context", name)
+					}
+				}
+			}
+		}
+	})
+
+	cfg.SetForgeUnloadHandler(func(forgeNames []string) {
+		if len(forgeNames) == 0 {
+			return
+		}
+		if loop := react.GetCurrentLoop(); loop != nil {
+			if ecm := loop.GetExtraCapabilities(); ecm != nil {
+				for _, name := range forgeNames {
+					if ecm.RemoveForgeByName(name) {
+						log.Infof("hot-unload forge %q from extra capabilities", name)
+					}
+				}
+			}
+		}
+	})
+
+	cfg.SetSessionSnapshotEmitHandler(func() {
+		reactloops.EmitSessionSnapshot(react.config, react.GetCurrentLoop(), react.GetCurrentTask())
+	})
+
 	// Register pending context providers
 	react.promptManager.cpm = cfg.ContextProviderManager
+	react.installRunningSessionRegistry()
 	// Start the event loop in background
 	mainloopDone := make(chan struct{})
 	react.startEventLoop(cfg.Ctx, mainloopDone)
@@ -287,24 +415,40 @@ func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 	case <-done:
 	}
 
-	dbId, err := yakit.CreateOrUpdateAIAgentRuntime(
-		react.config.GetDB(), &schema.AIAgentRuntime{
-			Uuid:              cfg.GetRuntimeId(),
-			Name:              "[re-act-runtime]",
-			Seq:               cfg.Seq,
-			TypeName:          schema.AIAgentRuntimeType_ReAct,
-			PersistentSession: cfg.PersistentSessionId,
-		},
-	)
-	if err != nil {
+	if err := cfg.CreateOrUpdateRuntimeRecord(&schema.AIAgentRuntime{
+		Uuid:              cfg.GetRuntimeId(),
+		Name:              "[re-act-runtime]",
+		Seq:               cfg.Seq,
+		TypeName:          schema.AIAgentRuntimeType_ReAct,
+		PersistentSession: cfg.PersistentSessionId,
+	}); err != nil {
 		return nil, err
 	}
-	cfg.DatabaseRecordID = dbId
+	cfg.FlushRestoredSessionEvidence()
 	// EmitPinDirectory is deferred to ensureWorkDirectory when user input arrives
 
-	if !react.config.DisallowMCPServers {
-		// load mcp servers into ai-tool
+	// When the session is restricted to its injected MCP servers, the profile/DB
+	// MCP machinery must NOT run: its background goroutine (and the
+	// tools-list-changed handler) would re-enable profile tools via
+	// OverrideToolByName AFTER loadExtraMCPServers calls RestrictToTools,
+	// silently defeating the restriction (fail-open) and racing the tool
+	// manager's enable map. Skipping it keeps the restriction authoritative.
+	if !react.config.DisallowMCPServers && !react.config.RestrictToolsToExtraMCPServers {
+		// Synchronously pre-load MCP stub tools from DB into the tool manager
+		// so they appear in the system prompt on the very first request, before
+		// the background connection goroutine has finished.
+		react.preloadMCPStubsFromDB()
+
+		// Fire-and-forget: connect to MCP servers, write fresh tool metadata
+		// to DB, then append live tools (with real callbacks) to AiToolManager,
+		// replacing the stubs. The first user query is not blocked.
 		react.loadMCPServers()
+	}
+
+	// 会话级显式挂载（内存态，不读 profile DB、不进全局列表）。
+	// 同步加载，保证首轮推理前工具已就绪。
+	if len(react.config.ExtraMCPServers) > 0 {
+		react.loadExtraMCPServers(react.config.ExtraMCPServers)
 	}
 
 	return react, nil
@@ -349,7 +493,13 @@ func (r *ReAct) AddToTimeline(entryType, content string) {
 	} else {
 		msg.WriteString(":\n")
 	}
-	msg.WriteString(utils.PrefixLines(content, "  "))
+	// 旧实现给 body 整体加过 '  ' 缩进, 当时是为了让人类阅读 dump 时一眼区分
+	// 'header line' 与 'body lines'. timeline 渲染 (TimelineIntervalBlock.Render)
+	// 现在已经为每个 item 输出独立的 'HH:MM:SS [type/...]' 行头, 缩进对 LLM 不再
+	// 提供任何信息, 只消耗 token. 直接拼 body 即可, humanReadable parser 端的
+	// removeIndent 在新数据无前缀时是 no-op, 向后兼容历史持久化.
+	// 关键词: ReAct.AddToTimeline 去掉 body 缩进, prompt token 节省
+	msg.WriteString(content)
 	r.config.Timeline.PushText(r.config.AcquireId(), msg.String())
 	r.SaveTimeline()
 }
@@ -470,6 +620,7 @@ func (r *ReAct) startEventLoop(ctx context.Context, done chan struct{}) {
 		},
 		func() {
 			r.UnRegisterReActSyncEvent()
+			r.CloseTrackedBrowserSessions()
 			doneOnce.Do(func() {
 				if done != nil {
 					close(done)
@@ -504,6 +655,27 @@ func (r *ReAct) loadMCPServers() {
 		m := new(sync.Mutex)
 		promptStartLoadingOnce := utils.NewOnce()
 		promptDoneLoadingOnce := utils.NewOnce()
+
+		onToolsListChanged := func(serverName string, tools []*aitool.Tool, removed []string) {
+			mng := r.config.GetAiToolManager()
+			if mng == nil {
+				return
+			}
+			for _, t := range tools {
+				if t != nil {
+					mng.OverrideToolByName(t)
+				}
+			}
+			for _, name := range removed {
+				mng.RemoveToolByName(name)
+			}
+			if len(tools) > 0 || len(removed) > 0 {
+				log.Infof(
+					"MCP server %q tools list_changed: refreshed %d tool(s), removed %d",
+					serverName, len(tools), len(removed),
+				)
+			}
+		}
 
 		tools, err := aitool.LoadAllEnabledAIToolsFromMCPServersWithCallback(
 			consts.GetGormProfileDatabase(),
@@ -540,15 +712,97 @@ func (r *ReAct) loadMCPServers() {
 				startLoadingPW.Close()
 				doneLoadingPW.Close()
 			},
+			onToolsListChanged,
 		)
 		if err != nil {
 			log.Errorf("load tools failed: %v", err)
 		}
 		if len(tools) > 0 {
 			mng := r.config.GetAiToolManager()
-			mng.AppendTools(tools...)
+			// Use OverrideToolByName so live MCP tools replace any stub tools
+			// that were pre-loaded from the DB cache (AppendTools skips
+			// already-registered names, so stubs would block live replacements).
+			for _, t := range tools {
+				mng.OverrideToolByName(t)
+			}
 		}
 	}()
+}
+
+// preloadMCPStubsFromDB loads MCP tool stubs from the DB cache into the tool
+// manager synchronously, before the background MCP server connection goroutine
+// finishes. This ensures MCP tools appear in the system prompt on the first
+// request even when the remote MCP server hasn't responded yet.
+// Once loadMCPServers completes, AppendTools will replace each stub with a
+// live tool carrying a real network callback (OverrideToolByName semantics via
+// AppendTools dedup logic).
+func (r *ReAct) preloadMCPStubsFromDB() {
+	db := consts.GetGormProfileDatabase()
+	if db == nil {
+		return
+	}
+	cfgs, err := yakit.GetAllEnabledMCPServerToolConfigs(db)
+	if err != nil {
+		log.Warnf("preload MCP stubs: failed to query DB: %v", err)
+		return
+	}
+	if len(cfgs) == 0 {
+		return
+	}
+
+	mng := r.config.GetAiToolManager()
+	if mng == nil {
+		return
+	}
+
+	var stubs []*aitool.Tool
+	for _, cfg := range cfgs {
+		fullName := fmt.Sprintf("mcp_%s_%s", cfg.ServerName, cfg.ToolName)
+		stub := buildinaitools.BuildStubToolFromMCPCachePublic(fullName, cfg)
+		if stub != nil {
+			stubs = append(stubs, stub)
+		}
+	}
+	if len(stubs) > 0 {
+		mng.AppendTools(stubs...)
+		log.Infof("preloaded %d MCP tool stubs from DB cache into tool manager", len(stubs))
+	}
+}
+
+// loadExtraMCPServers mounts session-scoped MCP servers at construction time.
+// 每个 server 经 aitool.LoadAIToolsFromMCPServer 取工具（不查 profile DB），
+// 并按 AllowedTools 在 client 侧做白名单过滤后 AppendTools。
+func (r *ReAct) loadExtraMCPServers(servers []*aicommon.ExtraMCPServer) {
+	mng := r.config.GetAiToolManager()
+	if mng == nil {
+		log.Errorf("cannot mount session-scoped mcp servers: tool manager is nil")
+		return
+	}
+	var mountedNames []string
+	for _, s := range servers {
+		if s == nil || s.Server == nil {
+			continue
+		}
+		tools, err := aitool.LoadAIToolsFromMCPServer(r.config.Ctx, s.Server, s.AllowedTools)
+		if err != nil {
+			log.Errorf("load session-scoped mcp server %s failed: %v", s.Server.Name, err)
+			continue
+		}
+		if len(tools) > 0 {
+			mng.AppendTools(tools...)
+			for _, tool := range tools {
+				mountedNames = append(mountedNames, tool.Name)
+			}
+			log.Infof("session-scoped mcp server %s mounted %d tool(s)", s.Server.Name, len(tools))
+		}
+	}
+	// Restrict unconditionally (deny-all when nothing mounted): if a restricted
+	// session's MCP servers are unreachable/empty, falling back to the full
+	// builtin/search toolset would be a fail-open, defeating the restriction.
+	if r.config.RestrictToolsToExtraMCPServers {
+		mng.RestrictToTools(mountedNames...)
+		log.Infof("session tools restricted to %d session-scoped mcp tool(s): %v", len(mountedNames), mountedNames)
+	}
 }
 
 // cycle import issue
@@ -582,8 +836,7 @@ func WithBuiltinTools() aicommon.ConfigOption {
 
 // emitArtifactsSummaryToTimeline pushes a summary of the artifacts directory into the
 // timeline after plan/forge completion, and ensures EmitPinDirectory is called for UI visibility.
-// This provides an immediate notification layer; the persistent layer is ArtifactsContextProvider
-// which runs on every prompt build.
+// Prompt visibility is handled by RenderSessionArtifactsFrozenOpen during prompt build.
 func (r *ReAct) emitArtifactsSummaryToTimeline() {
 	artifactsDir := r.config.GetOrCreateWorkDir()
 	if artifactsDir == "" {

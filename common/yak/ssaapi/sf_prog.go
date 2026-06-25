@@ -205,6 +205,92 @@ func (p *Program) matchVariable(ctx context.Context, compareMode ssadb.CompareMo
 	return p.matchVariableWithExcludeFiles(ctx, compareMode, mod, pattern, nil)
 }
 
+// appendPointerClosurePhisFromValue 从任意 SSA 值出发，沿 GetPointer() 做闭包展开补齐嵌套 phi。
+//
+// 为避免结果污染，默认约束在“同名 + 同函数”的 phi 集合内；起点没有 name/func 时则只做最小化过滤。
+// func appendPointerClosurePhisFromValue(p *Program, start ssa.Value, seen map[int64]struct{}, out *Values) {
+// 	if p == nil || p.Program == nil || utils.IsNil(start) {
+// 		return
+// 	}
+
+// 	startName := start.GetName()
+// 	startFn := start.GetFunc()
+// 	startFnID := int64(0)
+// 	if startFn != nil {
+// 		startFnID = startFn.GetId()
+// 	}
+
+// 	queue := []ssa.PointerIF{start}
+// 	queued := make(map[int64]struct{}, 8)
+// 	queued[start.GetId()] = struct{}{}
+
+// 	for qi := 0; qi < len(queue); qi++ {
+// 		cur := queue[qi]
+// 		if cur == nil {
+// 			continue
+// 		}
+// 		for _, ptr := range cur.GetPointer() {
+// 			if utils.IsNil(ptr) {
+// 				continue
+// 			}
+// 			phi, ok := ssa.ToPhi(ptr)
+// 			if !ok || phi == nil {
+// 				continue
+// 			}
+// 			if startName != "" && phi.GetName() != startName {
+// 				continue
+// 			}
+// 			if startFnID != 0 {
+// 				pf := phi.GetFunc()
+// 				if pf == nil || pf.GetId() != startFnID {
+// 					continue
+// 				}
+// 			}
+// 			pid := phi.GetId()
+// 			if _, dup := seen[pid]; !dup {
+// 				nv, err := p.NewValue(phi)
+// 				if err == nil && nv != nil {
+// 					seen[pid] = struct{}{}
+// 					*out = append(*out, nv)
+// 				}
+// 			}
+// 			if _, ok := queued[pid]; ok {
+// 				continue
+// 			}
+// 			queued[pid] = struct{}{}
+// 			queue = append(queue, phi)
+// 		}
+// 	}
+
+// }
+
+// appendPointerLinkedPhisFromParameters 对每个匹配到的形式参数：
+// 沿 GetPointer() 做闭包展开补齐嵌套 phi（不扫描全函数，也不沿 GetUsers BFS）。
+// func (p *Program) appendPointerLinkedPhisFromParameters(values Values) Values {
+// 	if p == nil || len(values) == 0 {
+// 		return values
+// 	}
+// 	seen := make(map[int64]struct{}, len(values)*2)
+// 	for _, v := range values {
+// 		if v != nil {
+// 			seen[v.GetId()] = struct{}{}
+// 		}
+// 	}
+// 	out := append(Values(nil), values...)
+// 	for _, v := range values {
+// 		if v == nil {
+// 			continue
+// 		}
+// 		inst := v.getInstruction()
+// 		start, ok := ssa.ToValue(inst)
+// 		if !ok || utils.IsNil(start) {
+// 			continue
+// 		}
+// 		appendPointerClosurePhisFromValue(p, start, seen, &out)
+// 	}
+// 	return out
+// }
+
 // matchVariableWithExcludeFiles 搜索变量，支持排除指定文件
 // excludeFiles: 要排除的文件路径列表（规范化后的路径，如 "/test.go"）
 func (p *Program) matchVariableWithExcludeFiles(ctx context.Context, compareMode ssadb.CompareMode, mod ssadb.MatchMode, pattern string, excludeFiles []string) (bool, sfvm.Values, error) {
@@ -219,6 +305,7 @@ func (p *Program) matchVariableWithExcludeFiles(ctx context.Context, compareMode
 			}
 		},
 	)
+	// values = values.ExpandPhiClosure()
 	// 将 Values 转换为 sfvm.ValueOperator
 	return len(values) > 0, ToSFVMValues(values), nil
 }
@@ -424,12 +511,11 @@ func (p *Program) getEditor(filename, hash string) (*memedit.MemEditor, error) {
 		return nil, utils.Errorf("get editor by filename %s not found", filename)
 	}
 	// if have database, get source code from database
-	if editor, err := ssadb.GetEditorByHash(hash); err != nil {
-		return nil, utils.Errorf("get ir source from hash error: %s", err)
-	} else {
+	if editor, ok := p.Program.GetEditorByHash(hash); ok {
 		p.Program.SetEditor(filename, editor)
 		return editor, nil
 	}
+	return nil, utils.Errorf("get ir source from hash error: %s", hash)
 }
 
 func (p *Program) ForEachExtraFile(callBack func(string, *memedit.MemEditor) bool) {
@@ -438,6 +524,38 @@ func (p *Program) ForEachExtraFile(callBack func(string, *memedit.MemEditor) boo
 
 func (p *Program) ForEachAllFile(callBack func(string, *memedit.MemEditor) bool) {
 	p.foreach(p.Program.FileList, callBack)
+}
+
+// forEachFileListAndExtraFile walks FileList then ExtraFile, deduplicating by path
+// so config / sidecar paths kept only in ExtraFile still participate in scans
+// (e.g. ${*.yml}.regexp / .re).
+func (p *Program) forEachFileListAndExtraFile(callBack func(string, *memedit.MemEditor) bool) {
+	if p == nil || p.Program == nil {
+		return
+	}
+	seen := make(map[string]struct{})
+	handler := func(filename, hash string) bool {
+		if _, ok := seen[filename]; ok {
+			return true
+		}
+		seen[filename] = struct{}{}
+		editor, err := p.getEditor(filename, hash)
+		if err != nil {
+			log.Errorf("get editor [%s] not found: %v", filename, err)
+			return true
+		}
+		return callBack(filename, editor)
+	}
+	for _, m := range []map[string]string{p.Program.FileList, p.Program.ExtraFile} {
+		if m == nil {
+			continue
+		}
+		for filename, hash := range m {
+			if !handler(filename, hash) {
+				return
+			}
+		}
+	}
 }
 func (p *Program) foreach(file2Hash map[string]string, callBack func(string, *memedit.MemEditor) bool) {
 	handler := func(filename, hash string) bool {
@@ -476,7 +594,7 @@ func (p *Program) FileFilter(path string, match string, rule map[string]string, 
 	}
 
 	matchFile := false
-	p.ForEachAllFile(func(s string, me *memedit.MemEditor) bool {
+	p.forEachFileListAndExtraFile(func(s string, me *memedit.MemEditor) bool {
 		if me == nil {
 			return true
 		}

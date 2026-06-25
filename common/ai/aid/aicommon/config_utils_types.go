@@ -24,10 +24,10 @@ type MemoryTriage interface {
 	HandleMemory(i any) error
 
 	// SearchMemory 根据输入内容搜索相关记忆，限制总内容字节数
-	SearchMemory(origin any, bytesLimit int) (*SearchMemoryResult, error)
+	SearchMemory(origin any, tokenLimit int) (*SearchMemoryResult, error)
 
 	// SearchMemoryWithoutAI 不使用AI的关键词搜索，直接基于关键词匹配
-	SearchMemoryWithoutAI(origin any, bytesLimit int) (*SearchMemoryResult, error)
+	SearchMemoryWithoutAI(origin any, tokenLimit int) (*SearchMemoryResult, error)
 
 	Close() error
 
@@ -108,4 +108,21 @@ type AIForgeFactory interface {
 	GetAIForge(name string) (*schema.AIForge, error)
 	GenerateAIForgeListForPrompt(forges []*schema.AIForge) (string, error)
 	GenerateAIJSONSchemaFromSchemaAIForge(forge *schema.AIForge) (string, error)
+}
+
+var defaultAIForgeFactoryProvider func() AIForgeFactory
+
+// RegisterDefaultAIForgeFactoryProvider registers the factory used when a Config
+// has no AiForgeManager after options are applied (e.g. standalone NewConfig).
+func RegisterDefaultAIForgeFactoryProvider(provider func() AIForgeFactory) {
+	defaultAIForgeFactoryProvider = provider
+}
+
+func ensureCapabilityManagers(config *Config) {
+	if config == nil {
+		return
+	}
+	if config.AiForgeManager == nil && defaultAIForgeFactoryProvider != nil {
+		config.AiForgeManager = defaultAIForgeFactoryProvider()
+	}
 }

@@ -55,7 +55,19 @@ func (v *BasePHPParserVisitor) VisitNamespaceDeclaration(ctx *NamespaceDeclarati
 	return v.VisitChildren(ctx)
 }
 
+func (v *BasePHPParserVisitor) VisitNamespaceDeclarationSemi(ctx *NamespaceDeclarationSemiContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BasePHPParserVisitor) VisitNamespaceStatement(ctx *NamespaceStatementContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitNamespaceDeclarationBody(ctx *NamespaceDeclarationBodyContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitNamespaceUseDeclarations(ctx *NamespaceUseDeclarationsContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
@@ -88,6 +100,10 @@ func (v *BasePHPParserVisitor) VisitTypeParameterDecl(ctx *TypeParameterDeclCont
 }
 
 func (v *BasePHPParserVisitor) VisitTypeParameterWithDefaultDecl(ctx *TypeParameterWithDefaultDeclContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitCallableIdentifier(ctx *CallableIdentifierContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
@@ -255,6 +271,18 @@ func (v *BasePHPParserVisitor) VisitTypeHint(ctx *TypeHintContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
+func (v *BasePHPParserVisitor) VisitTypeHintAtom(ctx *TypeHintAtomContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitTypeHintIntersection(ctx *TypeHintIntersectionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitTypeHintUnion(ctx *TypeHintUnionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BasePHPParserVisitor) VisitGlobalStatement(ctx *GlobalStatementContext) interface{} {
 	return v.VisitChildren(ctx)
 }
@@ -379,6 +407,22 @@ func (v *BasePHPParserVisitor) VisitIndexMemberCallKey(ctx *IndexMemberCallKeyCo
 	return v.VisitChildren(ctx)
 }
 
+func (v *BasePHPParserVisitor) VisitDynamicStaticClassExpr(ctx *DynamicStaticClassExprContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitDynamicStaticReceiver(ctx *DynamicStaticReceiverContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitDynamicStaticReceiverBase(ctx *DynamicStaticReceiverBaseContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitDynamicStaticReceiverAccess(ctx *DynamicStaticReceiverAccessContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BasePHPParserVisitor) VisitSpecialWordExpression(ctx *SpecialWordExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
@@ -411,10 +455,6 @@ func (v *BasePHPParserVisitor) VisitMatchExpression(ctx *MatchExpressionContext)
 	return v.VisitChildren(ctx)
 }
 
-func (v *BasePHPParserVisitor) VisitStaticClassReferenceAssignmentExpression(ctx *StaticClassReferenceAssignmentExpressionContext) interface{} {
-	return v.VisitChildren(ctx)
-}
-
 func (v *BasePHPParserVisitor) VisitFunctionCallExpression(ctx *FunctionCallExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
@@ -428,6 +468,10 @@ func (v *BasePHPParserVisitor) VisitPrintExpression(ctx *PrintExpressionContext)
 }
 
 func (v *BasePHPParserVisitor) VisitPostfixIncDecExpression(ctx *PostfixIncDecExpressionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitFunctionCallAssignableReferenceAssignmentExpression(ctx *FunctionCallAssignableReferenceAssignmentExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
@@ -447,11 +491,11 @@ func (v *BasePHPParserVisitor) VisitCloneExpression(ctx *CloneExpressionContext)
 	return v.VisitChildren(ctx)
 }
 
-func (v *BasePHPParserVisitor) VisitStaticClassMemberCallAssignmentExpression(ctx *StaticClassMemberCallAssignmentExpressionContext) interface{} {
+func (v *BasePHPParserVisitor) VisitUnaryOperatorExpression(ctx *UnaryOperatorExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
-func (v *BasePHPParserVisitor) VisitUnaryOperatorExpression(ctx *UnaryOperatorExpressionContext) interface{} {
+func (v *BasePHPParserVisitor) VisitFunctionCallAssignableAssignmentExpression(ctx *FunctionCallAssignableAssignmentExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
@@ -464,6 +508,10 @@ func (v *BasePHPParserVisitor) VisitSpaceshipExpression(ctx *SpaceshipExpression
 }
 
 func (v *BasePHPParserVisitor) VisitConditionalExpression(ctx *ConditionalExpressionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitDynamicStaticClassAccessExpression(ctx *DynamicStaticClassAccessExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
@@ -511,6 +559,10 @@ func (v *BasePHPParserVisitor) VisitOrdinaryAssignmentExpression(ctx *OrdinaryAs
 	return v.VisitChildren(ctx)
 }
 
+func (v *BasePHPParserVisitor) VisitDirectFunctionCallExpression(ctx *DirectFunctionCallExpressionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BasePHPParserVisitor) VisitCastExpression(ctx *CastExpressionContext) interface{} {
 	return v.VisitChildren(ctx)
 }
@@ -535,7 +587,7 @@ func (v *BasePHPParserVisitor) VisitStaticClassAccessExpression(ctx *StaticClass
 	return v.VisitChildren(ctx)
 }
 
-func (v *BasePHPParserVisitor) VisitMemberFunction(ctx *MemberFunctionContext) interface{} {
+func (v *BasePHPParserVisitor) VisitFlexiMemberAccess(ctx *FlexiMemberAccessContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
@@ -548,10 +600,6 @@ func (v *BasePHPParserVisitor) VisitIndexVariable(ctx *IndexVariableContext) int
 }
 
 func (v *BasePHPParserVisitor) VisitCustomVariable(ctx *CustomVariableContext) interface{} {
-	return v.VisitChildren(ctx)
-}
-
-func (v *BasePHPParserVisitor) VisitMemberVariable(ctx *MemberVariableContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
@@ -659,15 +707,15 @@ func (v *BasePHPParserVisitor) VisitQualifiedNamespaceName(ctx *QualifiedNamespa
 	return v.VisitChildren(ctx)
 }
 
-func (v *BasePHPParserVisitor) VisitNamespaceIdentifier(ctx *NamespaceIdentifierContext) interface{} {
+func (v *BasePHPParserVisitor) VisitNamespaceUseDeclaration(ctx *NamespaceUseDeclarationContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
-func (v *BasePHPParserVisitor) VisitNamespaceListNameTail(ctx *NamespaceListNameTailContext) interface{} {
+func (v *BasePHPParserVisitor) VisitNamespaceUseTail(ctx *NamespaceUseTailContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
-func (v *BasePHPParserVisitor) VisitNamespaceNameTail(ctx *NamespaceNameTailContext) interface{} {
+func (v *BasePHPParserVisitor) VisitNamespaceUseClause(ctx *NamespaceUseClauseContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 
@@ -744,6 +792,30 @@ func (v *BasePHPParserVisitor) VisitChainList(ctx *ChainListContext) interface{}
 }
 
 func (v *BasePHPParserVisitor) VisitChain(ctx *ChainContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitAssignableChain(ctx *AssignableChainContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitFunctionCallAssignable(ctx *FunctionCallAssignableContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitFunctionCallAssignableAccess(ctx *FunctionCallAssignableAccessContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitAssignableChainOrigin(ctx *AssignableChainOriginContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitAssignableChainAccess(ctx *AssignableChainAccessContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BasePHPParserVisitor) VisitStaticMethodCall(ctx *StaticMethodCallContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 

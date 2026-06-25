@@ -14,11 +14,39 @@ type sfCheck struct {
 
 	matchItem []*checkItem
 	untilItem []*checkItem
+
+	// beforeMergeHook runs on a child SFFrameResult before MergeByResult (e.g. dataflow
+	// only_reachable post-mode pruning include-rule captures). parent is the accumulated
+	// context result before this child merge.
+	beforeMergeHook func(parent *sf.SFFrameResult, child *sf.SFFrameResult)
 }
 
 type checkItem struct {
 	*sf.RecursiveConfigItem
 	frame *sf.SFFrame
+}
+
+// appendSubRuleFromNativeParam adds one include/exclude/hook/until sub-rule from a native-call param if non-empty.
+func appendSubRuleFromNativeParam(check *sfCheck, params *sf.NativeCallActualParams, paramKey string, cfgKey sf.RecursiveConfigKey) {
+	if check == nil || params == nil {
+		return
+	}
+	if rule := params.GetString(paramKey); rule != "" {
+		check.AppendItems(&sf.RecursiveConfigItem{
+			Key:            string(cfgKey),
+			Value:          rule,
+			SyntaxFlowRule: true,
+		})
+	}
+}
+
+func recursiveCheckKeyLabel(key string) string {
+	switch key {
+	case sf.RecursiveConfig_Include, sf.RecursiveConfig_Exclude, sf.RecursiveConfig_Until, sf.RecursiveConfig_Hook:
+		return string(key)
+	default:
+		return "unknown"
+	}
 }
 
 func CreateCheck(
@@ -43,6 +71,10 @@ func (c *sfCheck) Empty() bool {
 	return len(c.matchItem) == 0 && len(c.untilItem) == 0
 }
 
+func (c *sfCheck) SetBeforeMergeHook(f func(parent *sf.SFFrameResult, child *sf.SFFrameResult)) {
+	c.beforeMergeHook = f
+}
+
 func (c *sfCheck) AppendItems(items ...*sf.RecursiveConfigItem) {
 	for _, item := range items {
 		if item == nil {
@@ -50,19 +82,7 @@ func (c *sfCheck) AppendItems(items ...*sf.RecursiveConfigItem) {
 		}
 		frame, err := c.vm.Compile(item.Value)
 		if err != nil {
-			var keyName string
-			switch item.Key {
-			case sf.RecursiveConfig_Include:
-				keyName = "include"
-			case sf.RecursiveConfig_Exclude:
-				keyName = "exclude"
-			case sf.RecursiveConfig_Until:
-				keyName = "until"
-			case sf.RecursiveConfig_Hook:
-				keyName = "hook"
-			default:
-				keyName = "unknown"
-			}
+			keyName := recursiveCheckKeyLabel(item.Key)
 			// 暴露编译错误，添加到结果中以便前端可以获取
 			errorMsg := utils.Errorf("SyntaxFlow compile error for %s rule [%s]: %v", keyName, item.Value, err).Error()
 			log.Errorf(errorMsg)
@@ -91,23 +111,11 @@ func CreateCheckFromNativeCallParam(
 ) *sfCheck {
 
 	check := CreateCheck(sfResult, config)
-	if rule := params.GetString("exclude"); rule != "" {
-		configItem := &sf.RecursiveConfigItem{Key: sf.RecursiveConfig_Exclude, Value: rule, SyntaxFlowRule: true}
-		check.AppendItems(configItem)
-	}
-	if rule := params.GetString("include"); rule != "" {
-		configItem := &sf.RecursiveConfigItem{Key: sf.RecursiveConfig_Include, Value: rule, SyntaxFlowRule: true}
-		check.AppendItems(configItem)
-	}
-
-	if rule := params.GetString("hook"); rule != "" {
-		configItem := &sf.RecursiveConfigItem{Key: sf.RecursiveConfig_Hook, Value: rule, SyntaxFlowRule: true}
-		check.AppendItems(configItem)
-	}
-	if rule := params.GetString("until"); rule != "" {
-		configItem := &sf.RecursiveConfigItem{Key: sf.RecursiveConfig_Until, Value: rule, SyntaxFlowRule: true}
-		check.AppendItems(configItem)
-	}
+	// Order preserved: exclude / include (path match) before hook / until (walk).
+	appendSubRuleFromNativeParam(check, params, NativeCall_DataflowParamExclude, sf.RecursiveConfig_Exclude)
+	appendSubRuleFromNativeParam(check, params, NativeCall_DataflowParamInclude, sf.RecursiveConfig_Include)
+	appendSubRuleFromNativeParam(check, params, NativeCall_DataflowParamHook, sf.RecursiveConfig_Hook)
+	appendSubRuleFromNativeParam(check, params, NativeCall_DataflowParamUntil, sf.RecursiveConfig_Until)
 
 	return check
 }
@@ -158,7 +166,7 @@ func (r *sfCheck) CheckUntil(path sf.Values) bool {
 }
 func (r *sfCheck) check(
 	path sf.Values,
-	item []*checkItem,
+	items []*checkItem,
 	fn func(string, bool) bool,
 ) {
 	opt := []QueryOption{
@@ -166,8 +174,8 @@ func (r *sfCheck) check(
 		QueryWithInitVar(r.contextResult.SymbolTable),
 		QueryWithValues(path),
 	}
-	for _, item := range item {
-		res, err := item.check(path, opt...)
+	for _, it := range items {
+		res, err := it.check(path, opt...)
 		if err != nil {
 			log.Errorf("check path value %v fail: %v", path.String(), err)
 			continue
@@ -175,7 +183,7 @@ func (r *sfCheck) check(
 
 		match := isMatch(res)
 		r.clearup(res.GetSFResult())
-		if !fn(item.Key, match) {
+		if !fn(it.Key, match) {
 			return
 		}
 	}
@@ -193,16 +201,37 @@ func (item *checkItem) check(value sf.Values, opt ...QueryOption) (*SyntaxFlowRe
 	if err != nil {
 		return nil, utils.Errorf("syntaxflow rule exec fail: %v", err)
 	}
-	return (res), nil
+	return res, nil
 }
 
 func (r *sfCheck) clearup(sfres *sf.SFFrameResult) {
 	if sfres == nil {
 		return
 	}
+	r.sanitizeChildResult(sfres)
+	r.runBeforeMergeHook(sfres)
+	r.mergeChildResult(sfres)
+}
+
+func (r *sfCheck) sanitizeChildResult(sfres *sf.SFFrameResult) {
 	r.config.Mutex.Lock()
 	sfres.AlertSymbolTable.Delete(sf.RecursiveMagicVariable)
 	sfres.SymbolTable.Delete(sf.RecursiveMagicVariable)
+	r.config.Mutex.Unlock()
+}
+
+func (r *sfCheck) runBeforeMergeHook(sfres *sf.SFFrameResult) {
+	if r.beforeMergeHook == nil {
+		return
+	}
+	// Run hook outside config lock:
+	// hook logic may trigger CFG/reachability helpers that re-enter VM/config paths and
+	// attempt to lock the same mutex again. Holding the lock here can deadlock (non-reentrant mutex).
+	r.beforeMergeHook(r.contextResult, sfres)
+}
+
+func (r *sfCheck) mergeChildResult(sfres *sf.SFFrameResult) {
+	r.config.Mutex.Lock()
 	r.contextResult.MergeByResult(sfres)
 	r.config.Mutex.Unlock()
 }

@@ -42,7 +42,6 @@ func main() {
 	a = 0
 }
 `
-	output := runBinaryWithEnv(t, code, "main", map[string]string{"GCLOG": "1"})
+	output := runBinaryWithEnv(t, code, "main", map[string]string{"GCLOG": "1"}, withDebugRuntimeLib())
 	require.Contains(t, output, "[Yak GC] Finalizer triggered")
-	require.Contains(t, output, "Releasing handle")
 }

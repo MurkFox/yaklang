@@ -11,9 +11,6 @@ import (
 type runtimeDispatchFunc func(args []uint64) (int64, error)
 
 var runtimeDispatchTargets = map[abi.FuncID]any{
-	abi.IDPocTimeout:            runtimePocTimeout,
-	abi.IDPocGet:                runtimePocGet,
-	abi.IDPocGetHTTPPacketBody:  runtimePocGetHTTPPacketBody,
 	abi.IDOsGetenv:              runtimeBuiltinGetenv,
 	abi.IDPrint:                 runtimeBuiltinPrint,
 	abi.IDPrintf:                runtimeBuiltinPrintf,
@@ -34,8 +31,20 @@ var runtimeDispatchTargets = map[abi.FuncID]any{
 	abi.IDSyncNewCond:           runtimeSyncNewCond,
 }
 
+func runtimeRegisterDispatchTarget(id abi.FuncID, target any) {
+	if id == 0 || target == nil {
+		return
+	}
+	runtimeDispatchTargets[id] = target
+}
+
 var runtimeDispatchHandlers = map[abi.FuncID]runtimeDispatchFunc{
 	abi.IDRuntimeShadowMethod: runtimeDispatchShadowMethod,
+	abi.IDYaklibCall:          runtimeDispatchYaklibCall,
+	abi.IDRuntimeNext:         runtimeDispatchNext,
+	abi.IDRuntimeIn:           runtimeDispatchIn,
+	abi.IDRuntimeEq:           runtimeDispatchEq,
+	abi.IDRuntimeChanRecv:     runtimeDispatchChanRecv,
 }
 
 func executeRuntimeDispatch(ctx unsafe.Pointer) {

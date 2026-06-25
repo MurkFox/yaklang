@@ -3,6 +3,7 @@ package yakit
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jinzhu/gorm"
@@ -12,6 +13,13 @@ import (
 	"github.com/yaklang/yaklang/common/utils/bizhelper"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
+
+type AIEventRecoveryHistoryResult struct {
+	BlockCount  int
+	EventCount  int
+	NextStartID int64
+	HasMore     bool
+}
 
 func AssociateAIEventToProcess(db *gorm.DB, eventId string, processIds []string) error {
 	return utils.GormTransactionReturnDb(db, func(tx *gorm.DB) {
@@ -32,6 +40,7 @@ func CreateOrUpdateAIOutputEvent(db *gorm.DB, event *schema.AiOutputEvent) error
 	if event == nil {
 		return nil
 	}
+	event.NormalizeRecoveryBlock()
 	db = db.Model(event)
 
 	// stream-finished is a structured event emitted by the AI emitter to mark the end of a stream.
@@ -68,15 +77,57 @@ func SaveStreamAIEvent(outDb *gorm.DB, event *schema.AiOutputEvent) error {
 
 func FilterEvent(db *gorm.DB, filter *ypb.AIEventFilter) *gorm.DB {
 	db = db.Model(&schema.AiOutputEvent{})
-	if len(filter.GetEventUUIDS()) > 0 {
-		db = db.Where("event_uuid IN (?)", filter.GetEventUUIDS())
+	if filter == nil {
+		return db
 	}
-	db = bizhelper.ExactQueryStringArrayOr(db, "coordinator_id", filter.GetCoordinatorId())
-	db = bizhelper.ExactQueryStringArrayOr(db, "type", filter.GetEventType())
-	db = bizhelper.ExactQueryStringArrayOr(db, "task_index", filter.GetTaskIndex())
-	db = bizhelper.ExactQueryStringArrayOr(db, "task_uuid", filter.GetTaskUUID())
-	db = bizhelper.ExactQueryStringArrayOr(db, "node_id", filter.GetNodeId())
-	db = bizhelper.ExactQueryString(db, "session_id", filter.GetSessionID())
+
+	if !filter.GetUseOR() {
+		if len(filter.GetEventUUIDS()) > 0 {
+			db = db.Where("event_uuid IN (?)", filter.GetEventUUIDS())
+		}
+		db = bizhelper.ExactQueryStringArrayOr(db, "coordinator_id", filter.GetCoordinatorId())
+		db = bizhelper.ExactQueryStringArrayOr(db, "type", filter.GetEventType())
+		db = bizhelper.ExactQueryStringArrayOr(db, "task_index", filter.GetTaskIndex())
+		db = bizhelper.ExactQueryStringArrayOr(db, "task_uuid", filter.GetTaskUUID())
+		db = bizhelper.ExactQueryStringArrayOr(db, "node_id", filter.GetNodeId())
+		db = bizhelper.ExactQueryString(db, "session_id", filter.GetSessionID())
+		return db
+	}
+
+	var clauses []string
+	var args []interface{}
+	if len(filter.GetEventUUIDS()) > 0 {
+		clauses = append(clauses, "(event_uuid IN (?))")
+		args = append(args, filter.GetEventUUIDS())
+	}
+	if len(filter.GetCoordinatorId()) > 0 {
+		clauses = append(clauses, "(coordinator_id IN (?))")
+		args = append(args, filter.GetCoordinatorId())
+	}
+	if len(filter.GetEventType()) > 0 {
+		clauses = append(clauses, "(`type` IN (?))")
+		args = append(args, filter.GetEventType())
+	}
+	if len(filter.GetTaskIndex()) > 0 {
+		clauses = append(clauses, "(task_index IN (?))")
+		args = append(args, filter.GetTaskIndex())
+	}
+	if len(filter.GetTaskUUID()) > 0 {
+		clauses = append(clauses, "(task_uuid IN (?))")
+		args = append(args, filter.GetTaskUUID())
+	}
+	if len(filter.GetNodeId()) > 0 {
+		clauses = append(clauses, "(node_id IN (?))")
+		args = append(args, filter.GetNodeId())
+	}
+	if sessionID := filter.GetSessionID(); sessionID != "" {
+		clauses = append(clauses, "(session_id = ?)")
+		args = append(args, sessionID)
+	}
+	if len(clauses) == 0 {
+		return db
+	}
+	db = db.Where(strings.Join(clauses, " OR "), args...)
 	return db
 }
 
@@ -105,6 +156,90 @@ func QueryAIEvent(db *gorm.DB, filter *ypb.AIEventFilter) ([]*schema.AiOutputEve
 		return nil, db.Error
 	}
 	return event, nil
+}
+
+func filterRecoveryHistoryEventsBySession(db *gorm.DB, sessionID string) *gorm.DB {
+	return FilterEvent(db, &ypb.AIEventFilter{SessionID: sessionID})
+}
+
+func YieldAIEventRecoveryHistory(ctx context.Context, db *gorm.DB, sessionID string, startID int64, limit int) (chan *schema.AiOutputEvent, *AIEventRecoveryHistoryResult, error) {
+	if db == nil {
+		return nil, nil, utils.Errorf("database is nil")
+	}
+	if sessionID == "" {
+		return nil, nil, utils.Errorf("session_id is empty")
+	}
+	if limit <= 0 {
+		return nil, nil, utils.Errorf("limit must be greater than 0")
+	}
+
+	outC := make(chan *schema.AiOutputEvent)
+	result := &AIEventRecoveryHistoryResult{}
+
+	go func() {
+		defer close(outC)
+
+		query := filterRecoveryHistoryEventsBySession(db, sessionID).Where("is_recovery_block = ?", true)
+		if startID > 0 {
+			query = query.Where("id < ?", startID)
+		}
+
+		for anchor := range bizhelper.YieldModel[*schema.AiOutputEvent](
+			ctx,
+			query.Order("id desc"),
+			bizhelper.WithYieldModel_Limit(limit),
+		) {
+			if anchor == nil {
+				continue
+			}
+
+			result.BlockCount++
+			result.NextStartID = int64(anchor.ID)
+
+			if anchor.RecoveryIndexID == "" {
+				select {
+				case <-ctx.Done():
+					return
+				case outC <- anchor:
+					result.EventCount++
+				}
+				continue
+			}
+
+			blockQuery := filterRecoveryHistoryEventsBySession(db, sessionID).
+				Where("recovery_index_id = ?", anchor.RecoveryIndexID).
+				Order("id asc")
+
+			for blockEvent := range bizhelper.YieldModel[*schema.AiOutputEvent](ctx, blockQuery) {
+				if blockEvent == nil {
+					continue
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case outC <- blockEvent:
+					result.EventCount++
+				}
+			}
+		}
+
+		if result.NextStartID <= 0 {
+			return
+		}
+
+		var count int64
+		err := filterRecoveryHistoryEventsBySession(db, sessionID).
+			Where("is_recovery_block = ?", true).
+			Where("id < ?", result.NextStartID).
+			Count(&count).Error
+		if err != nil {
+			log.Errorf("count recovery history anchors failed: %v", err)
+			return
+		}
+		result.HasMore = count > 0
+	}()
+
+	return outC, result, nil
 }
 
 func GetRandomAIMaterials(db *gorm.DB, limit int) ([]*schema.AIYakTool, []*schema.KnowledgeBaseEntry, []*schema.AIForge, error) {

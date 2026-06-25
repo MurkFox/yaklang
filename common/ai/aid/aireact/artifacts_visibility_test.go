@@ -209,9 +209,8 @@ WAIT_SECOND:
 
 	secondPrompt := capturedPrompts[len(capturedPrompts)-1]
 
-	// The second prompt should contain artifacts context from DynamicContext
 	assert.Contains(t, secondPrompt, "Session Artifacts",
-		"subsequent conversation prompt should contain 'Session Artifacts' from ArtifactsContextProvider")
+		"subsequent conversation prompt should still surface Session Artifacts as a first-class prompt block")
 	assert.Contains(t, secondPrompt, "task_1-1_network_scan",
 		"subsequent conversation prompt should contain task_1-1 directory name")
 	assert.Contains(t, secondPrompt, "task_1-2_vuln_analysis",
@@ -223,7 +222,31 @@ WAIT_SECOND:
 	assert.Contains(t, secondPrompt, "task_1_1_network_scan_result_summary.txt",
 		"subsequent conversation prompt should contain result summary filename")
 
-	t.Logf("artifacts section found in prompt (extracting DynamicContext portion):")
+	// 反向断言: Pure Dynamic / AutoContext 段对应的 <|AUTO_PROVIDE_CTX_*|> tag
+	// 不应再含 Session Artifacts; 通过裁切验证: 若 Session Artifacts
+	// 出现的位置, 不在 AutoContext tag 之间.
+	// 关键词: 反向断言, AUTO_PROVIDE_CTX 不含 Session Artifacts
+	if autoIdx := strings.Index(secondPrompt, "<|AUTO_PROVIDE_CTX_"); autoIdx >= 0 {
+		autoEndIdx := strings.Index(secondPrompt[autoIdx:], "<|AUTO_PROVIDE_CTX_")
+		if autoEndIdx > 0 {
+			autoCtxBlock := secondPrompt[autoIdx : autoIdx+autoEndIdx]
+			assert.NotContains(t, autoCtxBlock, "Session Artifacts",
+				"AutoContext / Pure Dynamic block must NOT contain Session Artifacts after migration")
+		}
+	}
+
+	// Workspace 与 Session Artifacts 都在 timeline-open 段, 但 Artifacts 是
+	// Workspace 后面的一级块，不再作为 Workspace 子段。
+	wsIdx := strings.Index(secondPrompt, "# Workspace Context")
+	saIdx := strings.Index(secondPrompt, "# Session Artifacts (Open)")
+	if wsIdx >= 0 && saIdx >= 0 {
+		assert.Greater(t, saIdx, wsIdx,
+			"Session Artifacts should render after Workspace Context")
+		assert.NotContains(t, secondPrompt[wsIdx:saIdx], "## Session Artifacts",
+			"Workspace Context must not contain the legacy Session Artifacts subsection")
+	}
+
+	t.Logf("artifacts section found in prompt (extracting Workspace portion):")
 	if idx := strings.Index(secondPrompt, "Session Artifacts"); idx >= 0 {
 		end := idx + 2000
 		if end > len(secondPrompt) {

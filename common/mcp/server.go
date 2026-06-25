@@ -2,10 +2,12 @@ package mcp
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"sync"
 
 	"github.com/jinzhu/gorm"
+	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/mcp/mcp-go/mcp"
 	"github.com/yaklang/yaklang/common/mcp/mcp-go/server"
 )
@@ -20,6 +22,8 @@ type MCPServer struct {
 	projectDB            *gorm.DB
 
 	sseMu sync.Mutex
+
+	bridgeClientClosers []io.Closer
 }
 
 func NewMCPServer(opts ...McpServerOption) (*MCPServer, error) {
@@ -39,7 +43,11 @@ func NewMCPServer(opts ...McpServerOption) (*MCPServer, error) {
 			return nil, err
 		}
 	}
+	s.bridgeClientClosers = cfg.bridgeClientClosers
 	cfg.ApplyConfig(s)
+	if cfg.grpcClient != nil {
+		s.grpcClient = cfg.grpcClient
+	}
 
 	s.server.AddNotificationHandler("notification", s.handleNotification)
 	return s, nil
@@ -98,11 +106,19 @@ func (s *MCPServer) ServeStdio() (err error) {
 	return server.ServeStdio(s.server)
 }
 
-func (s *MCPServer) Close(ctxs ...context.Context) {
-	if s.sseServer == nil && s.streamableHTTPServer == nil && s.httpServer == nil {
-		return
+func (s *MCPServer) closeBridgeClients() {
+	for _, closer := range s.bridgeClientClosers {
+		if closer == nil {
+			continue
+		}
+		if err := closer.Close(); err != nil {
+			log.Warnf("close bridge mcp client failed: %v", err)
+		}
 	}
+	s.bridgeClientClosers = nil
+}
 
+func (s *MCPServer) Close(ctxs ...context.Context) {
 	s.sseMu.Lock()
 	defer s.sseMu.Unlock()
 
@@ -122,6 +138,7 @@ func (s *MCPServer) Close(ctxs ...context.Context) {
 		_ = s.httpServer.Shutdown(ctx)
 		s.httpServer = nil
 	}
+	s.closeBridgeClients()
 }
 
 func (s *MCPServer) handleNotification(
@@ -148,4 +165,9 @@ func (s *MCPServer) ensureLocalClient() error {
 	}
 	s.grpcClient = client
 	return nil
+}
+
+// BindLocalGRPCClient wires the in-process yak gRPC client for legacy tool handlers.
+func (s *MCPServer) BindLocalGRPCClient() error {
+	return s.ensureLocalClient()
 }

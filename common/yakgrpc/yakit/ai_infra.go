@@ -122,6 +122,12 @@ func UpdateAIAgentRuntimeUserInput(db *gorm.DB, uuid string, quotedInput string)
 	return db.Model(&schema.AIAgentRuntime{}).Where("uuid = ?", uuid).Update("quoted_user_input", quotedInput).Error
 }
 
+// UpdateAIAgentRuntimeEvidence updates the quoted_evidence field for all AIAgentRuntime rows
+// matching the given persistent session ID, consistent with other session-level update functions.
+func UpdateAIAgentRuntimeEvidence(db *gorm.DB, persistentId string, quotedEvidence string) error {
+	return db.Model(&schema.AIAgentRuntime{}).Where("persistent_session = ?", persistentId).Update("quoted_evidence", quotedEvidence).Error
+}
+
 // GetLatestAIAgentRuntimeByPersistentSession 获取某个持久化会话的最新运行时
 func GetLatestAIAgentRuntimeByPersistentSession(db *gorm.DB, sessionId string) (*schema.AIAgentRuntime, error) {
 	start := time.Now()
@@ -132,7 +138,7 @@ func GetLatestAIAgentRuntimeByPersistentSession(db *gorm.DB, sessionId string) (
 	}()
 
 	var runtime schema.AIAgentRuntime
-	if err := db.Where("persistent_session = ?", sessionId).Order("updated_at DESC").First(&runtime).Error; err != nil {
+	if err := db.Where("persistent_session = ?", sessionId).Order("id DESC").First(&runtime).Error; err != nil {
 		return nil, err
 	}
 	return &runtime, nil

@@ -1,0 +1,282 @@
+package aicommon
+
+import "github.com/yaklang/yaklang/common/ai/aid/aitool"
+
+// PromptMaterials 是 prefix 渲染的统一语义材料模型。
+//
+// 设计目标:
+//   - 作为 aireact 与 aid planAndExec 的共同 prefix 输入
+//   - 明确承载 high-static / frozen / semi / timeline-open 各层语义字段
+//   - PromptPrefixBuilder 只接收这一种语义材料，再由各段模板按需消费
+//
+// 关键词: PromptMaterials, shared prefix materials, aireact + aid 共用
+type PromptMaterials struct {
+	Nonce             string
+	AllowToolCall     bool
+	AllowPlanAndExec  bool
+	HasLoadCapability bool
+
+	TaskInstruction string
+	Schema          string
+	OutputExample   string
+
+	// SemiDynamic 提示材料:
+	//   - aireact: SkillsContext + RecentToolsCache
+	//   - aid: PlanHelp / OriginalUserInput / StableInstruction 等 prompt-specific
+	//     但仍属可缓存半动态前缀的内容
+	SkillsContext     string
+	RecentToolsCache  string
+	PlanHelp          string
+	OriginalUserInput string
+	StableInstruction string
+
+	ToolInventory bool
+	ToolsCount    int
+	TopToolsCount int
+	TopTools      []*aitool.Tool
+	HasMoreTools  bool
+	// MoreToolsCount = ToolsCount - TopToolsCount, 即未在 prompt Top 列表中
+	// 渲染的剩余工具数量. 让模板能直接展开成具体数字 ("...still 73 more tools
+	// available via search_capabilities"), 而不是只给一个无信息的省略号.
+	// 关键词: MoreToolsCount, Tool Inventory 剩余工具数
+	MoreToolsCount int
+	ForgeInventory bool
+	AIForgeList    string
+
+	TimelineFrozen         string
+	TimelineOpen           string
+	TimelineFrozenTimeUnix int64
+	FrozenPartitions       []FrozenBlockPartition
+	SessionArtifactsFrozen string
+	SessionArtifactsOpen   string
+	SessionEvidenceFrozen  string
+	SessionEvidenceOpen    string
+	CurrentTime            string
+	Workspace              bool
+	OSArch                 string
+	WorkingDir             string
+	WorkingDirGlance       string
+
+	// Deprecated: SessionArtifactsListing 保留给旧测试 / 兼容调用面。新 prompt
+	// 主路径使用 SessionArtifactsFrozen / SessionArtifactsOpen 两个一级字段。
+	SessionArtifactsListing string
+	// Deprecated: SessionEvidence 保留给旧调用路径 fallback。新主路径使用
+	// SessionEvidenceFrozen / SessionEvidenceOpen 两个一级字段。
+	SessionEvidence string
+	// TodoSnapshot 是会话级 TODO 列表渲染结果 (含 <|TODO_LIST_<nonce>|>...
+	// 边界标签的整段块). 物理位置紧跟 SessionEvidence, 与 SessionEvidence
+	// 一样落在 timeline-open 段, 不被 AI_CACHE_FROZEN / AI_CACHE_SEMI 任何
+	// 缓存边界包裹, 避免污染上游 prefix cache.
+	//
+	// 关键词: TodoSnapshot, 全局 TODO 块, timeline-open 段位
+	TodoSnapshot      string
+	UserHistory       string
+	FrozenUserContext string
+}
+
+// HighStaticData 返回空 map: high-static 段是完全无变量的系统级共享 static。
+func (m *PromptMaterials) HighStaticData() map[string]any {
+	return map[string]any{}
+}
+
+// SemiDynamicData 供 caller-specific semi-dynamic 模板消费。
+func (m *PromptMaterials) SemiDynamicData() map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"SkillsContext":     m.SkillsContext,
+		"RecentToolsCache":  m.RecentToolsCache,
+		"PlanHelp":          m.PlanHelp,
+		"OriginalUserInput": m.OriginalUserInput,
+		"StableInstruction": m.StableInstruction,
+	}
+}
+
+// SemiDynamic1Data 兼容 aireact P1.1 命名。
+func (m *PromptMaterials) SemiDynamic1Data() map[string]any {
+	return m.SemiDynamicData()
+}
+
+// SemiDynamic2Data 供 TaskInstruction -> Schema -> OutputExample 半动态段消费。
+func (m *PromptMaterials) SemiDynamic2Data() map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"TaskInstruction": m.TaskInstruction,
+		"Schema":          m.Schema,
+		"OutputExample":   m.OutputExample,
+	}
+}
+
+// FrozenBlockData 供 frozen-block 模板消费。
+func (m *PromptMaterials) FrozenBlockData() map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"ToolInventory":          m.ToolInventory,
+		"ToolsCount":             m.ToolsCount,
+		"TopToolsCount":          m.TopToolsCount,
+		"TopTools":               m.TopTools,
+		"HasMoreTools":           m.HasMoreTools,
+		"MoreToolsCount":         m.MoreToolsCount,
+		"ForgeInventory":         m.ForgeInventory,
+		"AIForgeList":            m.AIForgeList,
+		"FrozenPartitions":       NormalizeFrozenBlockPartitions(m.FrozenPartitions),
+		"SessionArtifactsFrozen": m.SessionArtifactsFrozen,
+		"SessionEvidenceFrozen":  m.SessionEvidenceFrozen,
+		"TimelineFrozen":         m.TimelineFrozen,
+		"TimelineFrozenTimeUnix": m.TimelineFrozenTimeUnix,
+	}
+}
+
+// TimelineOpenData 供 timeline-open 模板消费, 模板字段渲染顺序 (P1-C3):
+//
+//	Timeline (Open Tail) -> SessionEvidence -> TodoSnapshot -> Workspace ->
+//	SessionArtifactsOpen -> UserHistory -> Current Time -> PlanContext (末尾)
+//
+// 段内排序原则:
+//  1. Timeline (Open Tail) 在最前: 时间线最末桶是模型理解"刚发生了什么"的
+//     首要信息源, 顶到段首让 LLM 第一时间看到。midterm 内容 (若有) 已并入
+//     TimelineOpen。
+//  2. SessionEvidence 紧跟 Timeline: SESSION_ARTIFACTS 是 Config 级持久化
+//     观测 (跨 turn 累积的工件证据), 与 Timeline 末桶共同构成"会话级实证"
+//     连续语料块, 物理上贴近 Timeline 让两者形成连续语义。
+//  3. Workspace 居中: OS/Arch + working dir + glance 是相对静态的环境标识,
+//     既不属于"刚发生", 也不属于"用户视角", 居中过渡。
+//  4. UserHistory 在 Workspace 之后: PREV_USER_INPUT 是用户历史输入轨迹,
+//     与下方 Current Time 一起构成"时序前缀"。
+//  5. Current Time 紧跟 UserHistory: 当前时间是最末稳定的时序锚点, 形成
+//     "历史输入 -> 现在"时间递进, 同时与下方 PlanContext 形成"时间 ->
+//     任务"语义衔接。
+//  6. PlanContext (PE-TASK PLAN 产物 PARENT_TASK + CURRENT_TASK + INSTRUCTION)
+//     在段最末尾。本段不被 AI_CACHE_FROZEN /
+//     AI_CACHE_SEMI 任何缓存边界包裹, 是 prompt 的"易变尾段", 让 PlanContext
+//     的子任务切换抖动不会污染上游 system / frozen / semi 三段缓存命中。
+//
+// 注: Go map literal 的 key 顺序不影响模板渲染 (template 按 key 取值),
+// 这里 key 顺序与上面文档中的渲染顺序保持一致只是为了源码可读性, 真正的
+// 渲染顺序由 prompts/prefix/timeline_open_section.txt 决定。
+//
+// 关键词: TimelineOpenData, Timeline 末桶, SessionEvidence, Workspace,
+//
+//	UserHistory, Current Time, PlanContext 末尾注入, P1-C3 段内顺序,
+//	缓存边界外
+func (m *PromptMaterials) TimelineOpenData() map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	sessionEvidenceOpen := m.SessionEvidenceOpen
+	if sessionEvidenceOpen == "" {
+		sessionEvidenceOpen = m.SessionEvidence
+	}
+	return map[string]any{
+		"TimelineOpen":           m.TimelineOpen,
+		"TimelineFrozenTimeUnix": m.TimelineFrozenTimeUnix,
+		"SessionEvidence":        sessionEvidenceOpen,
+		"TodoSnapshot":           m.TodoSnapshot,
+		"Workspace":              m.Workspace,
+		"OSArch":                 m.OSArch,
+		"WorkingDir":             m.WorkingDir,
+		"WorkingDirGlance":       m.WorkingDirGlance,
+		"SessionArtifactsOpen":   m.SessionArtifactsOpen,
+		"UserHistory":            m.UserHistory,
+		"CurrentTime":            m.CurrentTime,
+		"PlanContext":            m.FrozenUserContext,
+	}
+}
+
+type TimelineFrozenOpenBlocks struct {
+	Frozen         string
+	Open           string
+	FrozenTimeUnix int64
+}
+
+func RenderTimelineFrozenOpen(timeline *Timeline) TimelineFrozenOpenBlocks {
+	if timeline == nil {
+		return TimelineFrozenOpenBlocks{}
+	}
+	rb := timeline.GroupByMinutes(TimelineDumpDefaultIntervalMinutes).GetAllRenderable()
+	return TimelineFrozenOpenBlocks{
+		Frozen:         rb.RenderFrozenOnly(TimelineDumpDefaultAITagName),
+		Open:           rb.RenderOpenOnly(TimelineDumpDefaultAITagName),
+		FrozenTimeUnix: timelineFrozenTimeUnixFromRenderable(rb),
+	}
+}
+
+type PromptFrozenOpenMaterials struct {
+	TimelineFrozen         string
+	TimelineOpen           string
+	TimelineFrozenTimeUnix int64
+	FrozenPartitions       []FrozenBlockPartition
+
+	SessionArtifactsFrozen string
+	SessionArtifactsOpen   string
+	SessionEvidenceFrozen  string
+	SessionEvidenceOpen    string
+}
+
+func BuildPromptFrozenOpenMaterials(config *Config, openNonce ...string) PromptFrozenOpenMaterials {
+	if config == nil {
+		return PromptFrozenOpenMaterials{}
+	}
+	nonce := ""
+	if len(openNonce) > 0 {
+		nonce = openNonce[0]
+	}
+	timelineBlocks := RenderTimelineFrozenOpen(config.GetTimeline())
+	artifactBlocks := RenderSessionArtifactsFrozenOpen(config, timelineBlocks.FrozenTimeUnix)
+	evidenceBlocks := config.GetSessionPromptState().GetSessionEvidenceFrozenOpenBlocks(timelineBlocks.FrozenTimeUnix, nonce)
+	return PromptFrozenOpenMaterials{
+		TimelineFrozen:         timelineBlocks.Frozen,
+		TimelineOpen:           timelineBlocks.Open,
+		TimelineFrozenTimeUnix: timelineBlocks.FrozenTimeUnix,
+		FrozenPartitions:       FrozenBlockPartitionsFromConfig(config),
+		SessionArtifactsFrozen: artifactBlocks.Frozen,
+		SessionArtifactsOpen:   artifactBlocks.Open,
+		SessionEvidenceFrozen:  evidenceBlocks.Frozen,
+		SessionEvidenceOpen:    evidenceBlocks.Open,
+	}
+}
+
+func ApplyPromptFrozenOpenMaterials(materials *PromptMaterials, frozenOpen PromptFrozenOpenMaterials) {
+	if materials == nil {
+		return
+	}
+	materials.TimelineFrozen = frozenOpen.TimelineFrozen
+	materials.TimelineOpen = frozenOpen.TimelineOpen
+	materials.TimelineFrozenTimeUnix = frozenOpen.TimelineFrozenTimeUnix
+	materials.FrozenPartitions = append([]FrozenBlockPartition(nil), NormalizeFrozenBlockPartitions(frozenOpen.FrozenPartitions)...)
+	materials.SessionArtifactsFrozen = frozenOpen.SessionArtifactsFrozen
+	materials.SessionArtifactsOpen = frozenOpen.SessionArtifactsOpen
+	materials.SessionEvidenceFrozen = frozenOpen.SessionEvidenceFrozen
+	materials.SessionEvidenceOpen = frozenOpen.SessionEvidenceOpen
+}
+
+func timelineFrozenTimeUnixFromRenderable(blocks TimelineRenderableBlocks) int64 {
+	if len(blocks) == 0 {
+		return 0
+	}
+	var lastFrozenEnd int64
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		interval, ok := block.(*TimelineIntervalBlock)
+		if !ok || interval == nil {
+			continue
+		}
+		if block.IsOpen() {
+			if !interval.BucketStart.IsZero() {
+				return interval.BucketStart.Unix()
+			}
+			return 0
+		}
+		if !interval.BucketEnd.IsZero() {
+			lastFrozenEnd = interval.BucketEnd.Unix()
+		}
+	}
+	return lastFrozenEnd
+}

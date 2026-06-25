@@ -149,6 +149,14 @@ func PemPkcs1v15Encrypt(pemBytes []byte, data interface{}) ([]byte, error) {
 
 // EncryptWithPkcs1v15/RSAEncryptWithPKCS1v15 使用 RSA 公钥和 PKCS#1 v1.5 填充方式对给定数据进行加密。
 //
+// 参数:
+//   - raw: RSA 公钥（支持 DER/PEM/Base64 等格式）
+//   - data: 要加密的明文数据（[]byte、string 等）
+//
+// 返回值:
+//   - 加密后的密文字节数组
+//   - 错误信息，加密失败时返回非空
+//
 // 参数 raw 表示 RSA 公钥，支持以下格式：
 //   - DER 编码的公钥（raw ASN.1 DER 字节流）
 //   - Base64 编码的 DER 格式（自动解码）
@@ -160,15 +168,11 @@ func PemPkcs1v15Encrypt(pemBytes []byte, data interface{}) ([]byte, error) {
 //
 // Example:
 // ```
-//
-//		raw := `
-//		-----BEGIN PUBLIC KEY-----
-//		MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAn...（略）
-//		-----END PUBLIC KEY-----
-//		`
-//		ciphertext, err := EncryptWithPkcs1v15(raw, "hello world")
-//	 ciphertext, err := RSAEncryptWithPKCS1v15(raw, "hello world")
-//
+// // 生成一对 RSA 密钥(第一个返回值是公钥, 第二个是私钥)，用公钥加密，再用私钥解密验证往返一致
+// pub, pri = tls.GenerateRSA2048KeyPair()~
+// ciphertext = codec.RSAEncryptWithPKCS1v15(pub, "hello world")~
+// plaintext = codec.RSADecryptWithPKCS1v15(pri, ciphertext)~
+// assert string(plaintext) == "hello world", "RSA PKCS1v15 encrypt/decrypt round-trip should match"
 // ```
 func Pkcs1v15Encrypt(raw []byte, data interface{}) ([]byte, error) {
 	dataBytes := utils.InterfaceToBytes(data)
@@ -321,27 +325,24 @@ func PemPkcsOAEPEncrypt(raw []byte, data interface{}) ([]byte, error) {
 	return PkcsOAEPEncryptWithHash(raw, data, sha256.New())
 }
 
-// RSAEncryptWithOAEP 使用 RSA 公钥和 OAEP 填充方式对给定数据进行加密。
+// RSAEncryptWithOAEP 使用 RSA 公钥和 OAEP 填充方式对给定数据进行加密（导出名为 codec.RSAEncryptWithOAEP）
+// 默认使用 SHA-256 作为 OAEP 哈希算法
 //
-// 参数 raw 表示 RSA 公钥，支持以下格式：
-//   - DER 编码的公钥（raw ASN.1 DER 字节流）
-//   - Base64 编码的 DER 格式（自动解码）
-//   - PEM 编码（例如 "-----BEGIN PUBLIC KEY-----" 或 "-----BEGIN RSA PUBLIC KEY-----" 块）
-//   - Base64 编码的 PEM 格式（自动解码）
+// 参数:
+//   - raw: RSA 公钥，支持 DER、Base64(DER)、PEM、Base64(PEM) 等格式（自动识别）
+//   - data: 待加密的明文，可为 []byte、string 等可转换为字节的类型
 //
-// 参数 data 是要加密的明文数据，可以是 []byte、string 或其他可转换为字节数组的类型。
-// 返回值是加密后的密文（字节切片），如果加密失败则返回错误。
+// 返回值:
+//   - 密文字节
+//   - 错误信息（公钥解析失败或加密失败时返回）
 //
 // Example:
 // ```
-//
-//	raw := `
-//	-----BEGIN PUBLIC KEY-----
-//	MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAn...（略）
-//	-----END PUBLIC KEY-----
-//	`
-//	ciphertext, err := RSAEncryptWithOAEP(raw, "hello world")
-//
+// pub, pri = tls.GenerateRSA2048KeyPair()~
+// ciphertext = codec.RSAEncryptWithOAEP(pub, "hello yak")~
+// plaintext = codec.RSADecryptWithOAEP(pri, ciphertext)~
+// println(string(plaintext))
+// assert string(plaintext) == "hello yak", "OAEP roundtrip should recover plaintext"
 // ```
 func PkcsOAEPEncrypt(raw []byte, data interface{}) ([]byte, error) {
 	return PkcsOAEPEncryptWithHash(raw, data, sha256.New())
@@ -366,24 +367,25 @@ func PemPkcsOAEPDecrypt(pemPriBytes []byte, data interface{}) ([]byte, error) {
 	return PkcsOAEPDecryptWithHash(pemPriBytes, data, sha256.New())
 }
 
-// RSADecryptWithOAEP 使用 RSA私钥 和 RSA-OAEP 填充方式解密给定的密文。
-// 参数 raw 表示 RSA 私钥，支持以下格式：
-//   - DER 编码的私钥（raw ASN.1 DER 字节流）
-//   - Base64 编码的 DER 格式（自动解码）
-//   - PEM 编码（包括带有 "-----BEGIN PRIVATE KEY-----" 或 "-----BEGIN RSA PRIVATE KEY-----" 的块）
-//   - Base64 编码的 PEM 格式（自动解码）
+// RSADecryptWithOAEP 使用 RSA 私钥和 OAEP 填充方式解密给定的密文（导出名为 codec.RSADecryptWithOAEP）
+// 默认使用 SHA-256 作为 OAEP 哈希算法，与 codec.RSAEncryptWithOAEP 配对使用
 //
-// 参数 data 是加密后的数据（密文），可以是 []byte 或 base64 字符串等支持类型。
-// 返回值是解密得到的原始明文，如果失败则返回错误。
+// 参数:
+//   - raw: RSA 私钥，支持 DER、Base64(DER)、PEM、Base64(PEM) 等格式（自动识别）
+//   - data: 待解密的密文，可为 []byte 或 base64 字符串等支持类型
 //
-// 示例：
+// 返回值:
+//   - 解密得到的明文字节
+//   - 错误信息（私钥解析失败或解密失败时返回）
 //
-//	raw := `
-//	-----BEGIN PRIVATE KEY-----
-//	MIIEvQIBADANBgkqhkiG9w0BAQEFAASC...（略）
-//	-----END PRIVATE KEY-----
-//	`
-//	plaintext, err := Pkcs1v15Decrypt([]byte(raw), encryptedData)
+// Example:
+// ```
+// pub, pri = tls.GenerateRSA2048KeyPair()~
+// ciphertext = codec.RSAEncryptWithOAEP(pub, "hello yak")~
+// plaintext = codec.RSADecryptWithOAEP(pri, ciphertext)~
+// println(string(plaintext))
+// assert string(plaintext) == "hello yak", "OAEP roundtrip should recover plaintext"
+// ```
 func PkcsOAEPDecrypt(raw []byte, data interface{}) ([]byte, error) {
 	return PkcsOAEPDecryptWithHash(raw, data, sha256.New())
 }
@@ -436,17 +438,21 @@ func PemPkcs1v15Decrypt(pemPriBytes []byte, data interface{}) ([]byte, error) {
 // 参数 data 是被加密后的数据（密文）
 // 返回值是解密得到的原始明文，如果失败则返回错误。
 //
+// 参数:
+//   - raw: RSA 私钥（支持 DER/PEM/Base64 等格式）
+//   - data: 要解密的密文数据（[]byte、string 等）
+//
+// 返回值:
+//   - 解密得到的明文字节数组
+//   - 错误信息，解密失败时返回非空
+//
 // Example:
 // ```
-//
-//		raw := `
-//		-----BEGIN PRIVATE KEY-----
-//		MIIEvQIBADANBgkqhkiG9w0BAQEFAASC...（略）
-//		-----END PRIVATE KEY-----
-//		`
-//		plaintext, err := DecryptWithPkcs1v15(raw, encryptedData)
-//	 	plaintext, err := RSADecryptWithPKCS1v15(raw, encryptedData)
-//
+// // 生成一对 RSA 密钥(第一个返回值是公钥, 第二个是私钥)，用公钥加密后再用私钥解密验证往返一致
+// pub, pri = tls.GenerateRSA2048KeyPair()~
+// ciphertext = codec.RSAEncryptWithPKCS1v15(pub, "hello world")~
+// plaintext = codec.RSADecryptWithPKCS1v15(pri, ciphertext)~
+// assert string(plaintext) == "hello world", "RSA PKCS1v15 decrypt should recover the plaintext"
 // ```
 func Pkcs1v15Decrypt(raw []byte, data interface{}) ([]byte, error) {
 	dataBytes := utils.InterfaceToBytes(data)
@@ -462,16 +468,24 @@ func Pkcs1v15Decrypt(raw []byte, data interface{}) ([]byte, error) {
 	return results, err
 }
 
-// SignSHA256WithRSA 使用RSA私钥对数据进行SHA256签名，返回签名与错误
+// SignSHA256WithRSA 使用 RSA 私钥对数据做 SHA256 签名（导出名为 codec.SignSHA256WithRSA）
+// 私钥支持 PKCS8 与 PKCS1 两种 PEM 格式
+//
+// 参数:
+//   - pemBytes: PEM 格式的 RSA 私钥
+//   - data: 待签名的原始数据，可为 []byte、string 等类型
+//
+// 返回值:
+//   - 签名字节
+//   - 错误信息（私钥解析失败或签名失败时返回）
+//
 // Example:
 // ```
-// pemBytes = string(`-----BEGIN PRIVATE KEY-----
-// MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDZz5Zz3z3z3z3z
-// ...
-// -----END PRIVATE KEY-----`)
-// signBytes, err := tls.SignSHA256WithRSA(pemBytes, "hello")
-// die(err)
-// signString = string(signBytes)
+// pub, pri = tls.GenerateRSA2048KeyPair()~
+// signature = codec.SignSHA256WithRSA(pri, "hello yak")~
+// err = codec.SignVerifySHA256WithRSA(pub, "hello yak", signature)
+// println(err)
+// assert err == nil, "valid sha256 signature should be verified successfully"
 // ```
 func PemSignSha256WithRSA(pemBytes []byte, data interface{}) ([]byte, error) {
 	dataBytes := utils.InterfaceToBytes(data)
@@ -494,15 +508,24 @@ func PemSignSha256WithRSA(pemBytes []byte, data interface{}) ([]byte, error) {
 	return rsa.SignPKCS1v15(cryptorand.Reader, pkey, crypto.SHA256, results)
 }
 
-// SignVerifySHA256WithRSA 使用RSA公钥对数据进行SHA256签名验证，返回错误
+// SignVerifySHA256WithRSA 使用 RSA 公钥验证数据的 SHA256 签名（导出名为 codec.SignVerifySHA256WithRSA）
+// 与 codec.SignSHA256WithRSA 配对使用，验证通过时返回 nil
+//
+// 参数:
+//   - pemBytes: PEM 格式的 RSA 公钥
+//   - originData: 被签名的原始数据
+//   - sign: 待验证的签名字节
+//
+// 返回值:
+//   - 错误信息（验证失败或公钥解析失败时返回，验证通过返回 nil）
+//
 // Example:
 // ```
-// pemBytes = string(`-----BEGIN PUBLIC KEY-----
-// MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs1pvFYNQpPSPbshg6F7Z
-// ...
-// -----END PUBLIC KEY-----`)
-// err := tls.PemVerifySignSha256WithRSA(pemBytes, "hello", signBytes)
-// die(err)
+// pub, pri = tls.GenerateRSA2048KeyPair()~
+// signature = codec.SignSHA256WithRSA(pri, "hello yak")~
+// err = codec.SignVerifySHA256WithRSA(pub, "hello yak", signature)
+// println(err)
+// assert err == nil, "valid sha256 signature should be verified successfully"
 // ```
 func PemVerifySignSha256WithRSA(pemBytes []byte, originData any, sign []byte) error {
 	dataBytes := utils.InterfaceToBytes(originData)
@@ -519,16 +542,24 @@ func PemVerifySignSha256WithRSA(pemBytes []byte, originData any, sign []byte) er
 	return rsa.VerifyPKCS1v15(pub, crypto.SHA256, origin, sign)
 }
 
-// SignSHA512WithRSA 使用RSA私钥对数据进行SHA512签名，返回签名与错误
+// SignSHA512WithRSA 使用 RSA 私钥对数据做 SHA512 签名（导出名为 codec.SignSHA512WithRSA）
+// 私钥支持 PKCS8 与 PKCS1 两种 PEM 格式
+//
+// 参数:
+//   - pemBytes: PEM 格式的 RSA 私钥
+//   - data: 待签名的原始数据，可为 []byte、string 等类型
+//
+// 返回值:
+//   - 签名字节
+//   - 错误信息（私钥解析失败或签名失败时返回）
+//
 // Example:
 // ```
-// pemBytes = string(`-----BEGIN PRIVATE KEY-----
-// MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDZz5Zz3z3z3z3z
-// ...
-// -----END PRIVATE KEY-----`)
-// signBytes, err := tls.SignSHA512WithRSA(pemBytes, "hello")
-// die(err)
-// signString = string(signBytes)
+// pub, pri = tls.GenerateRSA2048KeyPair()~
+// signature = codec.SignSHA512WithRSA(pri, "hello yak")~
+// err = codec.SignVerifySHA512WithRSA(pub, "hello yak", signature)
+// println(err)
+// assert err == nil, "valid sha512 signature should be verified successfully"
 // ```
 func PemSignSha512WithRSA(pemBytes []byte, data interface{}) ([]byte, error) {
 	dataBytes := utils.InterfaceToBytes(data)
@@ -551,15 +582,24 @@ func PemSignSha512WithRSA(pemBytes []byte, data interface{}) ([]byte, error) {
 	return rsa.SignPKCS1v15(cryptorand.Reader, pkey, crypto.SHA512, results)
 }
 
-// SignVerifySHA512WithRSA 使用RSA公钥对数据进行SHA512签名验证，返回错误
+// SignVerifySHA512WithRSA 使用 RSA 公钥验证数据的 SHA512 签名（导出名为 codec.SignVerifySHA512WithRSA）
+// 与 codec.SignSHA512WithRSA 配对使用，验证通过时返回 nil
+//
+// 参数:
+//   - pemBytes: PEM 格式的 RSA 公钥
+//   - originData: 被签名的原始数据
+//   - sign: 待验证的签名字节
+//
+// 返回值:
+//   - 错误信息（验证失败或公钥解析失败时返回，验证通过返回 nil）
+//
 // Example:
 // ```
-// pemBytes = string(`-----BEGIN PUBLIC KEY-----
-// MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs1pvFYNQpPSPbshg6F7Z
-// ...
-// -----END PUBLIC KEY-----`)
-// err := tls.PemVerifySignSha512WithRSA(pemBytes, "hello", signBytes)
-// die(err)
+// pub, pri = tls.GenerateRSA2048KeyPair()~
+// signature = codec.SignSHA512WithRSA(pri, "hello yak")~
+// err = codec.SignVerifySHA512WithRSA(pub, "hello yak", signature)
+// println(err)
+// assert err == nil, "valid sha512 signature should be verified successfully"
 // ```
 func PemVerifySignSha512WithRSA(pemBytes []byte, originData any, sign []byte) error {
 	dataBytes := utils.InterfaceToBytes(originData)
@@ -606,20 +646,9 @@ func hashData(data []byte, h crypto.Hash) []byte {
 // hashName: "MD5" | "SHA-1" | "SHA-256" | "SHA-384" | "SHA-512"
 func PemSignRSA(pemBytes []byte, data interface{}, scheme string, hashName string) ([]byte, error) {
 	dataBytes := utils.InterfaceToBytes(data)
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		return nil, utils.Error("parse PEM: no block found")
-	}
-	pri, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	pkey, err := GetRSAPrivateKey(pemBytes)
 	if err != nil {
-		pri, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, utils.Errorf("parse private key (PKCS8/PKCS1) failed: %s", err)
-		}
-	}
-	pkey, ok := pri.(*rsa.PrivateKey)
-	if !ok {
-		return nil, utils.Errorf("need *rsa.PrivateKey, got %T", pri)
+		return nil, utils.Errorf("parse private key failed: %s", err)
 	}
 	hashAlg := getCryptoHash(hashName)
 	hashed := hashData(dataBytes, hashAlg)
@@ -640,11 +669,7 @@ func PemSignRSA(pemBytes []byte, data interface{}, scheme string, hashName strin
 // scheme: "PKCS1v15" | "PSS", hashName 同 PemSignRSA
 func PemVerifyRSA(pemBytes []byte, data interface{}, sign []byte, scheme string, hashName string) error {
 	dataBytes := utils.InterfaceToBytes(data)
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		return utils.Error("parse PEM: no block found")
-	}
-	pub, err := ParseRsaPublicKeyFromPemBlock(block)
+	pub, err := GetRSAPubKey(pemBytes)
 	if err != nil {
 		return utils.Errorf("parse public key failed: %s", err)
 	}

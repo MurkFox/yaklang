@@ -43,8 +43,17 @@ type PHPParserVisitor interface {
 	// Visit a parse tree produced by PHPParser#namespaceDeclaration.
 	VisitNamespaceDeclaration(ctx *NamespaceDeclarationContext) interface{}
 
+	// Visit a parse tree produced by PHPParser#namespaceDeclarationSemi.
+	VisitNamespaceDeclarationSemi(ctx *NamespaceDeclarationSemiContext) interface{}
+
 	// Visit a parse tree produced by PHPParser#namespaceStatement.
 	VisitNamespaceStatement(ctx *NamespaceStatementContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#namespaceDeclarationBody.
+	VisitNamespaceDeclarationBody(ctx *NamespaceDeclarationBodyContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#namespaceUseDeclarations.
+	VisitNamespaceUseDeclarations(ctx *NamespaceUseDeclarationsContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#functionDeclaration.
 	VisitFunctionDeclaration(ctx *FunctionDeclarationContext) interface{}
@@ -69,6 +78,9 @@ type PHPParserVisitor interface {
 
 	// Visit a parse tree produced by PHPParser#typeParameterWithDefaultDecl.
 	VisitTypeParameterWithDefaultDecl(ctx *TypeParameterWithDefaultDeclContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#callableIdentifier.
+	VisitCallableIdentifier(ctx *CallableIdentifierContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#attributes.
 	VisitAttributes(ctx *AttributesContext) interface{}
@@ -193,6 +205,15 @@ type PHPParserVisitor interface {
 	// Visit a parse tree produced by PHPParser#typeHint.
 	VisitTypeHint(ctx *TypeHintContext) interface{}
 
+	// Visit a parse tree produced by PHPParser#typeHintAtom.
+	VisitTypeHintAtom(ctx *TypeHintAtomContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#typeHintIntersection.
+	VisitTypeHintIntersection(ctx *TypeHintIntersectionContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#typeHintUnion.
+	VisitTypeHintUnion(ctx *TypeHintUnionContext) interface{}
+
 	// Visit a parse tree produced by PHPParser#globalStatement.
 	VisitGlobalStatement(ctx *GlobalStatementContext) interface{}
 
@@ -286,6 +307,18 @@ type PHPParserVisitor interface {
 	// Visit a parse tree produced by PHPParser#indexMemberCallKey.
 	VisitIndexMemberCallKey(ctx *IndexMemberCallKeyContext) interface{}
 
+	// Visit a parse tree produced by PHPParser#dynamicStaticClassExpr.
+	VisitDynamicStaticClassExpr(ctx *DynamicStaticClassExprContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#dynamicStaticReceiver.
+	VisitDynamicStaticReceiver(ctx *DynamicStaticReceiverContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#dynamicStaticReceiverBase.
+	VisitDynamicStaticReceiverBase(ctx *DynamicStaticReceiverBaseContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#dynamicStaticReceiverAccess.
+	VisitDynamicStaticReceiverAccess(ctx *DynamicStaticReceiverAccessContext) interface{}
+
 	// Visit a parse tree produced by PHPParser#SpecialWordExpression.
 	VisitSpecialWordExpression(ctx *SpecialWordExpressionContext) interface{}
 
@@ -310,9 +343,6 @@ type PHPParserVisitor interface {
 	// Visit a parse tree produced by PHPParser#MatchExpression.
 	VisitMatchExpression(ctx *MatchExpressionContext) interface{}
 
-	// Visit a parse tree produced by PHPParser#StaticClassReferenceAssignmentExpression.
-	VisitStaticClassReferenceAssignmentExpression(ctx *StaticClassReferenceAssignmentExpressionContext) interface{}
-
 	// Visit a parse tree produced by PHPParser#FunctionCallExpression.
 	VisitFunctionCallExpression(ctx *FunctionCallExpressionContext) interface{}
 
@@ -324,6 +354,9 @@ type PHPParserVisitor interface {
 
 	// Visit a parse tree produced by PHPParser#PostfixIncDecExpression.
 	VisitPostfixIncDecExpression(ctx *PostfixIncDecExpressionContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#FunctionCallAssignableReferenceAssignmentExpression.
+	VisitFunctionCallAssignableReferenceAssignmentExpression(ctx *FunctionCallAssignableReferenceAssignmentExpressionContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#IncludeExpression.
 	VisitIncludeExpression(ctx *IncludeExpressionContext) interface{}
@@ -337,11 +370,11 @@ type PHPParserVisitor interface {
 	// Visit a parse tree produced by PHPParser#CloneExpression.
 	VisitCloneExpression(ctx *CloneExpressionContext) interface{}
 
-	// Visit a parse tree produced by PHPParser#StaticClassMemberCallAssignmentExpression.
-	VisitStaticClassMemberCallAssignmentExpression(ctx *StaticClassMemberCallAssignmentExpressionContext) interface{}
-
 	// Visit a parse tree produced by PHPParser#UnaryOperatorExpression.
 	VisitUnaryOperatorExpression(ctx *UnaryOperatorExpressionContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#FunctionCallAssignableAssignmentExpression.
+	VisitFunctionCallAssignableAssignmentExpression(ctx *FunctionCallAssignableAssignmentExpressionContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#ParenthesisExpression.
 	VisitParenthesisExpression(ctx *ParenthesisExpressionContext) interface{}
@@ -351,6 +384,9 @@ type PHPParserVisitor interface {
 
 	// Visit a parse tree produced by PHPParser#ConditionalExpression.
 	VisitConditionalExpression(ctx *ConditionalExpressionContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#DynamicStaticClassAccessExpression.
+	VisitDynamicStaticClassAccessExpression(ctx *DynamicStaticClassAccessExpressionContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#TemplateExpression.
 	VisitTemplateExpression(ctx *TemplateExpressionContext) interface{}
@@ -385,6 +421,9 @@ type PHPParserVisitor interface {
 	// Visit a parse tree produced by PHPParser#OrdinaryAssignmentExpression.
 	VisitOrdinaryAssignmentExpression(ctx *OrdinaryAssignmentExpressionContext) interface{}
 
+	// Visit a parse tree produced by PHPParser#DirectFunctionCallExpression.
+	VisitDirectFunctionCallExpression(ctx *DirectFunctionCallExpressionContext) interface{}
+
 	// Visit a parse tree produced by PHPParser#CastExpression.
 	VisitCastExpression(ctx *CastExpressionContext) interface{}
 
@@ -403,8 +442,8 @@ type PHPParserVisitor interface {
 	// Visit a parse tree produced by PHPParser#StaticClassAccessExpression.
 	VisitStaticClassAccessExpression(ctx *StaticClassAccessExpressionContext) interface{}
 
-	// Visit a parse tree produced by PHPParser#MemberFunction.
-	VisitMemberFunction(ctx *MemberFunctionContext) interface{}
+	// Visit a parse tree produced by PHPParser#FlexiMemberAccess.
+	VisitFlexiMemberAccess(ctx *FlexiMemberAccessContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#IndexLegacyCallVariable.
 	VisitIndexLegacyCallVariable(ctx *IndexLegacyCallVariableContext) interface{}
@@ -414,9 +453,6 @@ type PHPParserVisitor interface {
 
 	// Visit a parse tree produced by PHPParser#CustomVariable.
 	VisitCustomVariable(ctx *CustomVariableContext) interface{}
-
-	// Visit a parse tree produced by PHPParser#MemberVariable.
-	VisitMemberVariable(ctx *MemberVariableContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#defineExpr.
 	VisitDefineExpr(ctx *DefineExprContext) interface{}
@@ -496,14 +532,14 @@ type PHPParserVisitor interface {
 	// Visit a parse tree produced by PHPParser#qualifiedNamespaceName.
 	VisitQualifiedNamespaceName(ctx *QualifiedNamespaceNameContext) interface{}
 
-	// Visit a parse tree produced by PHPParser#NamespaceIdentifier.
-	VisitNamespaceIdentifier(ctx *NamespaceIdentifierContext) interface{}
+	// Visit a parse tree produced by PHPParser#namespaceUseDeclaration.
+	VisitNamespaceUseDeclaration(ctx *NamespaceUseDeclarationContext) interface{}
 
-	// Visit a parse tree produced by PHPParser#NamespaceListNameTail.
-	VisitNamespaceListNameTail(ctx *NamespaceListNameTailContext) interface{}
+	// Visit a parse tree produced by PHPParser#namespaceUseTail.
+	VisitNamespaceUseTail(ctx *NamespaceUseTailContext) interface{}
 
-	// Visit a parse tree produced by PHPParser#namespaceNameTail.
-	VisitNamespaceNameTail(ctx *NamespaceNameTailContext) interface{}
+	// Visit a parse tree produced by PHPParser#namespaceUseClause.
+	VisitNamespaceUseClause(ctx *NamespaceUseClauseContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#qualifiedNamespaceNameList.
 	VisitQualifiedNamespaceNameList(ctx *QualifiedNamespaceNameListContext) interface{}
@@ -561,6 +597,24 @@ type PHPParserVisitor interface {
 
 	// Visit a parse tree produced by PHPParser#chain.
 	VisitChain(ctx *ChainContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#assignableChain.
+	VisitAssignableChain(ctx *AssignableChainContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#functionCallAssignable.
+	VisitFunctionCallAssignable(ctx *FunctionCallAssignableContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#functionCallAssignableAccess.
+	VisitFunctionCallAssignableAccess(ctx *FunctionCallAssignableAccessContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#assignableChainOrigin.
+	VisitAssignableChainOrigin(ctx *AssignableChainOriginContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#assignableChainAccess.
+	VisitAssignableChainAccess(ctx *AssignableChainAccessContext) interface{}
+
+	// Visit a parse tree produced by PHPParser#staticMethodCall.
+	VisitStaticMethodCall(ctx *StaticMethodCallContext) interface{}
 
 	// Visit a parse tree produced by PHPParser#chainOrigin.
 	VisitChainOrigin(ctx *ChainOriginContext) interface{}

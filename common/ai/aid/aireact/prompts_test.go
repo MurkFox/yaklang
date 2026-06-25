@@ -2,6 +2,7 @@ package aireact
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -10,9 +11,11 @@ import (
 	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
+	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/filesys"
 )
 
 func TestPromptManagerWithDynamicContextProvider(t *testing.T) {
@@ -278,8 +281,13 @@ func TestPromptManager_DynamicContextWithNonce_TruncatesPrevUserInputHistoryTo20
 		t.Fatalf("Failed to create ReAct instance: %v", err)
 	}
 
-	oldPayload := "_old_marker" + strings.Repeat("A", 18000)
-	newPayload := strings.Repeat("B", 9000) + "_new_marker"
+	// Each "word_NNN " produces ~2 tokens. Need total > 20K tokens across both entries.
+	var oldParts []string
+	for i := 0; i < 15000; i++ {
+		oldParts = append(oldParts, fmt.Sprintf("old_%d", i))
+	}
+	oldPayload := "_old_marker " + strings.Join(oldParts, " ")
+	newPayload := strings.Repeat("B", 500) + " _new_marker"
 	react.config.SetUserInputHistory([]schema.AIAgentUserInputRecord{
 		{Round: 1, Timestamp: time.Date(2026, 3, 26, 10, 0, 0, 0, time.Local), UserInput: oldPayload},
 		{Round: 2, Timestamp: time.Date(2026, 3, 26, 10, 5, 0, 0, time.Local), UserInput: newPayload},
@@ -294,6 +302,383 @@ func TestPromptManager_DynamicContextWithNonce_TruncatesPrevUserInputHistoryTo20
 	}
 	if !strings.Contains(ctx, "_new_marker") || !strings.Contains(ctx, "Round 2") {
 		t.Fatalf("latest history content should be preserved after truncation. Got:\n%s", ctx)
+	}
+}
+
+func TestPromptManager_GenerateToolParamsPromptWithMeta_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	tool := aitool.NewWithoutCallback("query-file",
+		aitool.WithDescription("Read a target file"),
+		aitool.WithStringParam("path",
+			aitool.WithParam_Description("target path"),
+			aitool.WithParam_Required(true),
+		),
+	)
+	tool.Usage = "Read a file from the workspace."
+	react.AddToTimeline("test", "timeline content")
+
+	result, err := react.promptManager.GenerateToolParamsPromptWithMeta(tool)
+	if err != nil {
+		t.Fatalf("GenerateToolParamsPromptWithMeta failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("GenerateToolParamsPromptWithMeta returned nil result")
+	}
+
+	prompt := result.Prompt
+	if !utils.MatchAllOfSubString(prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-1|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_",
+		"<|SCHEMA|>",
+		"<|TOOL_DESC|>",
+		"<|TOOL_USAGE|>",
+		"target path",
+		"<|TOOL_PARAM_path_"+result.Nonce+"|>",
+	) {
+		t.Fatalf("tool params prompt should be composed by prompt sections. Got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "<|TOOL_PARAM_SCHEMA|>") {
+		t.Fatalf("tool schema should now be rendered in static schema block instead of dynamic tags. Got:\n%s", prompt)
+	}
+}
+
+func TestPromptManager_GenerateToolParamsPromptWithMeta_IncludesLoadedSkillsContext(t *testing.T) {
+	const skillCommandMarker = "excelcli import tax001-skill-marker-for-tool-params"
+
+	vfs := filesys.NewVirtualFs()
+	vfs.AddFile("tax-excel/SKILL.md", `---
+name: tax-excel
+description: Tax excel analysis skill for tool parameter generation
+---
+# Tax Excel Analysis
+
+Use this exact command sequence:
+
+`+skillCommandMarker+`
+`)
+
+	react, err := NewTestReAct(
+		aicommon.WithSkillsFS(vfs),
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	loop, err := reactloops.NewReActLoop("tool-params-skill-test", react)
+	if err != nil {
+		t.Fatalf("failed to create ReAct loop: %v", err)
+	}
+
+	mgr := loop.GetSkillsContextManager()
+	if mgr == nil {
+		t.Fatal("SkillsContextManager should not be nil when skills FS is configured")
+	}
+	if err := mgr.LoadSkill("tax-excel"); err != nil {
+		t.Fatalf("failed to load tax-excel skill: %v", err)
+	}
+
+	task := aicommon.NewStatefulTaskBase("tool-params-skill-task", "analyze tax excel files", context.Background(), react.config.GetEmitter(), true)
+	task.SetReActLoop(loop)
+	react.setCurrentTask(task)
+
+	tool := aitool.NewWithoutCallback("bash",
+		aitool.WithDescription("Execute shell commands"),
+		aitool.WithStringParam("command",
+			aitool.WithParam_Description("shell command"),
+			aitool.WithParam_Required(true),
+		),
+	)
+	tool.Usage = "Run shell commands in the workspace."
+
+	result, err := react.promptManager.GenerateToolParamsPromptWithMeta(tool)
+	if err != nil {
+		t.Fatalf("GenerateToolParamsPromptWithMeta failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("GenerateToolParamsPromptWithMeta returned nil result")
+	}
+
+	prompt := result.Prompt
+	if !strings.Contains(prompt, "<|SKILLS_CONTEXT_skills_context|>") {
+		t.Fatalf("tool params prompt should include SKILLS_CONTEXT block. Got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "== Currently Loaded Skills ==") {
+		t.Fatalf("tool params prompt should include loaded skills section. Got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, skillCommandMarker) {
+		t.Fatalf("tool params prompt should include loaded SKILL.md command guidance. Got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "tax-excel") {
+		t.Fatalf("tool params prompt should include loaded skill name. Got:\n%s", prompt)
+	}
+}
+
+func TestPromptManager_GenerateToolParamsPromptWithMeta_OmitsUnloadedSkillBody(t *testing.T) {
+	const skillCommandMarker = "excelcli import tax001-skill-marker-not-loaded"
+
+	vfs := filesys.NewVirtualFs()
+	vfs.AddFile("tax-excel/SKILL.md", `---
+name: tax-excel
+description: Tax excel analysis skill
+---
+# Tax Excel
+
+`+skillCommandMarker+`
+`)
+
+	react, err := NewTestReAct(
+		aicommon.WithSkillsFS(vfs),
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	loop, err := reactloops.NewReActLoop("tool-params-skill-not-loaded-test", react)
+	if err != nil {
+		t.Fatalf("failed to create ReAct loop: %v", err)
+	}
+
+	task := aicommon.NewStatefulTaskBase("tool-params-skill-not-loaded-task", "analyze tax excel files", context.Background(), react.config.GetEmitter(), true)
+	task.SetReActLoop(loop)
+	react.setCurrentTask(task)
+
+	tool := aitool.NewWithoutCallback("bash",
+		aitool.WithDescription("Execute shell commands"),
+		aitool.WithStringParam("command",
+			aitool.WithParam_Description("shell command"),
+			aitool.WithParam_Required(true),
+		),
+	)
+
+	result, err := react.promptManager.GenerateToolParamsPromptWithMeta(tool)
+	if err != nil {
+		t.Fatalf("GenerateToolParamsPromptWithMeta failed: %v", err)
+	}
+
+	prompt := result.Prompt
+	if strings.Contains(prompt, skillCommandMarker) {
+		t.Fatalf("unloaded skill body should not appear in tool params prompt. Got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "tax-excel") {
+		t.Fatalf("available skill registry should still be visible. Got:\n%s", prompt)
+	}
+}
+
+func TestPromptManager_GenerateDirectlyAnswerPrompt_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	prompt, nonce, err := react.promptManager.GenerateDirectlyAnswerPrompt("reply to this", nil)
+	if err != nil {
+		t.Fatalf("GenerateDirectlyAnswerPrompt failed: %v", err)
+	}
+
+	if !utils.MatchAllOfSubString(prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-1|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_"+nonce+"|>",
+		"<|SCHEMA|>",
+		"<|USER_QUERY_"+nonce+"|>",
+		"<|FINAL_ANSWER_"+nonce+"|>",
+	) {
+		t.Fatalf("directly answer prompt should be composed by prompt sections. Got:\n%s", prompt)
+	}
+}
+
+func TestPromptManager_GenerateToolReSelectPrompt_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	oldTool := aitool.NewWithoutCallback("sleep", aitool.WithDescription("sleep for a while"))
+	toolList := []*aitool.Tool{
+		oldTool,
+		aitool.NewWithoutCallback("echo", aitool.WithDescription("echo some text")),
+	}
+
+	prompt, err := react.promptManager.GenerateToolReSelectPrompt(true, oldTool, toolList)
+	if err != nil {
+		t.Fatalf("GenerateToolReSelectPrompt failed: %v", err)
+	}
+
+	if !utils.MatchAllOfSubString(prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-1|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_",
+		"# Tool Inventory",
+		"<|SCHEMA|>",
+		"你在此前选择了工具",
+		"`sleep`",
+		"`echo`",
+	) {
+		t.Fatalf("tool re-select prompt should be composed by prompt sections. Got:\n%s", prompt)
+	}
+}
+
+func TestPromptManager_GenerateReGenerateToolParamsPromptWithMeta_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	tool := aitool.NewWithoutCallback("bash-tool",
+		aitool.WithDescription("Run bash"),
+		aitool.WithStringParam("command", aitool.WithParam_Description("command text")),
+	)
+
+	result, err := react.promptManager.GenerateReGenerateToolParamsPromptWithMeta(
+		"retry with valid command",
+		aitool.InvokeParams{"command": "bad value"},
+		tool,
+	)
+	if err != nil {
+		t.Fatalf("GenerateReGenerateToolParamsPromptWithMeta failed: %v", err)
+	}
+
+	if !utils.MatchAllOfSubString(result.Prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-1|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_",
+		"<|SCHEMA|>",
+		"<|OLD_PARAMS_"+result.Nonce+"|>",
+		"<|TOOL_DESC|>",
+		"<|TOOL_PARAM_command_"+result.Nonce+"|>",
+	) {
+		t.Fatalf("re-generate tool params prompt should be composed by prompt sections. Got:\n%s", result.Prompt)
+	}
+}
+
+func TestPromptManager_GenerateChangeAIBlueprintPrompt_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	forge := &schema.AIForge{ForgeName: "forge-alpha", Description: "alpha desc"}
+	prompt, err := react.promptManager.GenerateChangeAIBlueprintPrompt(
+		forge,
+		"* `forge-beta`: beta desc",
+		aitool.InvokeParams{"target": "example.com"},
+		"switch to a better blueprint",
+	)
+	if err != nil {
+		t.Fatalf("GenerateChangeAIBlueprintPrompt failed: %v", err)
+	}
+
+	if !utils.MatchAllOfSubString(prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-1|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_",
+		"# AI Blueprint Inventory",
+		"<|SCHEMA|>",
+		"Current AI Blueprint",
+		"forge-alpha",
+		"forge-beta",
+		"<|OLD_PARAMS_",
+	) {
+		t.Fatalf("change blueprint prompt should be composed by prompt sections. Got:\n%s", prompt)
+	}
+}
+
+func TestPromptManager_GenerateAIBlueprintForgeParamsPrompt_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	forge := &schema.AIForge{ForgeName: "test-forge", Description: "Test AI Forge for unit testing"}
+	prompt, err := react.promptManager.GenerateAIBlueprintForgeParamsPrompt(forge, `{"type":"object","properties":{"host":{"type":"string","description":"目标主机地址"}}}`)
+	if err != nil {
+		t.Fatalf("GenerateAIBlueprintForgeParamsPrompt failed: %v", err)
+	}
+
+	if !utils.MatchAllOfSubString(prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-1|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_",
+		"<|SCHEMA|>",
+		"AI Blueprint Parameter Generation",
+		"Blueprint Description:",
+		"Blueprint Schema:",
+		"call-ai-blueprint",
+		"目标主机地址",
+		"test-forge",
+	) {
+		t.Fatalf("blueprint params prompt should be composed by prompt sections. Got:\n%s", prompt)
 	}
 }
 
@@ -601,6 +986,134 @@ func TestPromptManager_AIForgeList(t *testing.T) {
 	t.Logf("Successfully verified AI Forge List contains hostscan forge")
 }
 
+func TestPromptManager_GenerateVerificationPrompt_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	prompt, nonce, err := react.promptManager.GenerateVerificationPrompt(
+		"请验证当前子任务是否完成",
+		true,
+		"tool executed: verify target",
+		"extra verification hint",
+	)
+	if err != nil {
+		t.Fatalf("GenerateVerificationPrompt failed: %v", err)
+	}
+
+	if !utils.MatchAllOfSubString(prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-1|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_"+nonce+"|>",
+		"<|SCHEMA|>",
+		"<|USER_ORIGINAL_QUERY_"+nonce+"|>",
+		"<|INPUT_"+nonce+"|>",
+		"<|TODO_SNAPSHOT_"+nonce+"|>",
+		"<|ENHANCE_DATA_"+nonce+"|>",
+	) {
+		t.Fatalf("verification prompt should be composed by prompt sections. Got:\n%s", prompt)
+	}
+}
+
+func TestPromptManager_GenerateAIReviewPrompt_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "risk_assessment", "risk_score": 0.2, "reason": "safe read"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+	react.AddToTimeline("review", "timeline content for ai review")
+
+	prompt, err := react.promptManager.GenerateAIReviewPrompt(
+		"verify file exists",
+		"bash",
+		`{"command":"ls /tmp"}`,
+	)
+	if err != nil {
+		t.Fatalf("GenerateAIReviewPrompt failed: %v", err)
+	}
+
+	nonce := aicommon.MustExtractDynamicSectionNonce(t, prompt)
+	if !utils.MatchAllOfSubString(prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_"+nonce+"|>",
+		"<|SCHEMA|>",
+		"<|OUTPUT_EXAMPLE|>",
+		"<|USER_QUERY_"+nonce+"|>",
+		"<|REVIEW_ENTITY|>",
+		"risk_assessment",
+		`{"command":"ls /tmp"}`,
+	) {
+		t.Fatalf("ai review prompt should be composed by prompt sections. Got:\n%s", prompt)
+	}
+}
+
+func TestPromptManager_GenerateIntervalReviewPrompt_UsesPromptSections(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "decision": "continue"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+	react.AddToTimeline("interval-review", "timeline content for interval review")
+
+	tool := aitool.NewWithoutCallback(
+		"network_diagnose",
+		aitool.WithDescription("Collect network diagnostics"),
+		aitool.WithStringParam("target"),
+	)
+	prompt, err := react.promptManager.GenerateIntervalReviewPromptWithContext(
+		tool,
+		aitool.InvokeParams{"target": "127.0.0.1"},
+		[]byte("partial output"),
+		[]byte("warn line"),
+		time.Unix(0, 0),
+		1,
+		"expect structured diagnostics",
+	)
+	if err != nil {
+		t.Fatalf("GenerateIntervalReviewPromptWithContext failed: %v", err)
+	}
+
+	nonce := aicommon.MustExtractDynamicSectionNonce(t, prompt)
+	if !utils.MatchAllOfSubString(prompt,
+		"<|AI_CACHE_SYSTEM_high-static|>",
+		"<|PROMPT_SECTION_semi-dynamic-2|>",
+		"<|PROMPT_SECTION_timeline-open|>",
+		"<|PROMPT_SECTION_dynamic_"+nonce+"|>",
+		"<|SCHEMA|>",
+		"<|OUTPUT_EXAMPLE|>",
+		"network_diagnose",
+		"partial output",
+		"interval-toolcall-review",
+		"expect structured diagnostics",
+	) {
+		t.Fatalf("interval review prompt should be composed by prompt sections. Got:\n%s", prompt)
+	}
+}
+
 func TestGenerateVerificationPrompt_RendersTodoSnapshot(t *testing.T) {
 	react, err := NewTestReAct(
 		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
@@ -648,6 +1161,10 @@ func TestGenerateVerificationPrompt_RendersTodoSnapshot(t *testing.T) {
 		"next_movements 只输出增量",
 		"{\"op\": \"doing\", \"id\": \"stable_id\"}",
 		"{\"op\": \"delete\", \"id\": \"stable_id\"}",
+		// 新增 skip op 必须出现在 verification prompt 的 op 清单中, 否则
+		// AI 无从得知"如何主动跳过 TODO", 兜底机制就会反复触发.
+		// 关键词: prompt skip op 清单, AI 关闭 TODO 通道
+		"{\"op\": \"skip\", \"id\": \"stable_id\"}",
 		"{\"op\": \"add\", \"id\": \"stable_id\", \"content\": \"新增一个短链路 TODO\"}",
 	) {
 		t.Fatalf("verification prompt should contain structured TODO snapshot and incremental instructions. Got:\n%s", prompt)
@@ -675,10 +1192,16 @@ func TestGenerateVerificationPrompt_RendersAbandonedTodosAfterSatisfied(t *testi
 			{Op: "add", ID: "retry_payload", Content: "更换 payload 再次验证"},
 		},
 	})
+	// AI 主动 skip 两条残留 TODO, 这是新机制下唯一能让残留项进入 SKIPPED
+	// 状态的路径; 旧版本依赖 Satisfied=true 自动翻 SKIPPED, 该语义已废弃.
+	// 关键词: 显式 skip op + Satisfied=true 同轮关闭 + prompt 渲染
 	react.AppendVerificationHistory(&aicommon.VerifySatisfactionResult{
-		Satisfied:     true,
-		Reasoning:     "目标达成",
-		NextMovements: []aicommon.VerifyNextMovement{},
+		Satisfied: true,
+		Reasoning: "目标达成；同时主动跳过未推进的 TODO",
+		NextMovements: []aicommon.VerifyNextMovement{
+			{Op: "skip", ID: "collect_signal"},
+			{Op: "skip", ID: "retry_payload"},
+		},
 	})
 
 	prompt, _, err := react.promptManager.GenerateVerificationPrompt("观察页面回显", false, "已成功得到完整响应")
@@ -690,10 +1213,10 @@ func TestGenerateVerificationPrompt_RendersAbandonedTodosAfterSatisfied(t *testi
 		prompt,
 		"- [SKIPPED]: [id: collect_signal]: 收集页面回显信号",
 		"- [SKIPPED]: [id: retry_payload]: 更换 payload 再次验证",
-		"系统会自动把剩余未关闭 TODO 标记为 `SKIPPED`",
-		"`next_movements` 必须输出 `[]`",
+		"必须被显式关闭",
+		"系统不再自动把剩余未关闭 TODO 标记为 `SKIPPED`",
 	) {
-		t.Fatalf("verification prompt should render abandoned TODO items after satisfaction. Got:\n%s", prompt)
+		t.Fatalf("verification prompt should render explicitly-skipped TODO items and the new no-auto-skip guidance. Got:\n%s", prompt)
 	}
 }
 
@@ -738,9 +1261,43 @@ func TestGenerateVerificationPrompt_TruncatesLongTodoSnapshotButKeepsFocus(t *te
 		prompt,
 		"# TODO:",
 		"active_focus",
-		"TODO history exceeded 10KB",
+		"TODO history exceeded 10K tokens",
 	) {
 		t.Fatalf("verification prompt should truncate long TODO history but keep latest focus item. Got:\n%s", prompt)
+	}
+}
+
+func TestGenerateVerificationPrompt_IncludesEvidenceJSONArrayGuidance(t *testing.T) {
+	react, err := NewTestReAct(
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	prompt, _, err := react.promptManager.GenerateVerificationPrompt("请继续验证接口行为", true, "tool executed: continue")
+	if err != nil {
+		t.Fatalf("Failed to generate verification prompt: %v", err)
+	}
+
+	if !utils.MatchAllOfSubString(
+		prompt,
+		"`evidence` 不是必填字段",
+		"JSON 对象数组",
+		"`op`",
+		"`id`",
+		"`content`",
+	) {
+		t.Fatalf("verification prompt should contain evidence JSON array guidance. Got:\n%s", prompt)
+	}
+
+	if strings.Contains(prompt, "<|EVIDENCE_") {
+		t.Fatalf("verification prompt should NOT contain AITAG EVIDENCE blocks anymore. Got:\n%s", prompt)
 	}
 }
 
@@ -783,6 +1340,46 @@ func TestGenerateIntervalReviewPrompt_IncludesConcreteStringGuidance(t *testing.
 		`"progress_summary": "已完成网络接口、监听端口与路由配置的采集，正在补充协议与监控指标。"`,
 	) {
 		t.Fatalf("interval review prompt should contain anti-schema guidance and concrete example. Got:\n%s", prompt)
+	}
+}
+
+func TestGenerateIntervalReviewPrompt_WithExtraPrompt(t *testing.T) {
+	extraPrompt := "interval-review-extra-" + utils.RandStringBytes(24)
+
+	react, err := NewTestReAct(
+		aicommon.WithToolCallIntervalReviewExtraPrompt(extraPrompt),
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			rsp := i.NewAIResponse()
+			rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "test"}, "cumulative_summary": "test summary", "human_readable_thought": "test thought"}`))
+			rsp.Close()
+			return rsp, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ReAct instance: %v", err)
+	}
+
+	tool := aitool.NewWithoutCallback(
+		"network_diagnose",
+		aitool.WithStringParam("target"),
+	)
+
+	prompt, err := react.promptManager.GenerateIntervalReviewPromptWithContext(
+		tool,
+		aitool.InvokeParams{"target": "127.0.0.1"},
+		[]byte("partial output"),
+		nil,
+		time.Unix(0, 0),
+		1,
+		"expect structured diagnostics",
+	)
+	if err != nil {
+		t.Fatalf("Failed to generate interval review prompt: %v", err)
+	}
+
+	extraPromptBlock := aicommon.MustExtractAITagBlock(t, prompt, "EXTRA_PROMPT")
+	if extraPromptBlock.Body != extraPrompt {
+		t.Fatalf("interval review prompt should wrap extra prompt in EXTRA_PROMPT AITAG. Got:\n%s", prompt)
 	}
 }
 

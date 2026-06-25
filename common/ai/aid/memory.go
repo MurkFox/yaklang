@@ -3,6 +3,7 @@ package aid
 import (
 	"bytes"
 	"fmt"
+	"github.com/google/uuid"
 	osRuntime "runtime"
 	"strings"
 	"text/template"
@@ -85,6 +86,19 @@ func (m *PromptContextProvider) CopyReducibleMemory() *PromptContextProvider {
 	return mem
 }
 
+// GetDefaultContextProvider 返回默认的 Prompt 上下文提供器（导出名为 aiagent.GetDefaultContextProvider）
+// 上下文提供器持有计划历史、持久化数据、交互历史以及工具列表
+// 参数:
+//   - 无
+//
+// 返回值:
+//   - 默认上下文提供器对象
+//
+// Example:
+// ```
+// provider = aiagent.GetDefaultContextProvider()
+// dump(provider)
+// ```
 func GetDefaultContextProvider() *PromptContextProvider {
 	mem := &PromptContextProvider{
 		PlanHistory:        make([]*PlanRecord, 0),
@@ -113,6 +127,7 @@ func (m *PromptContextProvider) BindCoordinator(c *Coordinator) {
 		return config.Keywords
 	})
 	m.PushPersistentData(config.PersistentMemory...)
+	config.AppendFrozenBlockPartition(uuid.NewString(), "persistent_context", strings.Join(config.PersistentMemory, "\n"), aicommon.PersistentMemoryOrder)
 	m.timeline.SoftBindConfig(config, config)
 }
 
@@ -184,6 +199,24 @@ func (m *PromptContextProvider) TimelineDump() string {
 		return m.timeline.Dump()
 	}
 	return ""
+}
+
+// TimelineDumpFrozenOpen 把 timeline 拆成 frozen / open 两半返回,
+// 提供给 LiteForge 等 5 段稳定性分层模板把 frozen 段塞进
+// <|AI_CACHE_FROZEN_semi-dynamic|> 块, open 段塞进
+// <|PROMPT_SECTION_timeline-open|> 块。
+//
+// timeline 为空 / 全 open / 全 frozen 等退化场景由 Timeline.DumpFrozenOpen
+// 内部处理, 调用方仅需根据返回值是否为空来决定是否渲染对应 PROMPT_SECTION 块。
+//
+// 关键词: PromptContextProvider.TimelineDumpFrozenOpen, 5 段稳定性分层,
+//
+//	LiteForge timeline 拆分, frozen open
+func (m *PromptContextProvider) TimelineDumpFrozenOpen() (frozen string, open string) {
+	if m == nil || m.timeline == nil {
+		return "", ""
+	}
+	return m.timeline.DumpFrozenOpen()
 }
 
 // set tools list
@@ -287,10 +320,6 @@ func (m *PromptContextProvider) PushUserInteraction(stage aicommon.UserInteracti
 	m.timeline.PushUserInteraction(stage, seq, question, userInput)
 }
 
-func (m *PromptContextProvider) Timeline() string {
-	return m.timeline.Dump()
-}
-
 func (m *PromptContextProvider) GetTimelineInstance() *aicommon.Timeline {
 	return m.timeline
 }
@@ -336,7 +365,7 @@ func (m *PromptContextProvider) CurrentTaskTimeline() string {
 		}
 	}()
 	if m.CurrentTask == nil {
-		return m.Timeline()
+		return m.TimelineDump()
 	}
 	stl := m.timeline.CreateSubTimeline(m.CurrentTask.ToolCallResultsID()...)
 	if stl == nil {
@@ -364,106 +393,87 @@ func (m *PromptContextProvider) PromptForToolCallResultsForLastN(n int) string {
 
 // memory tools current task info
 func (m *PromptContextProvider) CurrentTaskInfo() string {
+	dynamic := strings.TrimSpace(m.CurrentTaskInfoDynamic())
+	stable := strings.TrimSpace(m.CurrentTaskInfoStable())
+	switch {
+	case dynamic == "" && stable == "":
+		return ""
+	case dynamic == "":
+		return stable
+	case stable == "":
+		return dynamic
+	default:
+		return dynamic + "\n\n" + stable
+	}
+}
+
+func (m *PromptContextProvider) CurrentTaskInfoDynamic() string {
 	if m.CurrentTask == nil {
 		return "BUG:... currentTaskInfo cannot be generated in `CurrentTaskInfo`, no current task"
 	}
-	results, err := utils.RenderTemplate(__prompt_currentTaskInfo, map[string]interface{}{
-		"ContextProvider": m,
+	results, err := aicommon.RenderPromptTemplate("current-task-info-dynamic", __prompt_currentTaskInfoDynamic, map[string]any{
+		"Progress":                m.Progress(),
+		"CurrentTaskUserInput":    m.CurrentTask.GetUserInput(),
+		"ToolCallCount":           m.CurrentTask.ToolCallCount(),
+		"TaskContinueCount":       m.CurrentTask.TaskContinueCount(),
+		"TaskMaxContinue":         m.TaskMaxContinue(),
+		"SingleLineStatusSummary": m.CurrentTask.SingleLineStatusSummary(),
+		"SharedEvidenceContext":   m.SharedEvidenceContext(),
 	})
 	if err != nil {
 		return "BUG:... currentTaskInfo cannot be generated in `CurrentTaskInfo` err: " + err.Error()
 	}
-
 	return results
 }
 
-func findTaskByIndex(root *AiTask, index string) *AiTask {
-	if root == nil || index == "" {
-		return nil
+func (m *PromptContextProvider) CurrentTaskInfoStable() string {
+	results, err := aicommon.RenderPromptTemplate("current-task-info-stable", __prompt_currentTaskInfoStable, map[string]any{})
+	if err != nil {
+		return "BUG:... currentTaskInfo stable cannot be generated err: " + err.Error()
 	}
-	if root.Index == index {
-		return root
-	}
-	for _, sub := range root.Subtasks {
-		if found := findTaskByIndex(sub, index); found != nil {
-			return found
-		}
-	}
-	return nil
+	return results
 }
 
-func (m *PromptContextProvider) getRootTask() *AiTask {
-	if m.RootTask != nil {
-		return m.RootTask
-	}
-	if m.CurrentTask != nil && m.CurrentTask.Coordinator != nil {
-		return m.CurrentTask.rootTask
-	}
-	return nil
-}
-
-// PredecessorTasksContext collects summaries from predecessor tasks (completed siblings
-// and DependsOn dependencies) so the current task can review what has already been delivered.
-func (m *PromptContextProvider) PredecessorTasksContext() string {
+func (m *PromptContextProvider) SharedEvidenceContext() string {
 	if m.CurrentTask == nil {
 		return ""
 	}
 
-	seen := make(map[string]bool)
-	var predecessors []*AiTask
-
-	if m.CurrentTask.ParentTask != nil {
-		for _, sibling := range m.CurrentTask.ParentTask.Subtasks {
-			if sibling.Index == m.CurrentTask.Index {
-				break
-			}
-			if sibling.executed() {
-				predecessors = append(predecessors, sibling)
-				seen[sibling.Index] = true
-			}
-		}
-	}
-
-	if len(m.CurrentTask.DependsOn) > 0 {
-		root := m.getRootTask()
-		if root != nil {
-			for _, depIndex := range m.CurrentTask.DependsOn {
-				if seen[depIndex] {
-					continue
-				}
-				if depTask := findTaskByIndex(root, depIndex); depTask != nil && depTask.executed() {
-					predecessors = append(predecessors, depTask)
-					seen[depIndex] = true
-				}
-			}
-		}
-	}
-
-	if len(predecessors) == 0 {
+	evidence := strings.TrimSpace(getTaskPlanEvidence(m.CurrentTask))
+	if evidence == "" {
 		return ""
 	}
 
-	var buf bytes.Buffer
-	for _, pred := range predecessors {
-		summary := pred.GetSummary()
-		runes := []rune(summary)
-		if len(runes) > 200 {
-			summary = string(runes[:200]) + "..."
-		}
-		if summary == "" {
-			summary = "(no summary available)"
-		}
-		buf.WriteString(fmt.Sprintf("- [%s] %s: %s\n", pred.Index, pred.Name, summary))
-		safeIndex := strings.ReplaceAll(pred.Index, "-", "_")
-		buf.WriteString(fmt.Sprintf("  artifact hint: task_%s_*_result_summary.txt\n", safeIndex))
+	const maxEvidenceRunes = 1600
+	runes := []rune(evidence)
+	if len(runes) <= maxEvidenceRunes {
+		return evidence
 	}
 
-	return buf.String()
+	return string(runes[:maxEvidenceRunes]) + "\n\n..."
 }
 
+// PersistentMemory 渲染"持久记忆"段, 进 LiteForge / aireact 模板的 semi-dynamic
+// 区。本段不再写入任何 time.Now() 派生字符串, 时间提示职责完全交给:
+//   - aireact 主循环 timeline-open 段 (renderCurrentTimeBlock,
+//     prompt_loop_materials.go: "# Current Time")
+//   - 各类 review / verification / summary prompt 的 {{ .CurrentTime }} 字段
+//   - 真正需要细粒度时间的调用方在 dynamic 段自己维护 (例如
+//     <current_time>...</current_time>)
+//
+// 设计取舍 (B3 修复):
+//   - 之前 B2 把 time.Now().String() (纳秒) 收敛到分钟粒度避免 91 distinct hash,
+//     但 timeline-open 段早就有 # Current Time, semi-dynamic 段的 # Now 是纯
+//     冗余, 每分钟翻一次仍会让整个 semi-dynamic 段在分钟边界 byte hash 变动,
+//     击穿上游 prefix cache
+//   - 直接删除 # Now 后, semi-dynamic 段在同一会话内可保持完全 byte 稳定,
+//     LLM 仍能从 timeline-open / dynamic 段拿到当前时间, 信息无损
+//
+// 关键词: PromptContextProvider.PersistentMemory, semi-dynamic byte 稳定,
+//
+//	aicache 时间抖动移除, 时间源解耦
 func (m *PromptContextProvider) PersistentMemory() string {
 	var buf bytes.Buffer
-	buf.WriteString("# Now " + time.Now().String() + "\n")
 	buf.WriteString("<persistent_memory>\n")
 	m.PersistentData.ForEach(func(i string, v *PersistentDataRecord) bool {
 		if v.Variable {

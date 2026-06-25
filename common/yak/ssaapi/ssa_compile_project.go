@@ -16,6 +16,21 @@ import (
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
 
+// ParseProjectFromPath 编译本地路径下的整个项目为 SSA 程序集合（导出名为 ssa.ParseLocalProject）
+// 参数:
+//   - path: 项目所在的本地目录路径
+//   - opts: 编译可选项，如 ssa.withLanguage、ssa.withProgramName 等
+//
+// 返回值:
+//   - SSA 程序集合
+//   - 错误信息
+//
+// Example:
+// ```
+// // 编译本地某个 Java 项目（示意性示例，需替换为真实路径）
+// progs = ssa.ParseLocalProject("/tmp/my-java-project", ssa.withLanguage(ssa.Java))~
+// println(len(progs))
+// ```
 func ParseProjectFromPath(path string, opts ...ssaconfig.Option) (Programs, error) {
 	if path != "" {
 		opts = append(opts, WithLocalFs(path))
@@ -184,6 +199,21 @@ func CompileDiffProgramAndSaveToDB(
 	return diffProgram, nil
 }
 
+// ParseProject 根据编译选项编译一个项目为 SSA 程序集合（导出名为 ssa.ParseProject）
+// 与 ParseLocalProject 不同，本函数通过选项指定代码来源（本地文件系统、git 等）
+// 参数:
+//   - opts: 编译可选项，如 ssa.withEntryFile、ssa.withLanguage、ssa.withProgramName 等
+//
+// 返回值:
+//   - SSA 程序集合
+//   - 错误信息
+//
+// Example:
+// ```
+// // 通过选项指定本地代码目录进行编译（示意性示例，需替换为真实路径）
+// progs = ssa.ParseProject(ssa.withLanguage(ssa.Java), ssa.withProgramName("demo"))~
+// println(len(progs))
+// ```
 func ParseProject(opts ...ssaconfig.Option) (prog Programs, err error) {
 	config, err := DefaultConfig(opts...)
 	if err != nil {
@@ -656,7 +686,9 @@ func (c *Config) parseProjectWithFirstIncrementalCompile() (*Program, error) {
 			} else {
 				irProgram.OverlayLayers = nil
 			}
-			ssadb.UpdateProgram(irProgram)
+			if err := ssadb.UpdateProgramWithError(irProgram); err != nil {
+				log.Errorf("update incremental base program overlay failed: name=%s err=%v", irProgram.ProgramName, err)
+			}
 			// 更新 prog.irProgram 字段，确保 IsIncrementalCompile() 能正确工作
 			prog.irProgram = irProgram
 		}
@@ -707,7 +739,9 @@ func saveOverlayToDatabase(overlay *ProgramOverLay, diffProgram *Program) error 
 	irProgram.OverlayLayers = layerNames
 
 	// 更新数据库（只更新当前 program 的 overlay 信息，不更新 layer）
-	ssadb.UpdateProgram(irProgram)
+	if err := ssadb.UpdateProgramWithError(irProgram); err != nil {
+		log.Errorf("save overlay metadata failed: name=%s err=%v", irProgram.ProgramName, err)
+	}
 
 	return nil
 }
@@ -722,13 +756,33 @@ func hasDeleteEntries(fileHashMap map[string]int) bool {
 }
 
 func createDeleteOnlyProgram(ctx context.Context, programName string, projectID uint64) *Program {
-	irProg := ssadb.CreateProgram(programName, "", ssadb.Application)
+	irProg, err := ssadb.CreateProgramWithError(programName, "", ssadb.Application)
+	if err != nil {
+		log.Errorf("create delete-only program failed: name=%s err=%v", programName, err)
+		irProg = &ssadb.IrProgram{
+			ProgramName: programName,
+			ProgramKind: ssadb.Application,
+		}
+	}
 	if projectID > 0 {
 		irProg.ProjectID = projectID
-		ssadb.UpdateProgram(irProg)
+		if irProg.ID > 0 {
+			if err := ssadb.UpdateProgramWithError(irProg); err != nil {
+				log.Errorf("update delete-only program project id failed: name=%s err=%v", irProg.ProgramName, err)
+			}
+		}
+	}
+	cfg, err := ssaconfig.New(
+		ssaconfig.ModeSSACompile,
+		ssaconfig.WithContext(ctx),
+		ssaconfig.WithSetProgramName(programName),
+	)
+	if err != nil {
+		log.Warnf("create delete-only program config failed: %v", err)
+		cfg = nil
 	}
 	ssaProg := ssa.NewProgram(
-		ctx, programName, ssa.ProgramCacheDBWrite, ssadb.Application,
+		cfg, ssa.ProgramCacheDBWrite, ssadb.Application,
 		filesys.NewVirtualFs(), "", 0,
 	)
 	return &Program{

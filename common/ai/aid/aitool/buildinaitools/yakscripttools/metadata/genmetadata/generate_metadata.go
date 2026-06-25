@@ -86,7 +86,11 @@ func GenerateMetadataFromCodeContent(name string, code string) (*metadata.YakScr
 }
 
 func newForge() (*aiforge.LiteForge, error) {
-	lf, err := aiforge.NewLiteForge("generate_metadata", aiforge.WithLiteForge_Prompt(aitool_generate_key_word_prompt),
+	// P0-B4: aitool_generate_key_word_prompt 是嵌入式 prompt 模板字符串
+	// (包含字面 "{{ .Code }}", 实际 Code 通过 lf.Execute 的 params 注入,
+	// 不会触发 Go template 二次渲染), 因此 Prompt 字段本身 100% 静态.
+	// 上移到 StaticInstruction 让 semi-dynamic 段跨调用 byte-stable.
+	lf, err := aiforge.NewLiteForge("generate_metadata", aiforge.WithLiteForge_StaticInstruction(aitool_generate_key_word_prompt),
 		aiforge.WithLiteForge_OutputSchema(
 			aitool.WithStringParam("language", aitool.WithParam_Required(true), aitool.WithParam_Description("语言，固定为chinese")),
 			aitool.WithStringParam("description", aitool.WithParam_Required(true), aitool.WithParam_Description("ai工具功能描述")),
@@ -145,6 +149,23 @@ func generateMetadata(code string, promptFormat string, debug bool) (*GenerateRe
 	}, nil
 }
 
+// UpdateYakScriptMetaData 解析并（按需借助 AI）补全 Yak 插件的元数据（导出名为 aiagent.UpdateYakScriptMetaData）
+// 参数:
+//   - name: 插件名称
+//   - content: 插件源码
+//   - forceUpdate: 是否强制重新生成元数据
+//
+// 返回值:
+//   - 更新后的插件源码
+//   - 解析出的元数据对象
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要配置可用的 AI 服务（示意性示例）
+// newContent, meta, err = aiagent.UpdateYakScriptMetaData("demo", code, false)
+// dump(meta)
+// ```
 func UpdateYakScriptMetaData(name string, content string, forceUpdate bool) (string, *metadata.YakScriptMetadata, error) {
 	metadataIns, err := metadata.ParseYakScriptMetadata(name, content)
 	if err != nil {

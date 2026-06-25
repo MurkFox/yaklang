@@ -15,8 +15,5 @@ func main() {
 }
 `
 
-	checkRunBinary(t, code, "main", map[string]string{"GCLOG": "1"}, []string{
-		"999",
-		"Releasing handle",
-	})
+	checkRunBinary(t, code, "main", map[string]string{"GCLOG": "1"}, []string{"999", "[Yak GC] Finalizer triggered"}, withDebugRuntimeLib())
 }

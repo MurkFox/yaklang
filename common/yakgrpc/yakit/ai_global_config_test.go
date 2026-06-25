@@ -30,6 +30,7 @@ func TestSetAndGetAIGlobalConfig(t *testing.T) {
 		DisableFallback: true,
 		DefaultModelId:  "default-model",
 		GlobalWeight:    0.75,
+		AIPresetPrompt:  "prefer concise answers",
 		IntelligentModels: []*ypb.AIModelConfig{
 			{
 				ModelName: "gpt-4o",
@@ -68,6 +69,7 @@ func TestSetAndGetAIGlobalConfig(t *testing.T) {
 	assert.True(t, loaded.DisableFallback)
 	assert.Equal(t, "default-model", loaded.DefaultModelId)
 	assert.Equal(t, 0.75, loaded.GlobalWeight)
+	assert.Equal(t, "prefer concise answers", loaded.GetAIPresetPrompt())
 
 	require.Len(t, loaded.IntelligentModels, 1)
 	assert.NotNil(t, loaded.IntelligentModels[0].Provider)
@@ -76,6 +78,41 @@ func TestSetAndGetAIGlobalConfig(t *testing.T) {
 	providers, err := ListAIProviders(db)
 	require.NoError(t, err)
 	assert.Len(t, providers, 2)
+}
+
+func TestGetAIGlobalConfig_MigratesLegacyBaseURL(t *testing.T) {
+	db := setupAIGlobalConfigTestDB(t)
+	defer db.Close()
+
+	cfg := &ypb.AIGlobalConfig{
+		Enabled:       true,
+		RoutingPolicy: "balance",
+		IntelligentModels: []*ypb.AIModelConfig{
+			{
+				ModelName: "gpt-4o",
+				Provider: &ypb.ThirdPartyApplicationConfig{
+					Type:    "openai",
+					APIKey:  "key-1",
+					Domain:  "api.openai.com",
+					NoHttps: true,
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	require.NoError(t, SetKey(db, consts.AI_GLOBAL_CONFIG_KEY, string(raw)))
+
+	loaded, err := GetAIGlobalConfig(db)
+	require.NoError(t, err)
+	require.Len(t, loaded.GetIntelligentModels(), 1)
+	require.NotNil(t, loaded.GetIntelligentModels()[0].GetProvider())
+	assert.Equal(t, "http://api.openai.com/v1", loaded.GetIntelligentModels()[0].GetProvider().GetBaseURL())
+
+	persisted, err := GetAIGlobalConfig(db)
+	require.NoError(t, err)
+	require.Len(t, persisted.GetIntelligentModels(), 1)
+	assert.Equal(t, "http://api.openai.com/v1", persisted.GetIntelligentModels()[0].GetProvider().GetBaseURL())
 }
 
 func TestSetAIGlobalConfig_UpdateProxyNoHttpsDomain(t *testing.T) {
@@ -260,8 +297,10 @@ func TestSetAIGlobalConfig_MultipleProvidersOrderAndUpdate(t *testing.T) {
 
 func TestApplyAIGlobalConfig(t *testing.T) {
 	original := consts.GetTieredAIConfig()
+	originalGlobalConfig := GetCachedAIGlobalConfig()
 	t.Cleanup(func() {
 		consts.SetTieredAIConfig(original)
+		SetCachedAIGlobalConfigForTest(originalGlobalConfig)
 	})
 
 	db := setupAIGlobalConfigTestDB(t)
@@ -273,6 +312,7 @@ func TestApplyAIGlobalConfig(t *testing.T) {
 		DisableFallback: true,
 		DefaultModelId:  "default-model",
 		GlobalWeight:    0.42,
+		AIPresetPrompt:  "always cite code paths",
 		IntelligentModels: []*ypb.AIModelConfig{
 			{
 				ModelName: "gpt-4o",
@@ -312,6 +352,9 @@ func TestApplyAIGlobalConfig(t *testing.T) {
 	assert.Equal(t, 0.42, applied.GlobalWeight)
 	assert.Len(t, applied.IntelligentConfigs, 1)
 	assert.Len(t, applied.LightweightConfigs, 1)
+	cached := GetCachedAIGlobalConfig()
+	require.NotNil(t, cached)
+	assert.Equal(t, "always cite code paths", cached.GetAIPresetPrompt())
 	assert.Equal(t, "gpt-4o", lookupExtraParam(applied.IntelligentConfigs[0], "model"))
 	assert.Equal(t, "gpt-4o-mini", lookupExtraParam(applied.LightweightConfigs[0], "model"))
 	require.NotNil(t, applied.IntelligentConfigs[0].GetProvider())

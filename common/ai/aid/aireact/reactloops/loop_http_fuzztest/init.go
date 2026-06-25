@@ -4,6 +4,7 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jinzhu/gorm"
@@ -11,8 +12,10 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/ai/rag"
+	"github.com/yaklang/yaklang/common/ai/ytoken"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/lowhttp"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
@@ -27,6 +30,7 @@ var reactiveData string
 var outputExample string
 
 const LoopHTTPFuzztestName = "http_fuzztest"
+const loopHTTPFuzztestHTTPSource = "reactloop_http_fuzztest"
 
 func init() {
 	err := reactloops.RegisterLoopFactory(
@@ -36,38 +40,74 @@ func init() {
 			preset := []reactloops.ReActLoopOption{
 				reactloops.WithAllowRAG(false),
 				reactloops.WithAllowToolCall(true),
+				reactloops.WithAITagFieldWithAINodeId("GEN_PACKET", generatedPacketContentField, "http_flow", aicommon.TypeCodeHTTPRequest),
+				reactloops.WithAITagFieldWithAINodeId("GEN_MODIFIED_PACKET", modifiedPacketContentField, "http_flow", aicommon.TypeCodeHTTPRequest),
+				reactloops.WithOverrideLoopAction(loopActionDirectlyAnswerHTTPFuzztest),
 				reactloops.WithInitTask(buildInitTask(r)),
+				BuildOnPostIterationHook(r),
+				reactloops.WithDisablePeriodicVerification(true),
 				reactloops.WithMaxIterations(int(r.GetConfig().GetMaxIterationCount())),
 				reactloops.WithAllowUserInteract(r.GetConfig().GetAllowUserInteraction()),
 				reactloops.WithPersistentInstruction(instruction),
 				reactloops.WithReflectionOutputExample(outputExample),
 				reactloops.WithReactiveDataBuilder(func(loop *reactloops.ReActLoop, feedbacker *bytes.Buffer, nonce string) (string, error) {
-					originalRequest := loop.Get("original_request")
-					lastRequest := loop.Get("last_request")
-					lastResponse := loop.Get("last_response")
+					originalRequest := getLoopOriginalRequestForPrompt(loop)
+					originalRequestSummary := loop.Get("original_request_summary")
+					currentRequestSummary := getCurrentRequestSummary(loop)
+					previousRequestSummary := loop.Get("previous_request_summary")
+					requestChangeSummary := loop.Get("request_change_summary")
+					requestModificationReason := loop.Get("request_modification_reason")
+					requestReviewDecision := loop.Get("request_review_decision")
+					representativeRequest := getLoopRepresentativeRequestForPrompt(loop)
+					uploadRequestSummary := loop.Get(loopHTTPUploadRequestSummaryKey)
+					representativeResponse := loop.Get("representative_response")
+					representativeHiddenIndex := loop.Get("representative_httpflow_hidden_index")
 					diffResult := loop.Get("diff_result")
+					verificationResult := loop.Get("verification_result")
 					securityKnowledge := loop.Get("security_knowledge")
+					recentActionsSummary := buildLoopHTTPFuzzRecentActionsPrompt(loop)
+					testedPayloadSummary := buildLoopHTTPFuzzTestedPayloadPrompt(loop)
+					fuzztagReference := loop.Get(loopHTTPFuzzFuzztagReferenceKey)
+					payloadGroupsReference := loop.Get(loopHTTPFuzzPayloadGroupsReferenceKey)
 
 					renderMap := map[string]any{
-						"OriginalRequest":   originalRequest,
-						"LastRequest":       lastRequest,
-						"LastResponse":      lastResponse,
-						"DiffResult":        diffResult,
-						"SecurityKnowledge": securityKnowledge,
-						"Nonce":             nonce,
-						"FeedbackMessages":  feedbacker.String(),
+						"OriginalRequest":           originalRequest,
+						"OriginalRequestSummary":    originalRequestSummary,
+						"CurrentRequestSummary":     currentRequestSummary,
+						"PreviousRequestSummary":    previousRequestSummary,
+						"RequestChangeSummary":      requestChangeSummary,
+						"RequestModificationReason": requestModificationReason,
+						"RequestReviewDecision":     requestReviewDecision,
+						"RepresentativeRequest":     representativeRequest,
+						"RepresentativeResponse":    representativeResponse,
+						"RepresentativeHiddenIndex": representativeHiddenIndex,
+						"UploadRequestSummary":      uploadRequestSummary,
+						"DiffResult":                diffResult,
+						"VerificationResult":        verificationResult,
+						"SecurityKnowledge":         securityKnowledge,
+						"RecentActionsSummary":      recentActionsSummary,
+						"TestedPayloadSummary":      testedPayloadSummary,
+						"FuzztagReference":          fuzztagReference,
+						"PayloadGroupsReference":    payloadGroupsReference,
+						"Nonce":                     nonce,
+						"FeedbackMessages":          feedbacker.String(),
 					}
 					return utils.RenderTemplate(reactiveData, renderMap)
 				}),
 				// Register set_http_request action (must be called first)
 				setHTTPRequestAction(r),
+				patchHTTPRequestAction(r),
+				modifyHTTPRequestAction(r),
 				// Register fuzz actions
 				fuzzMethodAction(r),
 				fuzzPathAction(r),
 				fuzzHeaderAction(r),
 				fuzzGetParamsAction(r),
 				fuzzBodyAction(r),
+				fuzzUploadAction(r),
 				fuzzCookieAction(r),
+				generateAndSendPacketAction(r),
+				generateRiskAction(r),
 			}
 			preset = append(preset, opts...)
 			return reactloops.NewReActLoop(LoopHTTPFuzztestName, r, preset...)
@@ -76,7 +116,7 @@ func init() {
 		reactloops.WithLoopDescriptionZh("HTTP 安全模糊测试模式：对 HTTP 请求进行变异、发送和响应差异分析，用于发现潜在安全问题。"),
 		reactloops.WithVerboseName("HTTP Fuzz Test"),
 		reactloops.WithVerboseNameZh("HTTP 安全模糊测试"),
-		reactloops.WithLoopUsagePrompt("Use when user wants to fuzz HTTP requests and analyze response differences. First use 'set_http_request' to set the target request, then use fuzz actions (fuzz_method, fuzz_path, fuzz_header, fuzz_get_params, fuzz_body, fuzz_cookie) to test"),
+		reactloops.WithLoopUsagePrompt("Use when user wants to fuzz HTTP requests and analyze security-relevant response differences. First use 'set_http_request' to set the target request, then use 'patch_http_request' for fine-grained single-step packet edits, auth/header/body format transforms, or repair, fuzz actions (fuzz_method, fuzz_path, fuzz_header, fuzz_get_params, fuzz_body, fuzz_upload, fuzz_cookie), 'modify_http_request' when the current packet must be revised with visible merge details via a full raw packet, 'generate_and_send_packet' when a complete raw packet must be constructed and sent, 'generate_risk' when validated or defensible vulnerability evidence should be saved as a Yakit risk, or 'directly_answer' for short testing-process Q&A."),
 		reactloops.WithLoopOutputExample(`
 * When user requests to fuzz HTTP request:
   {"@action": "http_fuzztest", "human_readable_thought": "I need to fuzz HTTP request parameters to find vulnerabilities"}
@@ -87,142 +127,211 @@ func init() {
 	}
 }
 
-// defaultSecurityKBCollectionName is the default collection name for security knowledge base
-var defaultSecurityKBCollectionName = "security_testing_kb"
+var urlPattern = regexp.MustCompile(`https?://[^\s"'<>]+`)
 
 // buildInitTask creates the initialization task handler
 func buildInitTask(r aicommon.AIInvokeRuntime) func(loop *reactloops.ReActLoop, task aicommon.AIStatefulTask, operator *reactloops.InitTaskOperator) {
 	return func(loop *reactloops.ReActLoop, task aicommon.AIStatefulTask, operator *reactloops.InitTaskOperator) {
-		emitter := r.GetConfig().GetEmitter()
+		attachedResources := reactloops.RunAttachedExtraResourcesInit(r, loop, task.GetAttachedDatas())
+
 		config := r.GetConfig()
 
-		// Step 1: 分析用户需求，生成搜索关键字和语义问题
-		log.Infof("init task step 1: analyzing user requirements and generating search patterns")
+		invoker := loop.GetInvoker()
+		bootstrapLoopHTTPFuzzFuzztagContext(loop, config.GetDB())
+		bindAttachedHTTPFuzzRequestToLoop(loop, r, task, attachedResources)
 
-		analysisPrompt := `
-你的目标是分析用户的安全测试需求，完成以下任务：
+		// TBD: 检查是否已经有 fuzz_request 了（可能是用户之前的交互设置的），如果有就直接继续
+		haveReq := loop.Get("fuzz_request") // Just to ensure the key exists in the loop state
+		if haveReq == "" {
+			// TBD: 如果没有，就尝试从用户输入中引导提取 HTTP 请求信息来初始化 fuzz_request
+			bootstrapResult := tryBootstrapFuzzRequestFromUserInput(r, loop, task)
+			switch bootstrapResult {
+			case "raw":
+				loop.Set("bootstrap_source", "user_input_raw")
+				reactloops.EmitStatus(loop, "已复用用户输入的 HTTP 数据包 / Reused HTTP Packet from User Input")
+			case "url":
+				loop.Set("bootstrap_source", "user_input_url")
+				reactloops.EmitStatus(loop, "已从 URL 构造 HTTP 数据包 / Constructed HTTP Packet from URL")
+			default:
+				if restoreLoopHTTPFuzzSessionContext(loop, r) {
+					reactloops.EmitStatus(loop, "已恢复会话上下文 / Restored Session Context")
+					invoker.AddToTimeline("http_fuzztest_restore", "Restored HTTP fuzz session context from persistent session history")
+				} else {
+					reactloops.EmitStatus(loop, "未找到有效 HTTP 数据包 / No Valid HTTP Packet Found")
+					operator.Done()
+					return
+				}
+			}
+		}
 
-【任务1：生成精确搜索关键词】
-根据用户需求，生成 2-5 个搜索关键词（search_keywords），用于在安全知识库中进行精确文本搜索：
+		// TBD: 使用 liteforge 来处理一下
+		action, err := invoker.InvokeSpeedPriorityLiteForge(task.GetContext(), "http_fuzztest_init_booststrap", `
+从安全模糊测试的角度来说，这个 HTTP 请求可能有哪些测试要点和灵感提示？请结合请求的结构、参数、头部等信息，给出一些模糊测试的思路和建议，帮助后续的 fuzzing 设计。
 
-关键词类型：
-1. 漏洞类型关键词：如 "SQL注入", "XSS", "SSRF", "命令注入", "路径遍历"
-2. 具体技术关键词：如 "字符型注入", "数字型注入", "存储型XSS", "反射型XSS", "DOM XSS", "盲注", "报错注入"
-3. 绕过技术关键词：如 "WAF绕过", "编码绕过", "双写绕过", "大小写绕过"
-4. Payload关键词：如 "union select", "img onerror", "script alert", "sleep注入"
+案例如下：
+1. 看起来这是一个登录接口的请求，URL 中有 /login，参数里有 username 和 password，这些都是典型的模糊测试目标。可以尝试在 username 和 password 参数里进行 SQL 注入、XSS、越权访问等测试。
+2. 请求头里有一个 User-Agent 字段，可以尝试在这个字段里进行模糊测试，比如注入恶意 payload 来测试服务器对 User-Agent 的处理。
+3. 如果请求里有 Cookie，Cookie 也是一个重要的模糊测试目标，可以尝试修改 Cookie 的值来测试会话管理和权限控制等方面的安全性。
+4. 如果请求里有 JSON 或者其他结构化的 body，可以针对这些参数进行模糊测试，尝试注入特殊字符、超长字符串、边界值等来测试服务器的健壮性和安全性。
+5. 如果参数名像 id、uid、userId、orderId、file、path、tenant、account 这一类对象标识符，要考虑参数遍历、对象切换、资源编号枚举，验证是否存在 IDOR、越权读取或信息泄漏。
+6. 如果响应里可能包含用户名、邮箱、手机号、路径、版本号、调试报错、SQL 报错、模板报错等内容，也要把信息泄漏当作漏洞方向，而不是只盯着 SQL 注入和 XSS。
+7. 如果当前数据包明显不合理，例如缺失 Host、User-Agent、Accept、Content-Type，或者 method/path/body 组合明显不匹配，先考虑修复数据包再测，尽量让请求更像真实客户端流量。
+8. 如果需要修复数据包，可以优先补齐 User-Agent、Accept、Accept-Language、Connection、Referer、Origin 等常见头部，并保持与当前接口语义一致，再继续做 fuzz。
 
-注意事项：
-- 优先使用具体的漏洞类型关键词
-- 如果用户提到具体漏洞类型，生成该类型的具体技术关键词
-- 如果用户没有明确漏洞类型，生成通用的安全测试关键词
+`, []aitool.ToolOption{
+			aitool.WithStringParam("thought", aitool.WithParam_Description("针对这个 HTTP 请求的模糊测试要点和灵感提示")),
+		}, aicommon.WithGeneralConfigStreamableFieldWithNodeId("thought", "quick_plan"))
+		if err != nil {
+			log.Warnf("http_fuzztest init booststrap failed: %v", err)
+			return
+		}
+		invoker.AddToTimeline("http_fuzztest_init_booststrap", "Bootstrap insights: "+action.GetString("thought"))
+	}
+}
 
-【任务2：生成语义搜索问题】
-根据用户需求，生成 2-4 个完整的问题（semantic_questions），用于语义向量搜索相关安全知识：
+func tryBootstrapFuzzRequestFromUserInput(r aicommon.AIInvokeRuntime, loop *reactloops.ReActLoop, task aicommon.AIStatefulTask) string {
+	userInput := strings.TrimSpace(task.GetUserInput())
+	if userInput == "" {
+		return ""
+	}
 
-问题格式要求：
-1. 必须是完整的主谓宾句式
-2. 禁止使用代词（它、这个、那个等）
-3. 每个问题要从不同角度描述需求
-4. 问题要具体，涉及具体的漏洞类型和测试技术
+	prompt := `
+请从用户输入中提取可用于 HTTP 安全测试的请求信息。
 
-问题示例：
-Good: "如何检测GET参数中的字符型SQL注入漏洞？"
-Good: "img标签的onerror属性如何触发XSS攻击？"
-Good: "Cookie参数中的SQL注入有哪些常见payload？"
-Good: "如何绕过WAF进行SQL注入测试？"
-Good: "JSON请求体中如何检测命令注入漏洞？"
-Good: "时间盲注的payload有哪些？"
-Good: "反射型XSS和存储型XSS有什么区别？"
-Bad: "如何注入？" - 太笼统
-Bad: "它怎么绕过？" - 使用代词
-Bad: "XSS" - 不完整句式
+输出规则：
+1) 如果用户提供了原始 HTTP 请求报文（请求行 + Host 头），将完整报文放到 raw_http_request。
+2) 如果没有原始报文但有 URL，提取到 url，并给出 method（无明确时使用 GET）。
+3) 若无法提取，返回空字符串。
 
 <|USER_INPUT_{{ .nonce }}|>
 {{ .userInput }}
 <|USER_INPUT_END_{{ .nonce }}|>
 `
 
-		renderedPrompt := utils.MustRenderTemplate(analysisPrompt, map[string]any{
-			"nonce":     utils.RandStringBytes(4),
-			"userInput": task.GetUserInput(),
-		})
+	renderedPrompt := utils.MustRenderTemplate(prompt, map[string]any{
+		"nonce":     utils.RandStringBytes(4),
+		"userInput": userInput,
+	})
 
-		result, err := r.InvokeSpeedPriorityLiteForge(
-			task.GetContext(),
-			"analyze-user-requirements",
-			renderedPrompt,
-			[]aitool.ToolOption{
-				aitool.WithStringArrayParam("search_keywords", aitool.WithParam_Description("2-5 search keywords for finding relevant security knowledge. Each keyword should be specific to vulnerability types or attack techniques.")),
-				aitool.WithStringArrayParam("semantic_questions", aitool.WithParam_Description("2-4 complete questions for semantic search. Each question must be a complete sentence describing specific security testing needs.")),
-				aitool.WithStringParam("analysis_summary", aitool.WithParam_Description("Summary of the user's security testing requirements and recommended approach")),
-			},
-			aicommon.WithGeneralConfigStreamableFieldWithNodeId("init-analyze-requirements", "analysis_summary"),
-		)
-
-		if err != nil {
-			log.Warnf("failed to analyze user requirements: %v", err)
-			operator.Continue()
-			return
-		}
-
-		searchKeywords := result.GetStringSlice("search_keywords")
-		semanticQuestions := result.GetStringSlice("semantic_questions")
-		analysisSummary := result.GetString("analysis_summary")
-
-		// Emit analysis results
-		if analysisSummary != "" {
-			emitter.EmitThoughtStream(task.GetIndex(), "Requirements Analysis:\n"+analysisSummary)
-			r.AddToTimeline("requirements_analysis", analysisSummary)
-		}
-
-		log.Infof("identified search_keywords: %d, semantic_questions: %d", len(searchKeywords), len(semanticQuestions))
-
-		// Step 2: 执行知识库搜索
-		var allSearchResults strings.Builder
-		db := config.GetDB()
-
-		// Step 2.1: 执行关键词搜索
-		if db != nil && len(searchKeywords) > 0 {
-			log.Infof("init task step 2.1: keyword searching security knowledge with %d keywords", len(searchKeywords))
-			emitter.EmitThoughtStream(task.GetIndex(), "Searching security knowledge base with keywords...")
-
-			keywordResults := searchByKeywords(db, searchKeywords)
-			if keywordResults != "" {
-				allSearchResults.WriteString(keywordResults)
-			}
-		}
-
-		// Step 2.2: 执行语义搜索
-		if db != nil && len(semanticQuestions) > 0 {
-			log.Infof("init task step 2.2: semantic searching security knowledge with %d questions", len(semanticQuestions))
-			emitter.EmitThoughtStream(task.GetIndex(), "Searching security knowledge base with semantic questions...")
-
-			semanticResults := searchBySemantic(db, defaultSecurityKBCollectionName, semanticQuestions)
-			if semanticResults != "" {
-				allSearchResults.WriteString(semanticResults)
-			}
-		}
-
-		// Step 3: 存储搜索结果
-		if allSearchResults.Len() > 0 {
-			searchResultsStr := allSearchResults.String()
-			log.Infof("collected %d bytes of security knowledge", len(searchResultsStr))
-
-			// 限制结果大小
-			maxSize := 20 * 1024 // 20KB
-			if len(searchResultsStr) > maxSize {
-				searchResultsStr = searchResultsStr[:maxSize] + "\n\n[... 内容已截断 ...]"
-			}
-
-			loop.Set("security_knowledge", searchResultsStr)
-			r.AddToTimeline("security_knowledge", fmt.Sprintf("Found security knowledge (%d bytes)", len(searchResultsStr)))
-			emitter.EmitThoughtStream(task.GetIndex(), "Found relevant security knowledge:\n"+utils.ShrinkTextBlock(searchResultsStr, 500))
-		}
-
-		log.Infof("http_fuzztest loop initialized successfully")
-		// Default: Continue with normal loop execution
-		operator.Continue()
+	action, err := r.InvokeSpeedPriorityLiteForge(
+		task.GetContext(),
+		"extract-http-request-from-user-input",
+		renderedPrompt,
+		[]aitool.ToolOption{
+			aitool.WithStringParam("raw_http_request", aitool.WithParam_Description("完整原始 HTTP 请求报文，无法提取则为空")),
+			aitool.WithStringParam("url", aitool.WithParam_Description("提取到的 URL，无法提取则为空")),
+			aitool.WithStringParam("method", aitool.WithParam_Description("提取到的 HTTP 方法，默认 GET")),
+			aitool.WithStringParam("reason", aitool.WithParam_Description("说明提取依据和置信度")),
+		},
+		aicommon.WithGeneralConfigStreamableFieldWithNodeId("http_flow", "raw_http_request"),
+		aicommon.WithGeneralConfigStreamableFieldWithNodeId("http_flow", "url"),
+		aicommon.WithGeneralConfigStreamableFieldWithNodeId("thought", "reason"),
+	)
+	if err != nil {
+		log.Warnf("failed to extract HTTP request from user input: %v", err)
+		return ""
 	}
+
+	rawPacket := ""
+	urlStr := ""
+	method := "GET"
+	reason := ""
+	if action != nil {
+		rawPacket = strings.TrimSpace(action.GetString("raw_http_request"))
+		urlStr = strings.TrimSpace(action.GetString("url"))
+		method = strings.TrimSpace(action.GetString("method"))
+		reason = strings.TrimSpace(action.GetString("reason"))
+	}
+
+	if method == "" {
+		method = "GET"
+	}
+	method = strings.ToUpper(method)
+
+	if rawPacket != "" {
+		rawIsHTTPS := strings.HasPrefix(strings.ToLower(urlStr), "https://")
+		if initFuzzRequestFromRaw(loop, r, rawPacket, rawIsHTTPS) {
+			r.AddToTimeline("http_request_bootstrap", fmt.Sprintf("Initialized from extracted raw packet (%s)", reason))
+			return "raw"
+		}
+	}
+
+	if urlStr == "" {
+		urlStr = extractURLFromUserInput(userInput)
+	}
+	if urlStr != "" {
+		if initFuzzRequestFromURL(loop, r, urlStr, method) {
+			r.AddToTimeline("http_request_bootstrap", fmt.Sprintf("Initialized from extracted URL: %s (%s)", urlStr, reason))
+			return "url"
+		}
+	}
+
+	if reason != "" {
+		r.AddToTimeline("http_request_bootstrap", fmt.Sprintf("Initialization skipped: %s", reason))
+	}
+	return "none"
+}
+
+func initFuzzRequestFromRaw(loop *reactloops.ReActLoop, runtime aicommon.AIInvokeRuntime, rawPacket string, isHTTPS bool) bool {
+	// 用户输入里已经包含了完整的原始 HTTP 数据包，前端可以直接看到，
+	// 这里不再通过 EmitHTTPRequestStreamEvent 把同一个包再发一遍，避免重复展示。
+	// 关键词: bootstrap, EmitEditablePacket, raw_packet, 避免重复输出
+	_, err := applyLoopHTTPFuzzRequestChange(loop, runtime, &loopHTTPFuzzRequestChange{
+		RawRequest:          rawPacket,
+		IsHTTPS:             isHTTPS,
+		SourceAction:        "user_input_raw",
+		EventOp:             loopHTTPFuzzRequestEventOpReplace,
+		ResetBaseline:       true,
+		ClearActionTracking: true,
+		EmitEvent:           true,
+		EmitEditablePacket:  false,
+		PersistSession:      true,
+		Task:                loop.GetCurrentTask(),
+	})
+	if err != nil {
+		log.Warnf("failed to build fuzz request from extracted raw packet: %v", err)
+		return false
+	}
+	return true
+}
+
+func initFuzzRequestFromURL(loop *reactloops.ReActLoop, runtime aicommon.AIInvokeRuntime, urlStr, method string) bool {
+	isHTTPS, packet, err := lowhttp.ParseUrlToHttpRequestRaw(method, urlStr)
+	if err != nil {
+		log.Warnf("failed to build request from URL %s: %v", urlStr, err)
+		return false
+	}
+
+	// 这是"第一次构造数据包"的场景：用户没有给出完整 HTTP 数据包，
+	// 系统根据 URL 生成了新的请求，通过 EmitEditablePacket 展示完整包。
+	_, err = applyLoopHTTPFuzzRequestChange(loop, runtime, &loopHTTPFuzzRequestChange{
+		RawRequest:          string(packet),
+		IsHTTPS:             isHTTPS,
+		SourceAction:        "user_input_url",
+		EventOp:             loopHTTPFuzzRequestEventOpReplace,
+		ResetBaseline:       true,
+		ClearActionTracking: true,
+		EmitEvent:           true,
+		EmitEditablePacket:  true,
+		PersistSession:      true,
+		Task:                loop.GetCurrentTask(),
+	})
+	if err != nil {
+		log.Warnf("failed to build fuzz request from URL packet: %v", err)
+		return false
+	}
+	return true
+}
+
+func extractURLFromUserInput(userInput string) string {
+	if userInput == "" {
+		return ""
+	}
+	matches := urlPattern.FindAllString(userInput, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(matches[0])
 }
 
 // searchByKeywords searches knowledge base by keywords
@@ -268,7 +377,7 @@ func searchByKeywords(db *gorm.DB, keywords []string) string {
 
 				results.WriteString(fmt.Sprintf("[%d] %s\n", i+1, entry.KnowledgeTitle))
 				content := entry.KnowledgeDetails
-				if len(content) > 500 {
+				if ytoken.CalcTokenCount(content) > 500 {
 					content = content[:500] + "..."
 				}
 				results.WriteString(content + "\n\n")
@@ -360,7 +469,7 @@ func searchBySemantic(db *gorm.DB, collectionName string, questions []string) st
 			content = result.Document.Content
 		}
 
-		if len(content) > 800 {
+		if ytoken.CalcTokenCount(content) > 800 {
 			content = content[:800] + "\n[... content truncated ...]"
 		}
 

@@ -151,10 +151,15 @@ func TestSchemaGeneration_WithDisallowExit(t *testing.T) {
 		},
 	}
 
+	// 用带引号的 enum token 精确匹配 finish "动作"自身, 而不是裸子串 "finish".
+	// directly_answer 的描述会合法地提到 'finish' 动作 (单引号), 裸子串匹配会误判.
+	// 关键词: schema finish 动作精确匹配, 避免 directly_answer 描述误命中
+	const finishEnumToken = `"finish"`
+
 	// 正常 schema
 	normalSchema := buildSchema(actions...)
-	if !strings.Contains(normalSchema, "finish") {
-		t.Error("Normal schema should contain finish")
+	if !strings.Contains(normalSchema, finishEnumToken) {
+		t.Error("Normal schema should contain finish action enum")
 	}
 
 	// 过滤掉 finish 的 schema（模拟 disallowExit 场景）
@@ -166,8 +171,8 @@ func TestSchemaGeneration_WithDisallowExit(t *testing.T) {
 	}
 
 	filteredSchema := buildSchema(filteredActions...)
-	if strings.Contains(filteredSchema, "finish") {
-		t.Error("Filtered schema should not contain finish")
+	if strings.Contains(filteredSchema, finishEnumToken) {
+		t.Error("Filtered schema should not contain finish action enum")
 	}
 
 	if !strings.Contains(filteredSchema, "directly_answer") {
@@ -380,6 +385,10 @@ func (m *mockSimpleTask) GetStatus() aicommon.AITaskState {
 }
 
 func (m *mockSimpleTask) SetStatus(status aicommon.AITaskState) {
+	m.status = status
+}
+
+func (m *mockSimpleTask) ForceSetStatus(status aicommon.AITaskState) {
 	m.status = status
 }
 
@@ -655,17 +664,17 @@ func (m *MockMemoryTriageForTesting) HandleMemory(i any) error {
 	return nil
 }
 
-func (m *MockMemoryTriageForTesting) SearchMemory(origin any, bytesLimit int) (*aicommon.SearchMemoryResult, error) {
+func (m *MockMemoryTriageForTesting) SearchMemory(origin any, tokenLimit int) (*aicommon.SearchMemoryResult, error) {
 	m.searchMemoryCalled = true
 	m.callCount++
-	log.Infof("SearchMemory called with query: %v, bytes limit: %d", utils.ShrinkString(utils.InterfaceToString(origin), 50), bytesLimit)
+	log.Infof("SearchMemory called with query: %v, token limit: %d", utils.ShrinkString(utils.InterfaceToString(origin), 50), tokenLimit)
 	return m.searchMemoryResult, m.searchMemoryError
 }
 
-func (m *MockMemoryTriageForTesting) SearchMemoryWithoutAI(origin any, bytesLimit int) (*aicommon.SearchMemoryResult, error) {
+func (m *MockMemoryTriageForTesting) SearchMemoryWithoutAI(origin any, tokenLimit int) (*aicommon.SearchMemoryResult, error) {
 	m.searchMemoryWithoutAICalled = true
 	m.callCount++
-	log.Infof("SearchMemoryWithoutAI called with query: %v, bytes limit: %d", utils.ShrinkString(utils.InterfaceToString(origin), 50), bytesLimit)
+	log.Infof("SearchMemoryWithoutAI called with query: %v, token limit: %d", utils.ShrinkString(utils.InterfaceToString(origin), 50), tokenLimit)
 	return m.searchMemoryResult, m.searchMemoryError
 }
 
@@ -679,7 +688,7 @@ func TestMemorySearch_NoMemories(t *testing.T) {
 		searchMemoryResult: &aicommon.SearchMemoryResult{
 			Memories:      []*aicommon.MemoryEntity{},
 			TotalContent:  "",
-			ContentBytes:  0,
+			ContentTokens:  0,
 			SearchSummary: "no memories found",
 		},
 	}
@@ -715,7 +724,7 @@ func TestMemorySearch_WithMemories(t *testing.T) {
 				},
 			},
 			TotalContent:  "First memory content\nSecond memory content",
-			ContentBytes:  42,
+			ContentTokens:  42,
 			SearchSummary: "found 2 memories",
 		},
 	}
@@ -729,11 +738,11 @@ func TestMemorySearch_WithMemories(t *testing.T) {
 		t.Errorf("expected 2 memories, got %d", len(result.Memories))
 	}
 
-	if result.ContentBytes != 42 {
-		t.Errorf("expected 42 bytes, got %d", result.ContentBytes)
+	if result.ContentTokens != 42 {
+		t.Errorf("expected 42 tokens, got %d", result.ContentTokens)
 	}
 
-	log.Infof("WithMemories test passed: found %d memories, %d bytes", len(result.Memories), result.ContentBytes)
+	log.Infof("WithMemories test passed: found %d memories, %d tokens", len(result.Memories), result.ContentTokens)
 }
 
 // TestMemorySearch_WithoutAI 测试不使用AI的记忆搜索
@@ -747,7 +756,7 @@ func TestMemorySearch_WithoutAI(t *testing.T) {
 				},
 			},
 			TotalContent:  "Keyword-based memory",
-			ContentBytes:  21,
+			ContentTokens:  21,
 			SearchSummary: "keyword search result",
 		},
 	}
@@ -768,8 +777,8 @@ func TestMemorySearch_WithoutAI(t *testing.T) {
 	log.Infof("WithoutAI test passed: found %d memory via keyword search", len(result.Memories))
 }
 
-// TestMemorySearch_BytesLimit 测试字节限制
-func TestMemorySearch_BytesLimit(t *testing.T) {
+// TestMemorySearch_TokenLimit 测试 token 限制
+func TestMemorySearch_TokenLimit(t *testing.T) {
 	mockMemory := &MockMemoryTriageForTesting{
 		searchMemoryResult: &aicommon.SearchMemoryResult{
 			Memories: []*aicommon.MemoryEntity{
@@ -779,8 +788,8 @@ func TestMemorySearch_BytesLimit(t *testing.T) {
 				},
 			},
 			TotalContent:  "First part",
-			ContentBytes:  10,
-			SearchSummary: "limited by bytes",
+			ContentTokens:  10,
+			SearchSummary: "limited by tokens",
 		},
 	}
 
@@ -789,11 +798,11 @@ func TestMemorySearch_BytesLimit(t *testing.T) {
 		t.Fatalf("SearchMemory should not error: %v", err)
 	}
 
-	if result.ContentBytes > 20 {
-		t.Errorf("content bytes %d should not exceed limit 20", result.ContentBytes)
+	if result.ContentTokens > 20 {
+		t.Errorf("content tokens %d should not exceed limit 20", result.ContentTokens)
 	}
 
-	log.Infof("BytesLimit test passed: content_bytes=%d, limit=20", result.ContentBytes)
+	log.Infof("TokenLimit test passed: content_tokens=%d, limit=20", result.ContentTokens)
 }
 
 // TestMemorySearch_Error 测试搜索错误处理
@@ -841,7 +850,7 @@ func TestReActLoop_MemoryIntegration_WithMemory(t *testing.T) {
 				},
 			},
 			TotalContent:  "Important context for user query",
-			ContentBytes:  31,
+			ContentTokens:  31,
 			SearchSummary: "found relevant memory",
 		},
 	}
@@ -880,7 +889,7 @@ func TestReActLoop_MemorySearch_Integration(t *testing.T) {
 				},
 			},
 			TotalContent:  "Context 1\nContext 2",
-			ContentBytes:  20,
+			ContentTokens:  20,
 			SearchSummary: "found 2 contexts",
 		},
 	}
@@ -954,7 +963,7 @@ func TestMemorySize_CalculationCorrectness(t *testing.T) {
 	expectedSize := 0
 	for _, entity := range entities {
 		loop.currentMemories.Set(entity.Id, entity)
-		expectedSize += len(entity.Content)
+		expectedSize += aicommon.MeasureTokens(entity.Content)
 	}
 
 	actualSize := loop.currentMemorySize()
@@ -969,13 +978,13 @@ func TestMemorySize_CalculationCorrectness(t *testing.T) {
 func TestMemoryEviction_Correctness(t *testing.T) {
 	loop := &ReActLoop{
 		currentMemories: omap.NewEmptyOrderedMap[string, *aicommon.MemoryEntity](),
-		memorySizeLimit: 40, // 限制为 40 字节
+		memorySizeLimit: 6, // 限制为 6 tokens
 	}
 
-	// 添加第一个内存（15 字节）
+	// 添加第一个内存（约 2 tokens）
 	result1 := &aicommon.SearchMemoryResult{
 		Memories: []*aicommon.MemoryEntity{
-			{Id: "mem-1", Content: "First memory "}, // 13 bytes
+			{Id: "mem-1", Content: "First memory "},
 		},
 	}
 	loop.PushMemory(result1)
@@ -983,10 +992,10 @@ func TestMemoryEviction_Correctness(t *testing.T) {
 	size1 := loop.currentMemorySize()
 	log.Infof("After first push: size=%d", size1)
 
-	// 添加第二个内存（20 字节）
+	// 添加第二个内存（约 3 tokens）
 	result2 := &aicommon.SearchMemoryResult{
 		Memories: []*aicommon.MemoryEntity{
-			{Id: "mem-2", Content: "Second memory content"}, // 21 bytes
+			{Id: "mem-2", Content: "Second memory content"},
 		},
 	}
 	loop.PushMemory(result2)
@@ -1047,7 +1056,7 @@ func TestMemorySearch_MultipleCallsConsistency(t *testing.T) {
 				{Id: "mem-1", Content: "Consistent memory"},
 			},
 			TotalContent:  "Consistent memory",
-			ContentBytes:  17,
+			ContentTokens:  17,
 			SearchSummary: "consistent result",
 		},
 	}

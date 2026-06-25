@@ -2,16 +2,15 @@ package yakgrpc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/mcp"
-	mcptool "github.com/yaklang/yaklang/common/mcp/mcp-go/mcp"
 	"github.com/yaklang/yaklang/common/utils"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
@@ -114,31 +113,36 @@ func launchMcpServer(ctx context.Context, req *ypb.StartMcpServerRequest, send f
 		opts = append(opts, mcp.WithDynamicScript(req.GetScript()))
 	}
 
-	if req.GetEnableYakAITool() {
-		_, yakitTools, err := yakit.SearchAIYakToolWithPagination(consts.GetGormProfileDatabase(), "", false, &ypb.Paging{
-			OrderBy: "updated_at",
-			Order:   "desc",
-			Limit:   200,
-		})
-		if err != nil {
-			log.Errorf("failed to search yakit tools: %s", err)
-		}
+	if req.GetEnableAIToolFramework() {
+		db := consts.GetGormProfileDatabase()
 
-		tools := make([]*mcptool.Tool, 0, len(yakitTools))
-		for _, aiTool := range yakitTools {
-			tool := mcptool.NewTool(aiTool.Name)
-			tool.Description = aiTool.Description
-			dataMap := map[string]any{}
-			err := json.Unmarshal([]byte(aiTool.Params), &dataMap)
-			if err != nil {
-				log.Errorf("unmarshal aiTool.Params failed: %v", err)
-				continue
-			}
-			tool.InputSchema.FromMap(dataMap)
-			tool.YakScript = aiTool.Content
-			tools = append(tools, tool)
+		// Built-in framework tools: fs, ssa, yakscript, etc.
+		builtinTools := buildinaitools.GetAllToolsDynamically(db)
+		if len(builtinTools) > 0 {
+			opts = append(opts, mcp.WithAITools(builtinTools...))
+			log.Infof("launchMcpServer: loaded %d built-in aitool-framework tools", len(builtinTools))
 		}
-		opts = append(opts, mcp.WithYakScriptTools(tools...))
+	}
+
+	if req.GetEnableBridgeExternalMCP() {
+		db := consts.GetGormProfileDatabase()
+		externalTools, mcpErr := aitool.LoadAllEnabledAIToolsFromMCPServers(db, ctx)
+		if mcpErr != nil {
+			log.Warnf("launchMcpServer: load external mcp tools via bridge failed: %v", mcpErr)
+		} else if len(externalTools) > 0 {
+			opts = append(opts, mcp.WithAITools(externalTools...))
+			log.Infof("launchMcpServer: loaded %d external mcp tools via bridge", len(externalTools))
+		}
+	}
+
+	// Apply per-tool enable/disable from the profile DB.
+	// Tools that were explicitly disabled by the user are filtered out here.
+	disabledTools, dbErr := GetDisabledMCPToolNamesFromDB()
+	if dbErr != nil {
+		log.Warnf("launchMcpServer: failed to load disabled tool list: %v", dbErr)
+	}
+	if len(disabledTools) > 0 {
+		opts = append(opts, mcp.WithDisabledToolNames(disabledTools))
 	}
 
 	// 创建 MCP 服务器
@@ -222,9 +226,10 @@ func launchMcpServer(ctx context.Context, req *ypb.StartMcpServerRequest, send f
 		}
 		// 发送启动状态
 		err = send(&ypb.StartMcpServerResponse{
-			Status:    "running",
-			Message:   fmt.Sprintf("MCP server started with SSE transport on %s/sse and Streamable HTTP transport on %s/mcp", urlStr, urlStr),
-			ServerUrl: urlStr + "/sse",
+			Status:            "running",
+			Message:           fmt.Sprintf("MCP server started with SSE transport on %s/sse and Streamable HTTP transport on %s/mcp", urlStr, urlStr),
+			ServerUrl:         urlStr + "/sse",
+			StreamableHttpUrl: urlStr + "/mcp",
 		})
 		if err != nil {
 			log.Errorf("Failed to send running status: %v", err)

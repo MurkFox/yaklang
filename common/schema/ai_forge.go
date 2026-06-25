@@ -24,7 +24,8 @@ type AIForge struct {
 	Actions            string
 	Tags               string
 
-	Author string
+	Author    string
+	IsBuiltin bool `gorm:"default:false;index"`
 
 	InitPrompt       string
 	PersistentPrompt string
@@ -34,6 +35,35 @@ type AIForge struct {
 	FSBytes          []byte `gorm:"type:blob"`
 
 	IsTemporary bool // for temporary use, will be cleaned up later
+}
+
+func (a *AIForge) ToUpdateMap() map[string]interface{} {
+	if a == nil {
+		return nil
+	}
+
+	return map[string]interface{}{
+		"forge_verbose_name":   a.ForgeVerboseName,
+		"forge_name":           a.ForgeName,
+		"forge_content":        a.ForgeContent,
+		"forge_type":           a.ForgeType,
+		"params_ui_config":     a.ParamsUIConfig,
+		"params":               a.Params,
+		"user_persistent_data": a.UserPersistentData,
+		"description":          a.Description,
+		"tools":                a.Tools,
+		"tool_keywords":        a.ToolKeywords,
+		"actions":              a.Actions,
+		"tags":                 a.Tags,
+		"is_builtin":           a.IsBuiltin,
+		"init_prompt":          a.InitPrompt,
+		"persistent_prompt":    a.PersistentPrompt,
+		"plan_prompt":          a.PlanPrompt,
+		"result_prompt":        a.ResultPrompt,
+		"skill_path":           a.SkillPath,
+		"fs_bytes":             a.FSBytes,
+		"is_temporary":         a.IsTemporary,
+	}
 }
 
 func (a *AIForge) GetName() string {
@@ -55,6 +85,11 @@ func (a *AIForge) GetKeywords() []string {
 var FORGE_TYPE_YAK = "yak"
 var FORGE_TYPE_Config = "config"
 var FORGE_TYPE_SkillMD = "skillmd"
+
+func (a *AIForge) BeforeCreate() error {
+	a.Author = NormalizeAIResourceAuthor(a.Author, AIResourceAuthorAnonymous)
+	return nil
+}
 
 func IsRunnableForgeType(forgeType string) bool {
 	return forgeType == FORGE_TYPE_YAK || forgeType == FORGE_TYPE_Config || forgeType == ""
@@ -83,6 +118,7 @@ func (a *AIForge) AfterDelete(tx *gorm.DB) (err error) {
 func (a *AIForge) ToGRPC() *ypb.AIForge {
 	return &ypb.AIForge{
 		Id:                 int64(a.ID),
+		CreatedAt:          a.CreatedAt.Unix(),
 		ForgeName:          a.ForgeName,
 		ForgeVerboseName:   a.ForgeVerboseName,
 		ForgeContent:       a.ForgeContent,
@@ -99,7 +135,9 @@ func (a *AIForge) ToGRPC() *ypb.AIForge {
 		PersistentPrompt:   a.PersistentPrompt,
 		PlanPrompt:         a.PlanPrompt,
 		ResultPrompt:       a.ResultPrompt,
+		UpdatedAt:          a.UpdatedAt.Unix(),
 		Author:             a.Author,
+		IsBuiltin:          a.IsBuiltin,
 		SkillPath:          a.SkillPath,
 	}
 }
@@ -122,6 +160,7 @@ func GRPC2AIForge(forge *ypb.AIForge) *AIForge {
 		PlanPrompt:         forge.GetPlanPrompt(),
 		ResultPrompt:       forge.GetResultPrompt(),
 		Author:             forge.GetAuthor(),
+		IsBuiltin:          forge.GetIsBuiltin(),
 		SkillPath:          forge.GetSkillPath(),
 	}
 	forgeIns.ID = uint(forge.Id)

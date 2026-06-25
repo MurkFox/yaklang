@@ -14,6 +14,7 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+	"github.com/yaklang/yaklang/common/ai/ytoken"
 	"github.com/yaklang/yaklang/common/aireducer"
 	"github.com/yaklang/yaklang/common/chunkmaker"
 	"github.com/yaklang/yaklang/common/jsonextractor"
@@ -29,6 +30,18 @@ type ScoredRange struct {
 	EndLine   int
 	Score     float64 // 相关性评分，0.0-1.0，越高越相关
 	Text      string
+}
+
+// 关键词: compression score threshold, knowledge filter, central constant
+// 集中管理压缩评分阈值，确保流式回调与 forge 最终结果两处口径一致。
+// 阈值由 0.4 下调到 0.3 以覆盖「弱相关但有线索价值」的片段（如知识库中
+// 仅出现 inline 用法示例的 API 名匹配）；prompt 中的评分语义同步对齐。
+const compressionScoreThreshold = 0.3
+
+// passesCompressionScore 是压缩阶段的相关性评分准入判断：
+// 严格小于 compressionScoreThreshold 则视为弱相关/无关，被过滤。
+func passesCompressionScore(score float64) bool {
+	return score >= compressionScoreThreshold
 }
 
 // deduplicateScoredRanges removes overlapping ranges, keeping higher scored ones
@@ -58,10 +71,10 @@ func (r *ReAct) CompressLongTextWithDestination(
 	ctx context.Context,
 	i any,
 	destination string,
-	targetByteSize int64,
+	targetTokenSize int64,
 ) (string, error) {
-	if targetByteSize <= 1024 {
-		targetByteSize = 10 * 1024
+	if targetTokenSize <= 1024 {
+		targetTokenSize = 10 * 1024
 	}
 	var rawText string
 	switch ret := i.(type) {
@@ -76,17 +89,18 @@ func (r *ReAct) CompressLongTextWithDestination(
 		return "", utils.Error("cannot compress empty text")
 	}
 
-	if int64(len(rawText)) < (targetByteSize / 2) {
+	if int64(ytoken.CalcTokenCount(rawText)) < (targetTokenSize / 2) {
 		return rawText, nil
 	}
 
-	var emergencyLimit = targetByteSize / 2
+	var emergencyLimit = targetTokenSize / 2
 	fallbackResult := utils.ShrinkTextBlock(rawText, int(emergencyLimit))
 
-	// For large content (>30KB), use chunked processing
-	const maxChunkSize = 30 * 1024 // 40KB per chunk
-	const overlapLines = 20        // 20 lines overlap
-	const maxChunks = 20           // max 10 chunks
+	// 关键词: compress chunk, maxChunkSize, ~10K tokens
+	// 大文本分片处理：单分片 40KB（约 10K tokens），Speed 模型单次可消化
+	// 搜索结果 Limit=10 典型总量 10-30KB，1-2 片即可处理
+	const maxChunkSize = 40 * 1024 // 40KB per chunk, ~10K tokens
+	const maxChunks = 5            // hard cap: max 5 AI calls per compression
 
 	editor := memedit.NewMemEditor(rawText)
 
@@ -172,7 +186,7 @@ func (r *ReAct) CompressLongTextWithDestination(
 	var result strings.Builder
 	result.WriteString(fmt.Sprintf("【AI 智能筛选】从 %d 字节内容中提取的 %d 个最相关知识片段：\n\n", len(rawText), len(allScoredRanges)))
 
-	totalExtractedBytes := 0
+	totalExtractedTokens := 0
 
 	for i, item := range allScoredRanges {
 		text := editor.GetTextFromPositionInt(item.StartLine, 1, item.EndLine+1, 1)
@@ -180,9 +194,9 @@ func (r *ReAct) CompressLongTextWithDestination(
 			continue
 		}
 
-		textBytes := len(text)
-		if totalExtractedBytes+textBytes > int(targetByteSize) {
-			result.WriteString(fmt.Sprintf("\n[... 已达到 %d 字节限制，剩余 %d 个片段未展示 ...]\n", targetByteSize, len(allScoredRanges)-i))
+		textTokens := ytoken.CalcTokenCount(text)
+		if totalExtractedTokens+textTokens > int(targetTokenSize) {
+			result.WriteString(fmt.Sprintf("\n[... 已达到 %d token 限制，剩余 %d 个片段未展示 ...]\n", targetTokenSize, len(allScoredRanges)-i))
 			break
 		}
 
@@ -190,7 +204,7 @@ func (r *ReAct) CompressLongTextWithDestination(
 		result.WriteString(text)
 		result.WriteString("\n\n")
 
-		totalExtractedBytes += textBytes
+		totalExtractedTokens += textTokens
 	}
 
 	finalResult := result.String()
@@ -252,7 +266,8 @@ ALREADY_EXTRACTED 部分包含了之前已经提取过的内容。请注意：
 - 0.80-1.00: 直接回答用户问题的核心内容（且未被提取过）
 - 0.60-0.80: 相关背景/技术细节（且未被提取过）
 - 0.40-0.60: 补充性信息（或与已提取内容部分重复但有新信息）
-- 0.00-0.40: 弱相关、无关内容、或与已提取内容完全重复（不输出）
+- 0.30-0.40: 弱相关但有线索价值（如包含目标库/函数名片段、用户可据此追问）
+- 0.00-0.30: 无关内容或与已提取内容完全重复（不输出）
 
 尽量使用，精确到小数点后两位来表示
 
@@ -290,13 +305,13 @@ ALREADY_EXTRACTED 部分包含了之前已经提取过的内容。请注意：
 				aitool.WithNumberParam("score", aitool.WithParam_Description("相关性评分，0.0-1.0，越高越相关")),
 			),
 		},
-		aicommon.WithGeneralConfigStreamableFieldCallback([]string{
+		aicommon.WithGeneralConfigStreamableFieldEmitterCallback([]string{
 			"ranges",
-		}, func(key string, r io.Reader) {
+		}, func(key string, r io.Reader, emitter *aicommon.Emitter) {
 			jsonextractor.ExtractStructuredJSONFromStream(r, jsonextractor.WithObjectCallback(func(data map[string]interface{}) {
 				score := 0.0
 				score = utils.MapGetFloat64(data, "score")
-				if score < 0.4 {
+				if !passesCompressionScore(score) {
 					return
 				}
 				rangeStr := utils.MapGetString(data, "range")
@@ -317,8 +332,7 @@ ALREADY_EXTRACTED 部分包含了之前已经提取过的内容。请注意：
 				text := editor.GetTextFromPositionInt(startLine, 1, endLine, 1)
 				pw.WriteString(fmt.Sprintf("[权重：%v] 片段范围: %v-%v(切片大小:%v)；", score, startLine, endLine, utils.ByteSize(uint64(len(text)))))
 				// Start streaming output with unified nodeId
-				if invoker != nil {
-					emitter := invoker.GetConfig().GetEmitter()
+				if emitter != nil {
 					if event, _ := emitter.EmitDefaultStreamEvent(
 						"knowledge-compress",
 						pr,
@@ -370,8 +384,7 @@ ALREADY_EXTRACTED 部分包含了之前已经提取过的内容。请注意：
 			continue
 		}
 
-		// Filter out low score items (< 0.4)
-		if score < 0.4 {
+		if !passesCompressionScore(score) {
 			continue
 		}
 

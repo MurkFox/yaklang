@@ -66,16 +66,24 @@ func (c *Config) parseFile() (ret *Program, err error) {
 	prog.SaveEditor(c.originEditor)
 	prog.Finish()
 	wait := func() {}
-	if prog.DatabaseKind != ssa.ProgramCacheMemory { // save program
+	if prog.DatabaseKind != ssa.ProgramCacheMemory {
+		// prog.ProcessInfof("[SSA/persist] program %s saving program metadata (ir_program)", prog.Name)
+		// metaStart := time.Now()
 		wait = prog.UpdateToDatabase()
+		// prog.ProcessInfof("[SSA/persist] program %s program metadata saved, cost %v", prog.Name, time.Since(metaStart))
 	}
 	total := prog.Cache.CountInstruction()
+	persisted := prog.Cache.InstructionPersistedCount()
+	totalExpected := total + persisted
 	if prog.DatabaseKind != ssa.ProgramCacheMemory {
-		prog.ProcessInfof("program %s finishing save cache instruction(len:%d) to database", prog.Name, total)
+		prog.ProcessInfof("[SSA/persist] program %s flushing IR cache (remaining=%d persisted=%d total=%d) to database",
+			prog.Name, total, persisted, totalExpected)
 	} else {
-		prog.ProcessInfof("program %s finishing cache instruction(len:%d) (memory only, not saved)", prog.Name, total)
+		prog.ProcessInfof("[SSA/persist] program %s finishing cache instruction(len:%d) (memory only, not saved)", prog.Name, total)
 	}
-	prog.Cache.SaveToDatabase()
+	if err := prog.Cache.SaveToDatabase(irSaveProgressCallback(prog, totalExpected, persisted, 0.0, 1.0, nil)); err != nil {
+		return nil, utils.Errorf("persist IR to database failed: %w", err)
+	}
 	wait()
 	p := NewProgram(prog, c)
 	SaveConfig(c, p)
@@ -171,9 +179,6 @@ func (c *Config) parseSimple(r *memedit.MemEditor) (ret *ssa.Program, err error)
 		c.diagnosticsRecorder.RecordDuration("SSA Build", buildDuration)
 	}
 
-	if diagnostics.Enabled(diagnostics.LevelLow) {
-		diagnostics.LogHeapSnapshot("ssa_compile_simple_end", true)
-	}
 	return prog, nil
 }
 
@@ -226,7 +231,7 @@ func (c *Config) checkLanguageEx(path string, handler func(ssa.Builder) bool) er
 
 func (c *Config) swapLanguageFs(fs fi.FileSystem) fi.FileSystem {
 	if c.LanguageBuilder != nil {
-		return c.LanguageBuilder.WrapWithPreprocessedFS(fs)
+		return c.LanguageBuilder.WrapWithPreprocessedFS(fs, c.GetCodeSourceJarRecursiveParse())
 	}
-	return c.fs
+	return fs
 }

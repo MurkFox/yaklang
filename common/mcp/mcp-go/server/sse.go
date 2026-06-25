@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/yaklang/yaklang/common/mcp/mcp-go/mcp"
@@ -26,16 +29,71 @@ type SSEServer struct {
 
 // sseSession represents an active SSE connection.
 type sseSession struct {
+	mu        sync.Mutex
 	writer    http.ResponseWriter
 	flusher   http.Flusher
 	closeOnce sync.Once
 	done      chan struct{}
 }
 
+var allowedMessageOriginExtensionSchemes = map[string]struct{}{
+	"chrome-extension":     {},
+	"moz-extension":        {},
+	"safari-web-extension": {},
+}
+
+var allowedMessageOriginLocalHosts = map[string]struct{}{
+	"127.0.0.1": {},
+	"::1":       {},
+	"localhost": {},
+}
+
 func (s *sseSession) Close() {
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		close(s.done)
 	})
+}
+
+func (sess *sseSession) writeMessageEvent(eventData []byte) (err error) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	select {
+	case <-sess.done:
+		return fmt.Errorf("session closed")
+	default:
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("sse write: %v", r)
+		}
+	}()
+
+	// Assemble the complete SSE frame in a single buffer before writing.
+	// http.ResponseWriter wraps a bufio.Writer (default 4 KiB). If we call
+	// fmt.Fprintf with a large payload the runtime may auto-flush mid-write,
+	// sending the "event: message\ndata: " prefix and part of the JSON in one
+	// TCP chunk and the rest (including the mandatory "\n\n" terminator) in a
+	// later chunk. SSE clients that feed each received chunk directly to a JSON
+	// parser will then see a truncated / incomplete string and report errors like
+	// "Unterminated string" – a symptom visible especially with multi-byte UTF-8
+	// content (Chinese characters, etc.) that exceeds the buffer boundary.
+	//
+	// Writing the entire frame atomically ensures the SSE event is always
+	// delivered as a coherent unit.
+	frame := make([]byte, 0, len("event: message\ndata: ")+len(eventData)+2)
+	frame = append(frame, "event: message\ndata: "...)
+	frame = append(frame, eventData...)
+	frame = append(frame, '\n', '\n')
+
+	if _, werr := sess.writer.Write(frame); werr != nil {
+		return werr
+	}
+	sess.flusher.Flush()
+	return nil
 }
 
 // NewSSEServer creates a new SSE server instance with the given MCP server and base URL.
@@ -64,6 +122,14 @@ func (s *SSEServer) startNotificationDispatcher() {
 						return
 					}
 					if serverNotification.Context.SessionID == "" {
+						// Broadcast server-initiated notifications (e.g. tools/list_changed
+						// from AddTool) to every active SSE session.
+						s.sessions.Range(func(key, _ any) bool {
+							if sessionID, ok := key.(string); ok {
+								_ = s.SendEventToSession(sessionID, serverNotification.Notification)
+							}
+							return true
+						})
 						continue
 					}
 					_ = s.SendEventToSession(
@@ -174,26 +240,79 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		closeOnce: sync.Once{},
 	}
 
-	s.sessions.Store(sessionID, session)
-	defer s.sessions.Delete(sessionID)
-
+	// Derive the message endpoint base from the incoming request so that the
+	// returned URL always matches the origin the client used to connect.
+	// This avoids "Endpoint origin does not match connection origin" errors
+	// thrown by strict MCP SDK validators when the server binds to 0.0.0.0
+	// but the client connects via a real IP or hostname.
+	endpointBase := s.baseURL
+	if host := r.Host; host != "" {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		endpointBase = scheme + "://" + host
+	}
 	messageEndpoint := fmt.Sprintf(
 		"%s/message?sessionId=%s",
-		s.baseURL,
+		endpointBase,
 		sessionID,
 	)
 	fmt.Fprintf(w, "event: endpoint\ndata: %s\r\n\r\n", messageEndpoint)
 	flusher.Flush()
 
-	<-r.Context().Done()
-	session.Close()
+	s.sessions.Store(sessionID, session)
+	defer s.sessions.Delete(sessionID)
+
+	// Send periodic SSE keep-alive comments to prevent client body timeouts.
+	// Many HTTP clients (Node.js fetch/undici, etc.) close idle SSE streams
+	// after ~5 min without data, resulting in "Body Timeout Error".
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			session.Close()
+			return
+		case <-ticker.C:
+			session.mu.Lock()
+			select {
+			case <-session.done:
+				session.mu.Unlock()
+				session.Close()
+				return
+			default:
+				_, _ = session.writer.Write([]byte(":keepalive\n\n"))
+				session.flusher.Flush()
+				session.mu.Unlock()
+			}
+		}
+	}
 }
 
 // handleMessage processes incoming JSON-RPC messages from clients and sends responses
 // back through both the SSE connection and HTTP response.
 func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if r.Method == http.MethodOptions {
+		s.handleMessagePreflight(w, r, origin)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		s.writeJSONRPCError(w, nil, mcp.INVALID_REQUEST, "Method not allowed")
+		return
+	}
+
+	if !isAllowedMessageOrigin(origin) {
+		s.writeJSONRPCErrorWithStatus(w, nil, mcp.INVALID_REQUEST, "Forbidden origin", http.StatusForbidden)
+		return
+	}
+	setAllowedMessageOriginHeaders(w, origin)
+
+	if err := validateJSONContentType(r.Header.Get("Content-Type")); err != nil {
+		s.writeJSONRPCError(w, nil, mcp.INVALID_REQUEST, err.Error())
 		return
 	}
 
@@ -204,7 +323,8 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set the client context in the server before handling the message
-	ctx := s.server.WithContext(r.Context(), NotificationContext{
+	ctx := withTransportContext(r.Context(), legacySSETransport)
+	ctx = s.server.WithContext(ctx, NotificationContext{
 		ClientID:  sessionID,
 		SessionID: sessionID,
 	})
@@ -229,8 +349,7 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Only send response if there is one (not for notifications)
 	if response != nil {
 		eventData, _ := json.Marshal(response)
-		fmt.Fprintf(session.writer, "event: message\ndata: %s\n\n", eventData)
-		session.flusher.Flush()
+		_ = session.writeMessageEvent(eventData)
 
 		// Send HTTP response
 		w.Header().Set("Content-Type", "application/json")
@@ -249,10 +368,66 @@ func (s *SSEServer) writeJSONRPCError(
 	code int,
 	message string,
 ) {
+	s.writeJSONRPCErrorWithStatus(w, id, code, message, http.StatusBadRequest)
+}
+
+func (s *SSEServer) writeJSONRPCErrorWithStatus(
+	w http.ResponseWriter,
+	id interface{},
+	code int,
+	message string,
+	status int,
+) {
 	response := createErrorResponse(id, code, message)
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(response)
+}
+
+func (s *SSEServer) handleMessagePreflight(w http.ResponseWriter, r *http.Request, origin string) {
+	if !isAllowedMessageOrigin(origin) {
+		http.Error(w, "Forbidden origin", http.StatusForbidden)
+		return
+	}
+
+	setAllowedMessageOriginHeaders(w, origin)
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func setAllowedMessageOriginHeaders(w http.ResponseWriter, origin string) {
+	if origin == "" {
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Vary", "Origin")
+}
+
+func isAllowedMessageOrigin(origin string) bool {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return true
+	}
+	if origin == "null" {
+		return false
+	}
+
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	if _, ok := allowedMessageOriginExtensionSchemes[parsed.Scheme]; ok {
+		return parsed.Host != ""
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+
+	_, ok := allowedMessageOriginLocalHosts[parsed.Hostname()]
+	return ok
 }
 
 // SendEventToSession sends an event to a specific SSE session identified by sessionID.
@@ -272,12 +447,5 @@ func (s *SSEServer) SendEventToSession(
 		return err
 	}
 
-	select {
-	case <-session.done:
-		return fmt.Errorf("session closed")
-	default:
-		fmt.Fprintf(session.writer, "event: message\ndata: %s\n\n", eventData)
-		session.flusher.Flush()
-		return nil
-	}
+	return session.writeMessageEvent(eventData)
 }

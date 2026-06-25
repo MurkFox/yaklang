@@ -22,6 +22,70 @@ import (
 
 const recoveryTaskIDPrefix = "react-recovery-"
 
+var (
+	newCoordinatorContextForPlanExec = aid.NewCoordinatorContext
+	runCoordinatorForPlanExec        = func(c *aid.Coordinator) error { return c.Run() }
+)
+
+type invokePlanAndExecuteOptions struct {
+	task             aicommon.AIStatefulTask
+	planPayload      string
+	forgeName        string
+	forgeParams      any
+	coordinatorID    string
+	startTaskIndex   string
+	executePlanInput *aicommon.ExecutePlanInput
+}
+
+type InvokePlanAndExecuteOption func(*invokePlanAndExecuteOptions)
+
+func WithInvokePlanAndExecuteTask(task aicommon.AIStatefulTask) InvokePlanAndExecuteOption {
+	return func(cfg *invokePlanAndExecuteOptions) {
+		cfg.task = task
+	}
+}
+
+func WithInvokePlanAndExecutePlanPayload(planPayload string) InvokePlanAndExecuteOption {
+	return func(cfg *invokePlanAndExecuteOptions) {
+		cfg.planPayload = planPayload
+	}
+}
+
+func WithInvokePlanAndExecuteForge(name string, params any) InvokePlanAndExecuteOption {
+	return func(cfg *invokePlanAndExecuteOptions) {
+		cfg.forgeName = name
+		cfg.forgeParams = params
+	}
+}
+
+func WithInvokePlanAndExecuteCoordinatorID(coordinatorID string) InvokePlanAndExecuteOption {
+	return func(cfg *invokePlanAndExecuteOptions) {
+		cfg.coordinatorID = coordinatorID
+	}
+}
+
+func WithInvokePlanAndExecuteStartTaskIndex(startTaskIndex string) InvokePlanAndExecuteOption {
+	return func(cfg *invokePlanAndExecuteOptions) {
+		cfg.startTaskIndex = startTaskIndex
+	}
+}
+
+func WithInvokePlanAndExecuteExecutePlanInput(input *aicommon.ExecutePlanInput) InvokePlanAndExecuteOption {
+	return func(cfg *invokePlanAndExecuteOptions) {
+		cfg.executePlanInput = input
+	}
+}
+
+func newInvokePlanAndExecuteOptions(opts ...InvokePlanAndExecuteOption) *invokePlanAndExecuteOptions {
+	cfg := &invokePlanAndExecuteOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(cfg)
+		}
+	}
+	return cfg
+}
+
 func formatRecoveryTaskID(coordinatorID string) string {
 	return recoveryTaskIDPrefix + sanitizeForTaskId(coordinatorID) + uuid.New().String()
 }
@@ -32,7 +96,6 @@ func newRecoveryPlanExecTask(ctx context.Context, emitter *aicommon.Emitter, coo
 		coordinatorID,
 		ctx,
 		emitter,
-		true,
 	)
 }
 
@@ -103,7 +166,10 @@ func (r *ReAct) RequireAIForgeAndAsyncExecute(
 			r.emitArtifactsSummaryToTimeline()
 			done(finalError)
 		}()
-		finalError = r.invokePlanAndExecute(taskDone, ctx, r.GetCurrentTask(), "", forgeName, forgeParams, "")
+		finalError = r.invokePlanAndExecute(taskDone, ctx,
+			WithInvokePlanAndExecuteTask(r.GetCurrentTask()),
+			WithInvokePlanAndExecuteForge(forgeName, forgeParams),
+		)
 		if finalError != nil {
 			log.Errorf("AsyncPlanAndExecute error: %v", finalError)
 		}
@@ -132,7 +198,10 @@ func (r *ReAct) AsyncPlanAndExecute(ctx context.Context, planPayload string, onF
 				onFinished(finalError)
 			}
 		}()
-		finalError = r.invokePlanAndExecute(taskDone, ctx, r.GetCurrentTask(), planPayload, "", nil, "")
+		finalError = r.invokePlanAndExecute(taskDone, ctx,
+			WithInvokePlanAndExecuteTask(r.GetCurrentTask()),
+			WithInvokePlanAndExecutePlanPayload(planPayload),
+		)
 		if finalError != nil {
 			log.Errorf("AsyncPlanAndExecute error: %v", finalError)
 		}
@@ -144,7 +213,7 @@ func (r *ReAct) AsyncPlanAndExecute(ctx context.Context, planPayload string, onF
 	}
 }
 
-func (r *ReAct) AsyncRecoverPlanAndExecute(ctx context.Context, coordinatorID string, onFinished func(error)) {
+func (r *ReAct) AsyncRecoverPlanAndExecute(ctx context.Context, coordinatorID string, startTaskIndex string, onFinished func(error), opts ...InvokePlanAndExecuteOption) {
 	cb := utils.NewCondBarrierContext(ctx)
 	startupBarrier := cb.CreateBarrier("startup")
 
@@ -164,7 +233,13 @@ func (r *ReAct) AsyncRecoverPlanAndExecute(ctx context.Context, coordinatorID st
 				onFinished(finalError)
 			}
 		}()
-		finalError = r.invokePlanAndExecute(taskDone, recoveryTask.GetContext(), recoveryTask, "", "", nil, coordinatorID)
+		invokeOpts := []InvokePlanAndExecuteOption{
+			WithInvokePlanAndExecuteTask(recoveryTask),
+			WithInvokePlanAndExecuteCoordinatorID(coordinatorID),
+			WithInvokePlanAndExecuteStartTaskIndex(startTaskIndex),
+		}
+		invokeOpts = append(invokeOpts, opts...)
+		finalError = r.invokePlanAndExecute(taskDone, recoveryTask.GetContext(), invokeOpts...)
 		if finalError != nil {
 			log.Errorf("AsyncRecoverPlanAndExecute error: %v", finalError)
 			recoveryTask.SetStatus(aicommon.AITaskState_Aborted)
@@ -181,7 +256,18 @@ func (r *ReAct) AsyncRecoverPlanAndExecute(ctx context.Context, coordinatorID st
 	}
 }
 
-func (r *ReAct) invokePlanAndExecute(doneChannel chan struct{}, ctx context.Context, task aicommon.AIStatefulTask, planPayload string, forgeName string, forgeParams any, coordinatorID string) (finalErr error) {
+func (r *ReAct) invokePlanAndExecute(doneChannel chan struct{}, ctx context.Context, opts ...InvokePlanAndExecuteOption) (finalErr error) {
+	cfg := newInvokePlanAndExecuteOptions(opts...)
+	task := cfg.task
+	planPayload := cfg.planPayload
+	if planPayload == "" && cfg.executePlanInput != nil {
+		planPayload = cfg.executePlanInput.PlanPayload
+	}
+	forgeName := cfg.forgeName
+	forgeParams := cfg.forgeParams
+	coordinatorID := cfg.coordinatorID
+	startTaskIndex := cfg.startTaskIndex
+
 	doneOnce := new(sync.Once)
 	done := func() {
 		doneOnce.Do(func() {
@@ -211,9 +297,10 @@ func (r *ReAct) invokePlanAndExecute(doneChannel chan struct{}, ctx context.Cont
 		reactTaskID = task.GetId()
 	}
 	params := map[string]any{
-		"re-act_id":      r.config.Id,
-		"re-act_task":    reactTaskID,
-		"coordinator_id": uid,
+		"re-act_id":        r.config.Id,
+		"re-act_task":      reactTaskID,
+		"coordinator_id":   uid,
+		"start_task_index": startTaskIndex,
 	}
 	r.EmitJSON(schema.EVENT_TYPE_START_PLAN_AND_EXECUTION, r.config.Id, params)
 	defer func() {
@@ -276,8 +363,8 @@ func (r *ReAct) invokePlanAndExecute(doneChannel chan struct{}, ctx context.Cont
 			case SYNC_TYPE_QUEUE_INFO:
 				log.Infof("Received queue info sync event, ignoring in plan execution mode")
 				return
-			case aicommon.SYNC_TYPE_USER_INTERVENTION: // 临时方案
-				log.Infof("Received user intervention event: %v", event)
+			case aicommon.SYNC_TYPE_USER_INTERVENTION, aicommon.SYNC_TYPE_RECOVERY_HISTORY: // 临时方案
+				log.Infof("Received user covery history or intervention event: %v", event)
 				// warning not mirror user intervention events to timeline to avoid confusion
 				return
 			default:
@@ -295,7 +382,7 @@ func (r *ReAct) invokePlanAndExecute(doneChannel chan struct{}, ctx context.Cont
 	baseOpts = append(baseOpts,
 		aicommon.WithID(uid),
 		aicommon.WithTimeline(r.config.Timeline),
-		aicommon.WithAICallback(r.config.OriginalAICallback),
+		aicommon.WithAICallbacks(r.config.GetRawAICallbacks()),
 		aicommon.WithAllowPlanUserInteract(true),
 		aicommon.WithEventInputChanx(inputChannel),
 		aicommon.WithHotPatchOptionChan(hotpatchChan),
@@ -305,6 +392,10 @@ func (r *ReAct) invokePlanAndExecute(doneChannel chan struct{}, ctx context.Cont
 			r.config.EventHandler(e)
 		}),
 	)
+	if startTaskIndex != "" {
+		baseOpts = append(baseOpts, aid.WithRecoveryStartTaskIndex(startTaskIndex))
+	}
+	baseOpts = appendApprovedPlanArtifactOptions(baseOpts, cfg.executePlanInput)
 
 	if forgeName != "" {
 		var opts = make([]aicommon.ConfigOption, len(baseOpts))
@@ -393,14 +484,14 @@ func (r *ReAct) invokePlanAndExecute(doneChannel chan struct{}, ctx context.Cont
 		r.config.HotPatchBroadcaster.Unsubscribe(hotpatchChan)
 		return nil
 	} else {
-		cod, err := aid.NewCoordinatorContext(planCtx, planPayload, baseOpts...)
+		cod, err := newCoordinatorContextForPlanExec(planCtx, planPayload, baseOpts...)
 		if err != nil {
 			log.Errorf("Failed to create coordinator for plan execution: %v", err)
 			return utils.Errorf("failed to create coordinator for plan execution: %v", err)
 		}
 
 		done()
-		if err := cod.Run(); err != nil {
+		if err := runCoordinatorForPlanExec(cod); err != nil {
 			log.Errorf("Plan execution failed: %v", err)
 			return utils.Errorf("plan execution failed: %v", err)
 		}

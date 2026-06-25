@@ -2,13 +2,18 @@ package aicommon
 
 import (
 	"context"
+	"strings"
+	"sync"
+
 	"github.com/yaklang/yaklang/common/consts"
 
 	"github.com/yaklang/yaklang/common/ai"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon/aiconfig"
 	"github.com/yaklang/yaklang/common/ai/aispec"
 	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+	"google.golang.org/protobuf/proto"
 )
 
 func (c *Config) StartHotPatchLoop(ctx context.Context) {
@@ -21,7 +26,7 @@ func (c *Config) StartHotPatchLoop(ctx context.Context) {
 			for {
 				select {
 				case <-validator:
-					log.Infof("hotpatch loop for config %s started", c.Id)
+					//log.Infof("hotpatch loop for config %s started", c.Id)
 				case <-ctx.Done():
 					return
 				case hotPatchOption := <-c.HotPatchOptionChan.OutputChannel():
@@ -66,11 +71,15 @@ func (c *Config) SimpleInfoMap() map[string]interface{} {
 		"AgreeAIScoreMiddle":          c.AgreeAIScoreMiddle,
 		"InputConsumption":            input,
 		"OutputConsumption":           output,
+		"CacheHitToken":               c.GetCacheHitToken(),
 		"AICallTokenLimit":            c.AiCallTokenLimit,
 		"AIAutoRetry":                 c.AiAutoRetry,
 		"AIAutoTransactionRetry":      c.AiTransactionAutoRetry,
 		"GenerateReport":              c.GenerateReport,
 		"ForgeName":                   c.ForgeName,
+		"EnablePlan":            c.GetEnablePlanAndExec(),
+		"SyncPerceptionTrigger": c.GetSyncPerceptionTrigger(),
+		"EnabledCapabilities":   c.GetEnabledCapabilities(),
 	}
 }
 
@@ -80,6 +89,9 @@ var (
 	HotPatchType_AIService                   = "AIService"
 	HotPatchType_ModelName                   = "ModelName"
 	HotPatchType_RiskControlScore            = "RiskControlScore"
+	HotPatchType_EnablePlan                  = "EnablePlan"
+	HotPatchType_AllowPlanUserInteract       = "AllowPlanUserInteract"
+	HotPatchType_SyncPerceptionTrigger       = "SyncPerceptionTrigger"
 
 	hotPatchPromoteIntelligentConfig = func(serviceName, modelName string) error {
 		mgr := aiconfig.GetGlobalManager()
@@ -152,6 +164,32 @@ func (c *Config) ProcessHotPatchMessage(e *ypb.AIInputEvent) []ConfigOption {
 		aiOption = append(aiOption, WithAIChatInfo(serviceName, modelName))
 	}
 
+	if e.HotpatchType == HotPatchType_EnablePlan {
+		aiOption = append(aiOption, WithEnablePlanAndExec(hotPatchParams.GetEnablePlan()))
+	}
+
+	if e.HotpatchType == HotPatchType_AllowPlanUserInteract {
+		aiOption = append(aiOption, WithAllowPlanUserInteract(hotPatchParams.GetAllowPlanUserInteract()))
+	}
+
+	if e.HotpatchType == HotPatchType_SyncPerceptionTrigger {
+		aiOption = append(aiOption, WithSyncPerceptionTrigger(hotPatchParams.GetSyncPerceptionTrigger()))
+	}
+
+	if e.HotpatchType == HotPatchType_EnabledCapabilities {
+		incoming := ParseEnabledCapabilitiesFromProto(hotPatchParams)
+		if len(incoming) > 0 {
+			aiOption = append(aiOption, wrapHotpatchOptionForTask(e.GetTaskId(), WithHotpatchEnabledCapabilities(incoming...)))
+		}
+	}
+
+	if e.HotpatchType == HotPatchType_DisabledCapabilities {
+		incoming := ParseEnabledCapabilitiesFromProto(hotPatchParams)
+		if len(incoming) > 0 {
+			aiOption = append(aiOption, wrapHotpatchOptionForTask(e.GetTaskId(), WithHotpatchDisabledCapabilities(incoming...)))
+		}
+	}
+
 	if e.HotpatchType == HotPatchType_ModelName {
 		serviceName := c.AiServerName
 		modelName := hotPatchParams.GetAIModelName()
@@ -181,4 +219,157 @@ func (c *Config) ProcessHotPatchMessage(e *ypb.AIInputEvent) []ConfigOption {
 	}
 
 	return aiOption
+}
+
+// mergeHotpatchSessionStartParams overlays hotpatch Params onto cached session start_params.
+// Bool fields use HotpatchType to distinguish explicit false from proto3 zero values.
+func mergeHotpatchSessionStartParams(base *ypb.AIStartParams, e *ypb.AIInputEvent) (*ypb.AIStartParams, bool) {
+	if e == nil || e.Params == nil {
+		return base, false
+	}
+	hotpatchType := strings.TrimSpace(e.GetHotpatchType())
+	if hotpatchType == "" {
+		return base, false
+	}
+
+	var next *ypb.AIStartParams
+	if base == nil {
+		next = &ypb.AIStartParams{}
+	} else {
+		next = proto.Clone(base).(*ypb.AIStartParams)
+	}
+	p := e.Params
+
+	switch hotpatchType {
+	case HotPatchType_EnablePlan:
+		next.EnablePlan = p.GetEnablePlan()
+	case HotPatchType_SyncPerceptionTrigger:
+		next.SyncPerceptionTrigger = p.GetSyncPerceptionTrigger()
+	case HotPatchType_EnabledCapabilities:
+		if len(p.GetEnabledCapabilities()) == 0 {
+			return base, false
+		}
+		next.EnabledCapabilities = MergeEnabledCapabilitiesHotpatch(base, p)
+	case HotPatchType_DisabledCapabilities:
+		if len(p.GetEnabledCapabilities()) == 0 {
+			return base, false
+		}
+		next.EnabledCapabilities = SubtractEnabledCapabilitiesHotpatch(base, p)
+	case HotPatchType_AllowPlanUserInteract:
+		next.AllowPlanUserInteract = p.GetAllowPlanUserInteract()
+	case HotPatchType_AllowRequireForUserInteract:
+		next.DisallowRequireForUserPrompt = p.GetDisallowRequireForUserPrompt()
+	case HotPatchType_AgreePolicy:
+		if p.GetReviewPolicy() == "" {
+			return base, false
+		}
+		next.ReviewPolicy = p.GetReviewPolicy()
+	case HotPatchType_RiskControlScore:
+		next.AIReviewRiskControlScore = p.GetAIReviewRiskControlScore()
+	case HotPatchType_AIService:
+		if p.GetAIService() == "" {
+			return base, false
+		}
+		next.AIService = p.GetAIService()
+		if p.GetAIModelName() != "" {
+			next.AIModelName = p.GetAIModelName()
+		}
+	case HotPatchType_ModelName:
+		if p.GetAIModelName() == "" {
+			return base, false
+		}
+		next.AIModelName = p.GetAIModelName()
+	default:
+		return base, false
+	}
+	return next, true
+}
+
+func (c *Config) SetHotpatchCurrentTaskIdResolver(resolver func() string) {
+	if c == nil {
+		return
+	}
+	if c.m == nil {
+		c.m = new(sync.Mutex)
+	}
+	c.m.Lock()
+	defer c.m.Unlock()
+	c.hotpatchCurrentTaskIdResolver = resolver
+}
+
+func (c *Config) resolveHotpatchCurrentTaskId() string {
+	if c == nil {
+		return ""
+	}
+	c.m.Lock()
+	resolver := c.hotpatchCurrentTaskIdResolver
+	c.m.Unlock()
+	if resolver == nil {
+		return ""
+	}
+	return strings.TrimSpace(resolver())
+}
+
+func isTaskScopedCapabilityHotpatch(e *ypb.AIInputEvent) bool {
+	if e == nil {
+		return false
+	}
+	if strings.TrimSpace(e.GetTaskId()) == "" {
+		return false
+	}
+	switch strings.TrimSpace(e.GetHotpatchType()) {
+	case HotPatchType_EnabledCapabilities, HotPatchType_DisabledCapabilities:
+		return true
+	default:
+		return false
+	}
+}
+
+func wrapHotpatchOptionForTask(targetTaskId string, opt ConfigOption) ConfigOption {
+	targetTaskId = strings.TrimSpace(targetTaskId)
+	if opt == nil {
+		return func(*Config) error { return nil }
+	}
+	if targetTaskId == "" {
+		return opt
+	}
+	return func(c *Config) error {
+		if c == nil {
+			return nil
+		}
+		currentTaskId := c.resolveHotpatchCurrentTaskId()
+		if currentTaskId != targetTaskId {
+			if c.DebugEvent {
+				log.Infof("skip hotpatch for task %q on config %s (current task: %q)",
+					targetTaskId, c.Id, currentTaskId)
+			}
+			return nil
+		}
+		return opt(c)
+	}
+}
+
+func (c *Config) PersistSessionStartParamsFromHotpatch(e *ypb.AIInputEvent) {
+	if c == nil || e == nil || !e.IsConfigHotpatch {
+		return
+	}
+	if isTaskScopedCapabilityHotpatch(e) {
+		return
+	}
+	sessionID := strings.TrimSpace(c.PersistentSessionId)
+	if sessionID == "" || c.GetDB() == nil {
+		return
+	}
+
+	cached, err := yakit.GetAISessionMetaStartParamsBySessionID(c.GetDB(), sessionID)
+	if err != nil {
+		log.Warnf("load ai session start params failed for %s: %v", sessionID, err)
+	}
+	next, changed := mergeHotpatchSessionStartParams(cached, e)
+	if !changed {
+		return
+	}
+	if _, err := yakit.CreateOrUpdateAISessionMetaStartParams(c.GetDB(), sessionID, next); err != nil {
+		log.Warnf("persist ai session start params from hotpatch failed for %s: %v", sessionID, err)
+	}
 }

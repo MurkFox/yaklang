@@ -5,19 +5,19 @@ package consts
 // ExistedCorePluginEmbedFSHash contains the SHA256 hash of the embedded core plugin filesystem.
 // This hash is used to verify the integrity of core plugins and detect changes in the plugin bundle.
 // The hash is automatically generated during the build process and should not be manually modified.
-const ExistedCorePluginEmbedFSHash string = "09e796d1d90208e91e371cc354c4f17b2c1705573b42eea5166170dee1b45fe5"
+const ExistedCorePluginEmbedFSHash string = "eab4a2f8ddeed77e84033b48f6e73dd88cd02e455cd6859085b84bbcae5786dc"
 
 // ExistedSyntaxFlowEmbedFSHash contains the SHA256 hash of the embedded SyntaxFlow filesystem.
 // This hash is used to verify the integrity of SyntaxFlow rules and templates embedded in the binary.
 // The hash is automatically calculated from the SyntaxFlow rule files during compilation.
-const ExistedSyntaxFlowEmbedFSHash string = "2c9a209b00c9613f05851a8760ee18bde352f0d963d49079cae346274146fbbb"
+const ExistedSyntaxFlowEmbedFSHash string = "10e65f330b50f766267d411588f1cf4581b4f49140df3e826bd57275f84adfa7"
 
 // ExistedBuildInForgeEmbedFSHash contains the SHA256 hash of the embedded build-in forge filesystem.
 // This hash is used to verify the integrity of the built-in forge templates and resources.
 // The forge system provides templates for code generation and vulnerability testing scenarios.
-const ExistedBuildInForgeEmbedFSHash string = "647e85a0d30b0ae37f5ac2a44ba20a07565529de82e12270a4b84a355d36d528"
+const ExistedBuildInForgeEmbedFSHash string = "4a290214fd240617f7efb5907df3814af9726d23063d3ab88fe88a9a8d61d830"
 
 // ExistedBuildInAIToolEmbedFSHash contains the SHA256 hash of the embedded AI tool filesystem.
 // This hash is used to verify the integrity of AI-related tools and configurations embedded in the binary.
 // These tools include AI-powered analysis engines and machine learning models for security testing.
-const ExistedBuildInAIToolEmbedFSHash string = "9e262367b5ecfb2da8ea0d61e36717384886c8899e4e130e00dab5dbdea63e67"
+const ExistedBuildInAIToolEmbedFSHash string = "276d675aba155454c765493ab9cddb648b31188fec442ed546a204e3cfc0571c"

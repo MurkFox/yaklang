@@ -10,12 +10,14 @@ import (
 )
 
 var fuzzMethodAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoopOption {
-	return reactloops.WithRegisterLoopAction(
+	return reactloops.WithRegisterLoopActionWithStreamField(
 		"fuzz_method",
 		"Fuzz the HTTP request method. Use this to test different HTTP methods (GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD, etc.) and observe response differences.",
 		[]aitool.ToolOption{
 			aitool.WithStringArrayParam("methods", aitool.WithParam_Description("HTTP methods to test, e.g., ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']"), aitool.WithParam_Required(true)),
-			aitool.WithStringParam("reason", aitool.WithParam_Description("Explain why you want to test these methods")),
+		},
+		[]*reactloops.LoopStreamField{
+			{FieldName: "reason", AINodeId: "thought"},
 		},
 		func(l *reactloops.ReActLoop, action *aicommon.Action) error {
 			methods := action.GetStringSlice("methods")
@@ -40,15 +42,15 @@ var fuzzMethodAction = func(r aicommon.AIInvokeRuntime) reactloops.ReActLoopOpti
 			fuzzResult := fuzzReq.FuzzMethod(methods...)
 
 			// Execute and compare
-			diffResult, err := executeFuzzAndCompare(loop, fuzzResult, "fuzz_method")
+			paramSummary := fmt.Sprintf("methods=%v; reason=%s", methods, reason)
+			diffResult, verifyResult, err := executeFuzzAndCompare(loop, fuzzResult, "fuzz_method", paramSummary, action)
 			if err != nil {
 				operator.Fail(err)
 				return
 			}
 
-			r.AddToTimeline("fuzz_method", fmt.Sprintf("Tested methods: %v\n%s", methods, diffResult))
-			operator.Feedback(diffResult)
+			r.AddToTimeline("fuzz_method", fmt.Sprintf("Tested methods: %v\n%s", methods, buildFuzzTimelineSummary(diffResult)))
+			applyFuzzVerificationOutcome(loop, operator, diffResult, verifyResult)
 		},
 	)
 }
-

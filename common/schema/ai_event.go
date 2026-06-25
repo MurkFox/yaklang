@@ -3,8 +3,9 @@ package schema
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/samber/lo"
 	"strings"
+
+	"github.com/samber/lo"
 
 	"github.com/yaklang/yaklang/common/jsonextractor"
 	"github.com/yaklang/yaklang/common/jsonpath"
@@ -27,6 +28,42 @@ const (
 
 type EventType string
 
+var eventTypeNotSaveBlackList = []EventType{
+	EVENT_TYPE_CONSUMPTION,
+	EVENT_TYPE_PONG,
+	EVENT_TYPE_PRESSURE,
+	EVENT_TYPE_AI_FIRST_BYTE_COST_MS,
+	EVENT_TYPE_AI_TOTAL_COST_MS,
+	EVENT_TYPE_AI_CALL_SUMMARY,
+	EVENT_TYPE_MEMORY_SEARCH_QUICKLY,
+	EVENT_TYPE_MEMORY_SEARCH_SPECIFIC,
+	EVENT_TYPE_MEMORY_BUILD,
+	EVENT_TYPE_MEMORY_SAVE,
+	EVENT_TYPE_MEMORY_ADD_CONTEXT,
+	EVENT_TYPE_MEMORY_REMOVE_CONTEXT,
+	EVENT_TYPE_MEMORY_CONTEXT,
+	// 价值评估结果只回吐前端展示, 不落本地数据库
+	EVENT_TYPE_VALUE_FEEDBACK,
+}
+
+var structuredNodeIDNotSaveBlackList = []string{
+	"status",
+	// 关键词: structured system 不保存默认行为, pop_task / push_task 特例保存
+	// 之前 commit 把 "system" 从黑名单中移除并新增了 pop_task / push_task
+	// 特例分支, 但忘了恢复"默认不保存"语义, 导致所有 NodeId == "system" 的
+	// STRUCTURED 事件全部被持久化, 与 TestAiOutputEvent_ShouldSave 中
+	// "structured_system_should_not_save" 的期望相悖. 把 "system" 加回黑名单
+	// 后, saveAllowedByNodeID 中 pop_task / push_task 早返路径仍然保留特例
+	// 保存; 其余 system 节点回归默认不保存.
+	"system",
+	"react_task_cancelled",
+	"react_task_enqueue",
+	"react_task_cleared",
+	"react_task_status_changed",
+	"react_task_created",
+	"session_title",
+}
+
 const (
 	AI_REACT_LOOP_ACTION_REQUIRE_TOOL             = "require_tool"
 	AI_REACT_LOOP_ACTION_SEARCH_CAPABILITIES      = "search_capabilities"
@@ -34,6 +71,7 @@ const (
 	AI_REACT_LOOP_ACTION_DIRECTLY_ANSWER          = "directly_answer"
 	AI_REACT_LOOP_ACTION_KNOWLEDGE_ENHANCE        = "knowledge_enhance_answer"
 	AI_REACT_LOOP_ACTION_REQUIRE_AI_BLUEPRINT     = "require_ai_blueprint"
+	AI_REACT_LOOP_ACTION_REQUEST_PLAN             = "request_plan"
 	AI_REACT_LOOP_ACTION_REQUEST_PLAN_EXECUTION   = "request_plan_and_execution"
 	AI_REACT_LOOP_ACTION_HTTP_FLOW_ANALYZE        = "http_flow_analyze"
 	AI_REACT_LOOP_ACTION_TOOL_COMPOSE             = "tool_compose"
@@ -42,6 +80,10 @@ const (
 	AI_REACT_LOOP_ACTION_LOAD_SKILL_RESOURCES     = "load_skill_resources"
 	AI_REACT_LOOP_ACTION_LOAD_CAPABILITY          = "load_capability"
 	AI_REACT_LOOP_ACTION_DIRECTLY_CALL_TOOL       = "directly_call_tool"
+	AI_REACT_LOOP_ACTION_REQUEST_VERIFICATION     = "request_verification"
+	AI_REACT_LOOP_ACTION_ADJUST_TODOLIST          = "adjust_todolist"
+	AI_REACT_LOOP_ACTION_QUERY_MCP_SERVERS        = "query_mcp_servers"
+	AI_REACT_LOOP_ACTION_QUERY_MCP_TOOLS          = "query_mcp_tools"
 )
 
 const (
@@ -60,6 +102,26 @@ const (
 	AI_REACT_LOOP_NAME_INTERNET_RESEARCH   = "internet_research"
 	AI_REACT_LOOP_NAME_SMART_QA            = "smart_qa"
 	AI_REACT_LOOP_NAME_DIR_EXPLORE         = "dir_explore"
+	AI_REACT_LOOP_NAME_INFOSEC_RECON       = "infosec_recon"
+	AI_REACT_LOOP_NAME_AI_SKILL_AUDIT      = "ai_skill_audit"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY                   = "ssa_api_discovery"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_PHASE4_SYNTAXFLOW = "ssa_api_discovery_phase4_syntaxflow"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_API_PROBE         = "ssa_api_discovery_api_probe"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_PHASE1_TECH_ARCH   = "ssa_api_discovery_phase1_tech_arch"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_TEST_API_ARCH     = "ssa_api_discovery_test_api_arch"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_ROUTING_PROBE      = "ssa_api_discovery_routing_probe"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_COMPONENT_MAP      = "ssa_api_discovery_component_map"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_PROJECT_CONTEXT    = "ssa_api_discovery_project_context"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_FRONTEND_API       = "ssa_api_discovery_frontend_api"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_FEATURE_INVENTORY  = "ssa_api_discovery_feature_inventory"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_AUTH_REALM         = "ssa_api_discovery_auth_realm"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_AUTH_MECHANISM     = "ssa_api_discovery_auth_mechanism"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_AUTH_SURFACE       = "ssa_api_discovery_auth_surface"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_FAILURE_SEMANTICS  = "ssa_api_discovery_failure_semantics"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_AUTH_CALIBRATION   = "ssa_api_discovery_auth_calibration"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_FEATURE_VERIFY     = "ssa_api_discovery_feature_verify"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_COVERAGE_SIGNAL  = "ssa_api_discovery_coverage_signal"
+	AI_REACT_LOOP_NAME_SSA_API_DISCOVERY_FRAMEWORK_TOOLKIT_ROUTER = "ssa_api_discovery_framework_toolkit_router"
 )
 
 const (
@@ -98,6 +160,7 @@ const (
 	EVENT_TOOL_CALL_SUMMARY     = "tool_call_summary"     // tool call summary event, used to emit the tool call summary information
 	EVENT_TOOL_CALL_DECISION    = "tool_call_decision"    // tool call decision event, used to emit the tool call decision information
 	EVENT_TOOL_CALL_RESULT      = "tool_call_result"      // tool call result event, used to emit the tool call result information
+	EVENT_TOOL_CALL_PARAM       = "tool_call_param"       // tool call param event, used to emit the final invoke params bound to call tool id
 	EVENT_TOOL_CALL_LOG_DIR     = "tool_call_log_dir"     // tool call log dir event, used to emit the tool call log dir information
 
 	EVENT_TYPE_START_PLAN_AND_EXECUTION    EventType = "start_plan_and_execution"
@@ -109,6 +172,7 @@ const (
 	EVENT_TYPE_PERMISSION_REQUIRE          EventType = "permission_require"
 	EVENT_TYPE_TASK_REVIEW_REQUIRE         EventType = "task_review_require"
 	EVENT_TYPE_PLAN_REVIEW_REQUIRE         EventType = "plan_review_require"
+	EVENT_TYPE_DETACHED_PLAN_REQUIRE       EventType = "detached_plan_require"
 	EVENT_TYPE_TOOL_USE_REVIEW_REQUIRE     EventType = "tool_use_review_require"
 	EVENT_TYPE_EXEC_AIFORGE_REVIEW_REQUIRE EventType = "exec_aiforge_review_require"
 
@@ -122,9 +186,17 @@ const (
 
 	EVENT_TYPE_AID_CONFIG = "aid_config" // aid config event, used to emit the current config information
 
-	EVENT_TYPE_YAKIT_EXEC_RESULT = "yak_exec_result" // yakit exec result event, used to emit the yakit exec result information
-	EVENT_TYPE_YAKIT_RISK        = "yak_risk"        // yakit risk event, used to emit the yakit risk information
-	EVENT_TYPE_YAKIT_HTTPFLOW    = "yak_httpflow"    // yakit httpflow event, used to emit saved httpflow identity information
+	EVENT_TYPE_YAKIT_EXEC_RESULT                  = "yak_exec_result" // yakit exec result event, used to emit the yakit exec result information
+	EVENT_TYPE_YAKIT_RISK                         = "yak_risk"        // yakit risk event, used to emit the yakit risk information
+	EVENT_TYPE_YAKIT_RISK_COUNT                   = "yak_risk_count"
+	EVENT_TYPE_YAKIT_HTTPFLOW                     = "yak_httpflow" // yakit httpflow event, used to emit saved httpflow identity information
+	EVENT_TYPE_YAKIT_HTTPFLOW_COUNT               = "yak_httpflow_count"
+	EVENT_TYPE_HTTP_FUZZ_REQUEST_CHANGE EventType = "http_fuzz_request_change"
+	EVENT_TYPE_YAKLANG_CODE_CHANGE      EventType = "yaklang_code_change"
+
+	EVENT_TYPE_HTTP_FLOW_FUZZ_STATUS = "http_flow_fuzz_status"
+	// report_generating 子 loop 写完报告后的终稿标记（不重复流正文，不表示会话结束）
+	EVENT_TYPE_REPORT_FINISH EventType = "report_finish"
 
 	// AI 推理过程通用事件类型
 	EVENT_TYPE_THOUGHT     EventType = "thought"     // AI 思考过程（适用于 ReAct、CoT 等推理模式）
@@ -159,6 +231,55 @@ const (
 	EVENT_TYPE_REFERENCE_MATERIAL EventType = "reference_material" // 引用材料
 
 	EVENT_TYPE_PROMPT_PROFILE EventType = "prompt_profile" // prompt profile event, used to emit the prompt profile information
+
+	EVENT_TYPE_INTENT_RECOGNITION    EventType = "intent_recognition"
+	EVENT_TYPE_PERCEPTION            EventType = "perception"
+	EVENT_TYPE_PERCEPTION_CAPABILITY EventType = "perception_capabilities"
+	EVENT_TYPE_PERCEPTION_KNOWLEDGE  EventType = "perception_knowledge"
+
+	// EVENT_TYPE_NOTIFY emits structured user-facing warning notifications.
+	// Payload includes the notification type, content, and display duration.
+	EVENT_TYPE_NOTIFY             EventType = "notify"
+	EVENT_TYPE_API_REQUEST_FAILED EventType = "api_request_failed"
+
+	// EVENT_TYPE_TODO_LIST_UPDATE emits the full structured TODO list snapshot
+	// after one verification round commits its next_movements to the shared
+	// SessionPromptState. The frontend uses this to render a persistent TODO
+	// panel that stays visible across loop iterations (not only during Verify
+	// markdown streaming).
+	//
+	// Payload schema:
+	//   {
+	//     "items": [
+	//       {"id":"...","content":"...","status":"PENDING|DOING|DONE|DELETED|SKIPPED",
+	//        "created_at":<int>,"updated_at":<int>}
+	//     ],
+	//     "stats": {"pending":N,"doing":N,"done":N,"deleted":N,"skipped":N},
+	//     "applied_ops": [
+	//       {"op":"add","id":"...","content":"..."},
+	//       {"op":"done","id":"..."}
+	//     ],
+	//     "satisfied": <bool>,
+	//     "iteration_index": <int>,
+	//     "task_id": "..."
+	//   }
+	//
+	// 关键词: EVENT_TYPE_TODO_LIST_UPDATE, 全局 TODO 事件, 结构化前端通道
+	EVENT_TYPE_TODO_LIST_UPDATE EventType = "todo_list_update"
+
+	// EVENT_TYPE_CURRENT_TASK_TODO_LIST_UPDATE emits a structured TODO snapshot
+	// scoped to the current task only (items/stats filtered by task scope).
+	// Payload schema matches EVENT_TYPE_TODO_LIST_UPDATE (TodoListUpdatePayload).
+	//
+	// 关键词: EVENT_TYPE_CURRENT_TASK_TODO_LIST_UPDATE, 当前任务 TODO 事件
+	EVENT_TYPE_CURRENT_TASK_TODO_LIST_UPDATE EventType = "current_task_todo_list_update"
+
+	// EVENT_TYPE_VALUE_FEEDBACK 价值评估结果事件: 由 aive 价值评估链路在拿到小模型
+	// 价值分后回吐给用户的唯一结果事件. 该事件只用于回吐前端展示, 不写本地数据库
+	// (见下方 eventTypeNotSaveBlackList). 携带 record_id / signature / value_score
+	// 等字段.
+	// 关键词: EVENT_TYPE_VALUE_FEEDBACK, 价值评估结果, aive value feedback, 不落本地
+	EVENT_TYPE_VALUE_FEEDBACK EventType = "value_feedback"
 )
 
 type AiOutputEvent struct {
@@ -183,6 +304,9 @@ type AiOutputEvent struct {
 	// task index
 	TaskIndex string `gorm:"index"`
 
+	// task id (AIStatefulTask.GetId)
+	TaskId string `gorm:"index"`
+
 	// task uuid
 	TaskUUID string `gorm:"index"`
 	// disable markdown render
@@ -199,6 +323,55 @@ type AiOutputEvent struct {
 
 	// semantic label for the task associated with this event
 	TaskSemanticLabel string `json:"task_semantic_label"`
+
+	// Recovery block metadata is used to rebuild UI blocks from persisted events.
+	// Single renderable events are anchors themselves, while multi-event blocks
+	// (tool calls, streams) share a RecoveryIndexID and only the anchor/start
+	// event is marked as IsRecoveryBlock.
+	IsRecoveryBlock bool   `gorm:"index"`
+	RecoveryIndexID string `gorm:"index"`
+}
+
+// NormalizeRecoveryBlock derives recovery-block metadata for persisted events.
+// Priority is:
+//  1. Tool-call related events belong to the tool-call block keyed by CallToolID,
+//     and only tool_call_start is the recovery anchor.
+//  2. Stream related events belong to the stream block keyed by event_writer_id
+//     (stream_start / stream-finished) or EventUUID (stream delta rows), and only
+//     stream_start is the recovery anchor.
+//  3. All other events are treated as standalone renderable blocks and therefore
+//     act as their own recovery anchor.
+func (e *AiOutputEvent) NormalizeRecoveryBlock() {
+	if e == nil {
+		return
+	}
+
+	if e.CallToolID != "" {
+		e.RecoveryIndexID = e.CallToolID
+		e.IsRecoveryBlock = e.Type == EVENT_TOOL_CALL_START
+		return
+	}
+
+	if e.Type == EVENT_TYPE_STREAM_START {
+		if writerID := e.GetStreamEventWriterId(); writerID != "" {
+			e.RecoveryIndexID = writerID
+			e.IsRecoveryBlock = true
+			return
+		}
+	}
+
+	if e.Type == EVENT_TYPE_REFERENCE_MATERIAL ||
+		(e.Type == EVENT_TYPE_STRUCTURED && e.NodeId == "stream-finished") {
+		if writerID := e.GetStreamEventWriterId(); writerID != "" {
+			e.RecoveryIndexID = writerID
+			e.IsRecoveryBlock = false
+			return
+		}
+	}
+
+	if e.RecoveryIndexID == "" { // standalone event, use EventUUID as RecoveryIndexID to allow idempotent recovery
+		e.IsRecoveryBlock = true
+	}
 }
 
 func (e *AiOutputEvent) GetContentJSONPath(p string) string {
@@ -214,32 +387,45 @@ func (e *AiOutputEvent) GetStreamEventWriterId() string {
 }
 
 func (e *AiOutputEvent) ShouldSave() bool {
-	if e.IsSystem {
-		return false
-	}
-	if e.IsSync {
-		return false
-	}
-	if e.Type == EVENT_TYPE_CONSUMPTION || e.Type == EVENT_TYPE_PONG || e.Type == EVENT_TYPE_PRESSURE ||
-		e.Type == EVENT_TYPE_AI_FIRST_BYTE_COST_MS || e.Type == EVENT_TYPE_AI_TOTAL_COST_MS ||
-		e.Type == EVENT_TYPE_AI_CALL_SUMMARY {
-		return false
-	}
-	if e.structTypeNodeIdNotSave() {
-		return false
-	}
-	return true
+	return e != nil &&
+		e.saveAllowedByFlags() &&
+		e.saveAllowedByType() &&
+		e.saveAllowedByNodeID()
 }
 
-func (e *AiOutputEvent) structTypeNodeIdNotSave() bool {
+func (e *AiOutputEvent) saveAllowedByFlags() bool {
+	return !e.IsSystem && !e.IsSync
+}
+
+// saveAllowedByType uses a blacklist instead of a whitelist because most event
+// types are useful for persistence, timeline reconstruction, or UI recovery.
+// New event types should default to "save", and only high-frequency transient
+// telemetry should be added to the blacklist.
+func (e *AiOutputEvent) saveAllowedByType() bool {
+	return !lo.Contains(eventTypeNotSaveBlackList, e.Type)
+}
+
+func (e *AiOutputEvent) saveAllowedByNodeID() bool {
 	if e.Type != EVENT_TYPE_STRUCTURED {
-		return false
+		return true
 	}
-	blackList := []string{
-		"status",
-		"system",
+	if e.NodeId == "system" {
+		// 关键词: json.Unmarshal pointer 修复, pop_task / push_task 特例保存
+		// 之前传的是 map 值而非 map 指针, 导致 json.Unmarshal 直接返回
+		// InvalidUnmarshalError, pop_task / push_task 特例永远走不到, system
+		// 节点的 push_task / pop_task 实际上不会被保存. 改为传 &data 让
+		// Unmarshal 能正确解析; 同时容忍 nil / 空 Content (不是 JSON 时直接
+		// 跳过特例, 走默认黑名单 not-save 路径).
+		var data map[string]any
+		if len(e.Content) > 0 {
+			if err := json.Unmarshal(e.Content, &data); err == nil {
+				if data["type"] == "pop_task" || data["type"] == "push_task" {
+					return true
+				}
+			}
+		}
 	}
-	return lo.Contains(blackList, e.NodeId)
+	return !lo.Contains(structuredNodeIDNotSaveBlackList, e.NodeId)
 }
 
 func (e *AiOutputEvent) IsInteractive() bool {
@@ -308,6 +494,14 @@ func (e *AiOutputEvent) String() string {
 			typeStr = "[stream]"
 		case EVENT_TYPE_STRUCTURED:
 			typeStr = "[structured]"
+		case EVENT_TYPE_INTENT_RECOGNITION:
+			typeStr = "[intent_recognition]"
+		case EVENT_TYPE_PERCEPTION:
+			typeStr = "[perception]"
+		case EVENT_TYPE_PERCEPTION_CAPABILITY:
+			typeStr = "[perception_capabilities]"
+		case EVENT_TYPE_PERCEPTION_KNOWLEDGE:
+			typeStr = "[perception_knowledge]"
 		}
 		parts = append(parts, fmt.Sprintf("[type:%s]", typeStr))
 	}
@@ -388,6 +582,7 @@ func (e *AiOutputEvent) ToExecResult() *ypb.ExecResult {
 
 func (e *AiOutputEvent) ToGRPC() *ypb.AIOutputEvent {
 	return &ypb.AIOutputEvent{
+		ID:                 int64(e.ID),
 		CoordinatorId:      e.CoordinatorId,
 		Type:               string(e.Type),
 		NodeId:             utils.EscapeInvalidUTF8Byte([]byte(e.NodeId)),
@@ -400,6 +595,7 @@ func (e *AiOutputEvent) ToGRPC() *ypb.AIOutputEvent {
 		Content:            e.Content,
 		Timestamp:          e.Timestamp,
 		TaskIndex:          e.TaskIndex,
+		TaskId:             e.TaskId,
 		DisableMarkdown:    e.DisableMarkdown,
 		SyncID:             e.SyncID,
 		EventUUID:          e.EventUUID,

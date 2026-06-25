@@ -32,6 +32,7 @@ type AICallerConfigIf interface {
 	CallAIResponseConsumptionCallback(int)
 	GetAITransactionAutoRetryCount() int64
 	GetToolComposeConcurrency() int
+	GetPlanExecTaskConcurrency() int
 	GetTimelineContentSizeLimit() int64
 	GetUserInteractiveLimitedTimes() int64
 	GetMaxIterationCount() int64
@@ -44,6 +45,24 @@ type AICallerConfigIf interface {
 	OriginOptions() []ConfigOption
 	GetOrCreateWorkDir() string
 	GetContextProviderManager() *ContextProviderManager
+	AppendRelatedRuntimeID(runtimeID string)
+	GetSessionEvidenceRendered() string
+	ApplySessionEvidenceOps(ops []EvidenceOperation)
+
+	// 全局 TODO List：维持在 SessionPromptState 中，loop prompt 与 verify 路径
+	// 共享同一份状态。详见 verification_todo_store.go / session_prompt_state.go.
+	// 关键词: 全局 TODO, ApplyVerificationTodoOps, GetVerificationTodoRendered
+	GetVerificationTodoRendered(currentScope VerificationTodoScope) string
+	ApplyVerificationTodoOps(scope VerificationTodoScope, satisfied bool, movements []VerifyNextMovement) []VerificationTodoApplyError
+	GetVerificationTodoMarkdownDelta(scope VerificationTodoScope, satisfied bool, movements []VerifyNextMovement) string
+	SnapshotVerificationTodoItems() []VerificationTodoItem
+	SnapshotVerificationTodoItemsByScope(scope VerificationTodoScope) []VerificationTodoItem
+	GetVerificationTodoStats() VerificationTodoStats
+	GetVerificationTodoStatsByScope(scope VerificationTodoScope) VerificationTodoStats
+	HasActiveVerificationTodosByScope(scope VerificationTodoScope) bool
+	ActiveVerificationTodoItemsByScope(scope VerificationTodoScope) []VerificationTodoItem
+
+	GetBrowserSessionTracker() BrowserSessionTracker
 }
 
 func AIChatToAICallbackType(cb func(prompt string, opts ...aispec.AIConfigOption) (string, error)) AICallbackType {
@@ -62,18 +81,19 @@ func AIChatToAICallbackType(cb func(prompt string, opts ...aispec.AIConfigOption
 					resp.EmitReasonStream(reader)
 				}),
 				aispec.WithModelInfoCallback(func(provider, model string) {
-					resp.SetModelInfo(provider, model)
-					if cfg, ok := aicf.(interface{ UpdateAIModelInfo(string, string) }); ok {
-						cfg.UpdateAIModelInfo(provider, model)
-					}
-					log.Infof("ai request %v:%v is sent with request body: %v bytes",
-						provider, model, len(req.GetPrompt()))
+					resp.SetModelInfo(provider, model) // not update config model info, just set for response
 				}),
 				aispec.WithModelInfoConfirmCallback(func(provider, model string) {
 					resp.SetModelInfo(provider, model)
 				}),
+				aispec.WithRawHTTPResponseHeaderCallback(func(headerBytes []byte) {
+					resp.SetRawHTTPResponseHeader(headerBytes)
+				}),
 				aispec.WithRawHTTPResponseCallback(func(headerBytes []byte, bodyPreview []byte) {
 					resp.SetRawHTTPResponseData(headerBytes, bodyPreview)
+				}),
+				aispec.WithRawHTTPRequestResponseCallback(func(requestBytes []byte, responseHeaderBytes []byte, bodyPreview []byte, usageInfo *aispec.ChatUsage) {
+					resp.SetUsageInfo(usageInfo)
 				}),
 			}
 			for _, data := range req.GetImageList() {
@@ -83,12 +103,25 @@ func AIChatToAICallbackType(cb func(prompt string, opts ...aispec.AIConfigOption
 					optList = append(optList, aispec.WithImageRaw(data.Data))
 				}
 			}
+			// 从 caller config 读取 user 注册的 UsageCallback,
+			// 把 ai.usageCallback(...) 透传到 GetOriginalAICallback / WithAICallback /
+			// WithFastAICallback 路径, 让 raw ai.Chat 末帧 token usage (含 cached_tokens)
+			// 也能触达用户脚本.
+			// 关键词: AIChatToAICallbackType, original callback usage 透传, ai.usageCallback
+			optList = append(optList, extractUserUsageCallbackOpts(aicf)...)
+			// 上报本次请求的模型用途类型(tier)，供 aibalance gateway 注入
+			// X-Yak-AI-Model-Usage-Type 头给中转层做用量保护降级。空 tier 不上报。
+			// 关键词: AIChatToAICallbackType tier 上报, WithModelUsageType, GetModelTier
+			if tier := strings.TrimSpace(req.GetModelTier()); tier != "" {
+				optList = append(optList, aispec.WithModelUsageType(tier))
+			}
 			output, err := cb(
 				req.GetPrompt(),
 				optList...,
 			)
 			if err != nil {
 				log.Errorf("chat error: %v", err)
+				resp.SetError(err)
 			}
 			if !isStream {
 				resp.EmitOutputStream(strings.NewReader(output))
@@ -150,6 +183,16 @@ func LoadAIService(typeName string, opts ...aispec.AIConfigOption) (AICallbackTy
 
 // CreateCallbackFromConfig creates an AICallbackType from an AIModelConfig.
 func CreateCallbackFromConfig(config *ypb.AIModelConfig) (AICallbackType, error) {
+	return CreateCallbackFromConfigWithExtraOpts(config)
+}
+
+// CreateCallbackFromConfigWithExtraOpts 与 CreateCallbackFromConfig 相同,
+// 但允许调用方追加 aispec.AIConfigOption (例如 aispec.WithUsageCallback),
+// 这些 opt 会拼接在 aispec.BuildOptionsFromConfig(config) 之后, 因此 Tiered AI
+// 路径 (GetXxxAIModelCallback) 可以把用户脚本端注册的 UsageCallback 重新注入,
+// 修复 ai.usageCallback 在 React loop 内不触发的问题.
+// 关键词: CreateCallbackFromConfigWithExtraOpts, Tiered usageCallback 注入
+func CreateCallbackFromConfigWithExtraOpts(config *ypb.AIModelConfig, extraOpts ...aispec.AIConfigOption) (AICallbackType, error) {
 	if config == nil {
 		return nil, utils.Error("config is nil")
 	}
@@ -158,5 +201,8 @@ func CreateCallbackFromConfig(config *ypb.AIModelConfig) (AICallbackType, error)
 	}
 
 	opts := aispec.BuildOptionsFromConfig(config)
+	if len(extraOpts) > 0 {
+		opts = append(opts, extraOpts...)
+	}
 	return LoadAIService(config.GetProvider().GetType(), opts...)
 }

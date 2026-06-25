@@ -1,22 +1,35 @@
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            line-height: 1.6;
+            line-height: 1.45;
             color: #333;
-            max-width: 1200px;
+            /* 宽屏动态变宽; 左右边距用 clamp: 最小可缩到 0, 随视口增长, 最多约 24px.
+               大屏不无限拉伸, 上限 2200px 防超宽屏行太长.
+               关键词: 页面放宽 边距可缩 0 clamp 动态宽度 */
+            max-width: 2200px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 10px clamp(0px, 1.4vw, 24px);
             background-color: #f9f9f9;
         }
         h1, h2, h3 {
             color: #2c3e50;
         }
+        /* 压缩顶部 header: 更小标题 + 更窄间距, 给下方内容腾空间 */
+        /* 关键词: header 压缩 紧凑 dense */
         .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 30px;
-            padding-bottom: 10px;
+            margin-bottom: 10px;
+            padding-bottom: 6px;
             border-bottom: 1px solid #eee;
+        }
+        .header h1 {
+            font-size: 20px;
+            margin: 0;
+        }
+        .header p {
+            margin: 0;
+            font-size: 13px;
         }
         .status-info {
             background-color: #e3f2fd;
@@ -28,8 +41,8 @@
             background: white;
             border-radius: 5px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            padding: 20px;
-            margin-bottom: 20px;
+            padding: 12px 14px;
+            margin-bottom: 12px;
         }
         /* 表格样式优化 */
         table {
@@ -109,29 +122,37 @@
             display: flex;
             justify-content: space-between;
             flex-wrap: wrap;
-            margin-bottom: 10px;
+            margin-bottom: 8px;
         }
         .stat-card {
             flex: 1;
-            min-width: 160px;
+            min-width: 110px;
             background-color: white;
             border-radius: 4px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            padding: 8px 10px;
-            margin: 0 5px 5px 0;
+            padding: 5px 8px;
+            margin: 0 4px 4px 0;
             text-align: center;
         }
         .stat-card h3 {
             margin-top: 0;
-            margin-bottom: 3px;
+            margin-bottom: 1px;
             color: #777;
-            font-size: 13px;
+            font-size: 11px;
+            font-weight: 600;
+            white-space: nowrap;
         }
         .stat-card .value {
-            font-size: 20px;
+            font-size: 17px;
             font-weight: bold;
-            margin: 3px 0;
+            margin: 1px 0;
             color: #2c3e50;
+        }
+        /* 磁盘卡副行: 已用% / 总量 */
+        .stat-card .stat-sub {
+            font-size: 10px;
+            color: #999;
+            line-height: 1.3;
         }
         .footer {
             text-align: center;
@@ -573,18 +594,20 @@
         th:nth-child(9), td:nth-child(9) { width: 80px; } /* 成功率 */
         th:nth-child(10), td:nth-child(10) { width: 60px; } /* 操作 */
         
-        /* API密钥表格列宽 */
-        #api-table th:nth-child(1), #api-table td:nth-child(1) { width: 30px; } /* 复选框 */
-        #api-table th:nth-child(2), #api-table td:nth-child(2) { width: 40px; } /* ID */
-        #api-table th:nth-child(3), #api-table td:nth-child(3) { width: 100px; } /* 新：状态/操作 */
-        #api-table th:nth-child(4), #api-table td:nth-child(4) { width: 150px; } /* API密钥 */
-        #api-table th:nth-child(5), #api-table td:nth-child(5) { width: 120px; } /* 允许模型 */
-        #api-table th:nth-child(6), #api-table td:nth-child(6) { width: 70px; }  /* 使用统计 */
-        #api-table th:nth-child(7), #api-table td:nth-child(7) { width: 100px; } /* 成功/失败 */
-        #api-table th:nth-child(8), #api-table td:nth-child(8) { width: 120px; } /* 流量 */
-        #api-table th:nth-child(9), #api-table td:nth-child(9) { width: 120px; } /* 最后使用 */
-        /* #api-table th:nth-child(9), #api-table td:nth-child(9) { width: 70px; } */ /* 原状态列 - 注释掉 */
-        /* #api-table th:nth-child(10), #api-table td:nth-child(10) { width: 80px; } */ /* 原操作列 - 注释掉 */
+        /* API密钥表格列宽 (兜底，与下面 13 列默认配置保持一致) */
+        #api-table th:nth-child(1),  #api-table td:nth-child(1)  { width: 30px;  } /* 复选框 */
+        #api-table th:nth-child(2),  #api-table td:nth-child(2)  { width: 40px;  } /* ID */
+        #api-table th:nth-child(3),  #api-table td:nth-child(3)  { width: 60px;  } /* 状态 */
+        #api-table th:nth-child(4),  #api-table td:nth-child(4)  { width: 110px; } /* API密钥 */
+        #api-table th:nth-child(5),  #api-table td:nth-child(5)  { width: 180px; } /* 允许模型 */
+        #api-table th:nth-child(6),  #api-table td:nth-child(6)  { width: 60px;  } /* 使用统计 */
+        #api-table th:nth-child(7),  #api-table td:nth-child(7)  { width: 70px;  } /* Web Search */
+        #api-table th:nth-child(8),  #api-table td:nth-child(8)  { width: 80px;  } /* 成功/失败 */
+        #api-table th:nth-child(9),  #api-table td:nth-child(9)  { width: 110px; } /* 流量 */
+        #api-table th:nth-child(10), #api-table td:nth-child(10) { width: 90px;  } /* 流量限制 */
+        #api-table th:nth-child(11), #api-table td:nth-child(11) { width: 80px;  } /* 创建者 */
+        #api-table th:nth-child(12), #api-table td:nth-child(12) { width: 130px; } /* 最后使用 */
+        #api-table th:nth-child(13), #api-table td:nth-child(13) { width: 130px; } /* 操作 */
 
         /* 表格列对齐方式 */
         /* ID、提供者和类型列居中 */
@@ -1682,26 +1705,98 @@
         #provider-table th:nth-child(9), #provider-table td:nth-child(9) { min-width: 50px; width: 60px; } /* 请求 */
         #provider-table th:nth-child(10), #provider-table td:nth-child(10) { min-width: 60px; width: 70px; } /* 操作 */
         
-        /* 优化的默认列宽配置 - API密钥表格 */
-        #api-table th:nth-child(1), #api-table td:nth-child(1) { min-width: 30px; width: 30px; } /* 复选框 */
-        #api-table th:nth-child(2), #api-table td:nth-child(2) { min-width: 35px; width: 40px; } /* ID */
-        #api-table th:nth-child(3), #api-table td:nth-child(3) { min-width: 45px; width: 50px; } /* 状态 */
-        #api-table th:nth-child(4), #api-table td:nth-child(4) { min-width: 90px; width: 100px; } /* API密钥 */
-        #api-table th:nth-child(5), #api-table td:nth-child(5) { min-width: 110px; width: 130px; } /* 允许模型 */
-        #api-table th:nth-child(6), #api-table td:nth-child(6) { min-width: 55px; width: 60px; } /* 使用统计 */
-        #api-table th:nth-child(7), #api-table td:nth-child(7) { min-width: 70px; width: 80px; } /* 成功/失败 */
-        #api-table th:nth-child(8), #api-table td:nth-child(8) { min-width: 90px; width: 100px; } /* 流量 */
-        #api-table th:nth-child(9), #api-table td:nth-child(9) { min-width: 70px; width: 80px; } /* 流量限制 */
-        #api-table th:nth-child(10), #api-table td:nth-child(10) { min-width: 80px; width: 90px; } /* 最后使用 */
-        #api-table th:nth-child(11), #api-table td:nth-child(11) { min-width: 110px; width: 120px; } /* 操作 */
-        
-        /* 优化的默认列宽配置 - 模型信息表格 */
+        /* 优化的默认列宽配置 - API密钥表格 (与表头 13 列对齐) */
+        #api-table th:nth-child(1),  #api-table td:nth-child(1)  { min-width: 30px;  width: 30px;  } /* 复选框 */
+        #api-table th:nth-child(2),  #api-table td:nth-child(2)  { min-width: 35px;  width: 40px;  } /* ID */
+        #api-table th:nth-child(3),  #api-table td:nth-child(3)  { min-width: 50px;  width: 60px;  } /* 状态 */
+        #api-table th:nth-child(4),  #api-table td:nth-child(4)  { min-width: 90px;  width: 110px; } /* API密钥 */
+        #api-table th:nth-child(5),  #api-table td:nth-child(5)  { min-width: 130px; width: 180px; } /* 允许模型 */
+        #api-table th:nth-child(6),  #api-table td:nth-child(6)  { min-width: 55px;  width: 60px;  } /* 使用统计 */
+        #api-table th:nth-child(7),  #api-table td:nth-child(7)  { min-width: 60px;  width: 70px;  } /* Web Search */
+        #api-table th:nth-child(8),  #api-table td:nth-child(8)  { min-width: 70px;  width: 80px;  } /* 成功/失败 */
+        #api-table th:nth-child(9),  #api-table td:nth-child(9)  { min-width: 95px;  width: 110px; } /* 流量(输入/输出) */
+        #api-table th:nth-child(10), #api-table td:nth-child(10) { min-width: 80px;  width: 90px;  } /* 流量限制 */
+        #api-table th:nth-child(11), #api-table td:nth-child(11) { min-width: 70px;  width: 80px;  } /* 创建者 */
+        #api-table th:nth-child(12), #api-table td:nth-child(12) { min-width: 110px; width: 130px; } /* 最后使用 */
+        #api-table th:nth-child(13), #api-table td:nth-child(13) { min-width: 110px; width: 130px; } /* 操作 */
+
+        /* "允许模型" 单元格紧凑徽章布局
+           !important + max-width 确保即使 ColumnResizer 把旧的超大宽度从
+           localStorage 写回到 inline style，也不会再把整张表撑爆。 */
+        #api-table td.editable-allowed-models {
+            max-width: 240px !important;
+            min-width: 130px;
+            padding: 4px 6px;
+            overflow: hidden;
+            white-space: normal;
+        }
+        #api-table td.editable-allowed-models .allowed-models-wrap {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 3px;
+            align-items: center;
+            line-height: 1.2;
+        }
+        #api-table td.editable-allowed-models .allowed-model-count {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 22px;
+            height: 18px;
+            padding: 0 6px;
+            font-size: 11px;
+            font-weight: 600;
+            border-radius: 9px;
+            background: #455a64;
+            color: #fff;
+        }
+        #api-table td.editable-allowed-models .allowed-model-chip {
+            display: inline-flex;
+            align-items: center;
+            max-width: 96px;
+            padding: 1px 6px;
+            font-size: 11px;
+            line-height: 16px;
+            border-radius: 3px;
+            border: 1px solid transparent;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-family: monospace;
+        }
+        #api-table td.editable-allowed-models .chip-paid {
+            background: #e3f2fd;
+            color: #1565c0;
+            border-color: #bbdefb;
+        }
+        #api-table td.editable-allowed-models .chip-free {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border-color: #c8e6c9;
+        }
+        #api-table td.editable-allowed-models .chip-glob {
+            background: #fff3e0;
+            color: #e65100;
+            border-color: #ffe0b2;
+        }
+        #api-table td.editable-allowed-models .chip-more {
+            background: #eceff1;
+            color: #455a64;
+            border-color: #cfd8dc;
+            font-weight: 600;
+        }
+        #api-table td.editable-allowed-models .allowed-models-empty {
+            color: #999;
+            font-style: italic;
+            font-size: 12px;
+        }
+
+        /* 优化的默认列宽配置 - 模型信息表格（传统倍数列已移除，现 5 列） */
         #models-table th:nth-child(1), #models-table td:nth-child(1) { min-width: 100px; width: 140px; } /* 模型名 */
         #models-table th:nth-child(2), #models-table td:nth-child(2) { min-width: 65px; width: 75px; } /* 供应商数量 */
-        #models-table th:nth-child(3), #models-table td:nth-child(3) { min-width: 65px; width: 75px; } /* 流量倍数 */
-        #models-table th:nth-child(4), #models-table td:nth-child(4) { min-width: 140px; width: 180px; } /* 描述 */
-        #models-table th:nth-child(5), #models-table td:nth-child(5) { min-width: 90px; width: 110px; } /* 标签 */
-        #models-table th:nth-child(6), #models-table td:nth-child(6) { min-width: 90px; width: 110px; } /* 操作 */
+        #models-table th:nth-child(3), #models-table td:nth-child(3) { min-width: 140px; width: 180px; } /* 描述 */
+        #models-table th:nth-child(4), #models-table td:nth-child(4) { min-width: 90px; width: 110px; } /* 标签 */
+        #models-table th:nth-child(5), #models-table td:nth-child(5) { min-width: 90px; width: 110px; } /* 操作 */
 }
 
 /* ==================== Model Selection (Shared Styles) ==================== */
@@ -1860,4 +1955,782 @@
 
 .selected-preview .tag.glob {
     background: #f57c00;
+}
+
+/* ========== Portal Layout (Sidebar + Main Pane) ==========
+   关键词: portal layout sidebar, 左侧分组菜单, 右侧 tab 主体
+   设计目标: 让 11+ 个 tab 在窄屏幕下也能完整展示, 且保留旧 .tab-content
+   的可见性切换逻辑不变 (依然由 .active 类决定显隐) */
+.portal-layout {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    padding: 0;
+}
+
+.portal-layout .sidebar {
+    width: 200px;
+    flex: 0 0 200px;
+    border-right: 1px solid #e0e0e0;
+    padding: 8px 0;
+    background: #fafafa;
+    min-height: 480px;
+}
+
+.portal-layout .sidebar .sidebar-group {
+    margin-bottom: 6px;
+}
+
+.portal-layout .sidebar .group-title {
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 4px 16px 2px;
+    font-weight: 600;
+}
+
+.portal-layout .sidebar .menu-item {
+    padding: 6px 16px;
+    cursor: pointer;
+    font-size: 14px;
+    color: #333;
+    border-left: 3px solid transparent;
+    transition: background-color 0.15s, border-color 0.15s;
+    user-select: none;
+}
+
+.portal-layout .sidebar .menu-item:hover {
+    background: #eef2f7;
+}
+
+.portal-layout .sidebar .menu-item.active {
+    background: #e3f2fd;
+    border-left-color: #1976d2;
+    color: #1565c0;
+    font-weight: 600;
+}
+
+.portal-layout .tab-pane-host {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 14px;
+    overflow-x: auto;
+}
+
+@media (max-width: 768px) {
+    .portal-layout {
+        flex-direction: column;
+    }
+    .portal-layout .sidebar {
+        width: 100%;
+        flex: 0 0 auto;
+        border-right: none;
+        border-bottom: 1px solid #e0e0e0;
+        min-height: auto;
+        padding: 8px 0;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0 8px;
+    }
+    .portal-layout .sidebar .sidebar-group {
+        margin-bottom: 4px;
+    }
+    .portal-layout .sidebar .group-title {
+        padding: 4px 12px 2px;
+    }
+    .portal-layout .sidebar .menu-item {
+        padding: 6px 12px;
+    }
+}
+
+/* ========== dau-cache 图表网格 ==========
+   6 张图用响应式网格并排, 宽屏 2~3 列, 窄屏单列, 大幅压缩纵向高度.
+   关键词: dc-charts-grid 图表网格 压缩高度 一屏 */
+.dc-charts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+    gap: 10px;
+    margin-bottom: 14px;
+}
+.dc-chart-cell {
+    min-width: 0;
+}
+.dc-chart-title {
+    margin: 0 0 4px 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: #2c3e50;
+}
+.dc-chart-title small {
+    color: #888;
+    font-weight: normal;
+    font-size: 11px;
+}
+.dc-chart-box {
+    position: relative;
+    background: #fafafa;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 6px;
+    cursor: pointer;
+    transition: box-shadow 0.15s;
+}
+.dc-chart-box:hover {
+    box-shadow: 0 0 0 2px #90caf9;
+}
+.dc-chart-box svg {
+    display: block;
+}
+/* 右上角放大提示, 不拦截点击 */
+.dc-chart-box::after {
+    content: '\2922 \653e\5927';
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    font-size: 10px;
+    color: #90a4ae;
+    background: rgba(255, 255, 255, 0.75);
+    padding: 0 4px;
+    border-radius: 3px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+.dc-chart-box:hover::after {
+    opacity: 1;
+}
+@media (max-width: 900px) {
+    .dc-charts-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ========== 图表放大弹窗 (lightbox) ========== */
+/* 关键词: chart-zoom-modal 图表放大弹窗 lightbox */
+#chart-zoom-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 1100;
+    justify-content: center;
+    align-items: center;
+}
+#chart-zoom-modal.open {
+    display: flex;
+}
+.chart-zoom-inner {
+    background: #fff;
+    border-radius: 8px;
+    padding: 14px 16px;
+    width: 92vw;
+    max-width: 1700px;
+    height: 84vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+}
+.chart-zoom-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #eee;
+}
+.chart-zoom-head h3 {
+    margin: 0;
+    font-size: 15px;
+}
+.chart-zoom-body {
+    flex: 1;
+    min-height: 0;
+    background: #fafafa;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 8px;
+}
+.chart-zoom-body svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+/* ========== Mirror Rules UI ========== */
+#mirror-rules-table th,
+#mirror-rules-table td {
+    vertical-align: middle;
+}
+
+/* ========== Mirror Records (镜像数据) UI ========== */
+.mirror-rec-card {
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    background: #fff;
+}
+
+.mirror-rec-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.mirror-rec-idx {
+    color: #90a4ae;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.mirror-rec-model {
+    color: #1565c0;
+    font-weight: 600;
+}
+
+.mirror-rec-ts {
+    margin-left: auto;
+    color: #90a4ae;
+    font-size: 12px;
+}
+
+.mirror-rec-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.mirror-rec-chip {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    background: #f1f8ff;
+    border: 1px solid #cfe3ff;
+    color: #37474f;
+}
+
+.mirror-rec-line {
+    font-size: 13px;
+    color: #455a64;
+    margin: 4px 0;
+    line-height: 1.5;
+    word-break: break-word;
+}
+
+.mirror-rec-label {
+    color: #90a4ae;
+    font-weight: 600;
+    margin-right: 4px;
+}
+
+.mirror-rec-toggle {
+    display: inline-block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: #1565c0;
+    cursor: pointer;
+    user-select: none;
+}
+
+.mirror-rec-toggle:hover {
+    text-decoration: underline;
+}
+
+.mirror-rec-raw {
+    margin-top: 8px;
+    padding: 10px;
+    background: #f7f9fa;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    font-size: 12px;
+    max-height: 360px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* 折叠触发条: 多个 toggle 并排 */
+.mirror-rec-toggle-bar {
+    display: flex;
+    gap: 16px;
+    margin-top: 6px;
+}
+
+/* 请求/响应对照: 两列并排, 窄屏自动换行 */
+.mirror-rec-compare {
+    display: flex;
+    gap: 12px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+}
+
+.mirror-rec-col {
+    flex: 1 1 320px;
+    min-width: 280px;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.mirror-rec-col-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 10px;
+    background: #eef2f6;
+    border-bottom: 1px solid #e0e0e0;
+    font-size: 12px;
+    font-weight: 600;
+    color: #37474f;
+}
+
+.mirror-rec-copy-btn {
+    height: 22px;
+    padding: 0 10px;
+    font-size: 11px;
+    border: 1px solid #cfd8dc;
+    border-radius: 3px;
+    background: #fff;
+    color: #1565c0;
+    cursor: pointer;
+}
+
+.mirror-rec-copy-btn:hover {
+    background: #f1f8ff;
+    border-color: #90caf9;
+}
+
+.mirror-rec-text {
+    margin: 0;
+    padding: 10px;
+    background: #0b1220;
+    color: #e2e8f0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 360px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.mirror-status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.mirror-status-badge.enabled {
+    background: #e8f5e9;
+    color: #2e7d32;
+}
+
+.mirror-status-badge.disabled {
+    background: #f5f5f5;
+    color: #757575;
+}
+
+.mirror-stats-mini {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: #555;
+}
+
+.mirror-log-entry {
+    padding: 6px 8px;
+    border-bottom: 1px solid #eee;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.mirror-log-entry.success {
+    border-left: 3px solid #4caf50;
+}
+
+.mirror-log-entry.failure {
+    border-left: 3px solid #f44336;
+}
+
+/* ================================================================
+ * Mirror Rule Edit Modal
+ * 关键词: mirror modal, 分 section 表单, data spec 帮助面板
+ * ================================================================ */
+.mirror-modal-content {
+    width: 95vw !important;
+    max-width: 1240px !important;
+    max-height: 90vh;
+    overflow-y: auto;
+    padding: 24px 28px;
+    border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.18);
+}
+
+.mirror-modal-content h4 {
+    margin: 0 0 18px 0;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #e0e0e0;
+    font-size: 18px;
+    color: #1f2937;
+    font-weight: 600;
+}
+
+.mirror-modal-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.9fr);
+    gap: 20px;
+}
+
+@media (max-width: 1080px) {
+    .mirror-modal-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.mirror-modal-form-col {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
+}
+
+.mirror-modal-spec-col {
+    background: #fafbfc;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    max-height: 100%;
+    min-height: 200px;
+}
+
+.mirror-spec-header {
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: 8px;
+    margin-bottom: 10px;
+}
+
+.mirror-spec-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: #111827;
+}
+
+.mirror-spec-subtitle {
+    font-size: 11px;
+    color: #6b7280;
+    margin-top: 2px;
+}
+
+.mirror-spec-host {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    overflow-x: hidden;
+    max-height: 560px;
+    padding-right: 4px;
+}
+
+.mirror-spec-entry {
+    border-bottom: 1px dashed #e5e7eb;
+    padding: 8px 0;
+}
+
+.mirror-spec-entry:last-child {
+    border-bottom: none;
+}
+
+.mirror-spec-entry-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.mirror-spec-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #1f2937;
+    background: #eef2ff;
+    padding: 1px 6px;
+    border-radius: 4px;
+}
+
+.mirror-spec-type {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #6b7280;
+}
+
+.mirror-spec-desc {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #374151;
+    line-height: 1.55;
+    word-break: break-word;
+}
+
+.mirror-spec-example {
+    margin-top: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #2563eb;
+    background: #f1f5f9;
+    padding: 4px 6px;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    line-height: 1.4;
+}
+
+.mirror-form-section {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+.mirror-form-section-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #111827;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.mirror-form-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.mirror-form-row + .mirror-form-row {
+    margin-top: 10px;
+}
+
+.mirror-form-field {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.mirror-form-field.flex-1 { flex: 1 1 0; }
+.mirror-form-field.flex-2 { flex: 2 1 0; }
+
+.mirror-form-field label {
+    font-size: 12px;
+    font-weight: 500;
+    color: #4b5563;
+    margin-bottom: 4px;
+}
+
+.mirror-required {
+    color: #dc2626;
+    margin-left: 2px;
+}
+
+/* label 后面跟的 (可选)/(必填) 等灰色提示, 区别于红色必填星号 */
+.mirror-label-hint {
+    margin-left: 6px;
+    font-size: 11px;
+    font-weight: 400;
+    color: #6b7280;
+}
+
+.mirror-label-hint.optional {
+    color: #6b7280;
+}
+
+.mirror-label-hint.required {
+    color: #dc2626;
+}
+
+/* 字段下方的灰色帮助文案, 比 placeholder 更明确 */
+.mirror-field-help {
+    margin-top: 4px;
+    font-size: 11px;
+    color: #6b7280;
+    line-height: 1.5;
+}
+
+.mirror-field-help code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #f3f4f6;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #1f2937;
+    font-size: 10.5px;
+}
+
+.mirror-checkbox-label {
+    display: flex !important;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px !important;
+    color: #374151 !important;
+    margin-bottom: 0 !important;
+    cursor: pointer;
+}
+
+.mirror-checkbox-label input[type="checkbox"] {
+    margin: 0;
+}
+
+.mirror-link-btn {
+    background: transparent;
+    border: 1px solid #d1d5db;
+    color: #2563eb;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    line-height: 1.4;
+}
+
+.mirror-link-btn:hover {
+    background: #eff6ff;
+    border-color: #93c5fd;
+}
+
+.mirror-script-editor {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+    font-size: 12.5px !important;
+    line-height: 1.55 !important;
+    white-space: pre !important;
+    overflow-wrap: normal !important;
+    word-break: normal !important;
+    overflow-x: auto !important;
+    resize: vertical;
+    tab-size: 4;
+}
+
+.mirror-script-help {
+    margin-top: 6px;
+    font-size: 11px;
+    color: #6b7280;
+    line-height: 1.5;
+}
+
+.mirror-script-help code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #f3f4f6;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #1f2937;
+    font-size: 11px;
+}
+
+.mirror-test-result {
+    background: #0f172a;
+    color: #e2e8f0;
+    border: 1px solid #1e293b;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 240px;
+    overflow: auto;
+    margin-top: 4px;
+}
+
+.mirror-test-result.error {
+    background: #fef2f2;
+    color: #991b1b;
+    border-color: #fecaca;
+}
+
+.mirror-test-result-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 6px;
+    font-weight: 600;
+    font-size: 12px;
+}
+
+.mirror-test-status-ok   { color: #4ade80; }
+.mirror-test-status-fail { color: #f87171; }
+
+/* save() 试运行反馈块 */
+.mirror-test-save {
+    margin: 8px 0;
+    padding: 6px 10px;
+    background: rgba(148, 163, 184, 0.08);
+    border-left: 3px solid #64748b;
+    border-radius: 3px;
+}
+
+.mirror-test-save-preview {
+    margin: 4px 0 0 0;
+    padding: 6px 8px;
+    background: #0b1220;
+    border: 1px solid #1e293b;
+    border-radius: 3px;
+    color: #cbd5e1;
+    font-size: 11px;
+    max-height: 140px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.mirror-modal-actions {
+    margin-top: 18px;
+    padding-top: 14px;
+    border-top: 1px solid #e5e7eb;
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+
+/* ========== 限流配置二级 tab ========== */
+/* 关键词: rate-limit 子 tab 分组, rl-subtabs, rl-subpane */
+.rl-subtabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 18px;
+    border-bottom: 2px solid #e0e0e0;
+    padding-bottom: 0;
+}
+.rl-subtab {
+    padding: 8px 16px;
+    cursor: pointer;
+    background-color: #f5f5f5;
+    border: 1px solid #ddd;
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    font-size: 13px;
+    color: #555;
+    margin-bottom: -2px;
+}
+.rl-subtab:hover {
+    background-color: #eaeaea;
+}
+.rl-subtab.active {
+    background-color: #fff;
+    color: #1565c0;
+    font-weight: 600;
+    border-color: #e0e0e0;
+    border-bottom: 2px solid #fff;
+}
+.rl-subpane {
+    display: none;
+}
+.rl-subpane.active {
+    display: block;
 }

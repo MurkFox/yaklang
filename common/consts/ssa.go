@@ -93,6 +93,7 @@ func SetSSADatabaseInfo(raw string) {
 }
 
 func SetGormSSAProjectDatabaseByInfo(raw string) error {
+	SetSSADatabaseInfo(raw)
 	db, err := CreateSSAProjectDatabaseRaw(raw)
 	if err != nil {
 		return err

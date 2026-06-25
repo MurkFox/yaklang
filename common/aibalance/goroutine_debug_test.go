@@ -17,7 +17,6 @@ import (
 
 	"github.com/yaklang/yaklang/common/ai/aispec"
 	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/lowhttp"
 	"github.com/yaklang/yaklang/common/utils/lowhttp/poc"
@@ -52,9 +51,9 @@ func TestRealAIBalanceFlow(t *testing.T) {
 
 	// 清理并创建测试 provider
 	testProviderName := "test-goroutine-leak-provider"
-	GetDB().Where("model_name = ?", testProviderName).Delete(&schema.AiProvider{})
+	GetDB().Where("model_name = ?", testProviderName).Delete(&AiProvider{})
 
-	provider := &schema.AiProvider{
+	provider := &AiProvider{
 		ModelName:    testProviderName,
 		TypeName:     "openai",
 		DomainOrURL:  fmt.Sprintf("http://%s/v1/chat/completions", mockProvider.Addr),
@@ -65,7 +64,7 @@ func TestRealAIBalanceFlow(t *testing.T) {
 	if err := GetDB().Create(provider).Error; err != nil {
 		t.Fatalf("Failed to create test provider: %v", err)
 	}
-	defer GetDB().Where("model_name = ?", testProviderName).Delete(&schema.AiProvider{})
+	defer GetDB().Where("model_name = ?", testProviderName).Delete(&AiProvider{})
 
 	// 启动服务器
 	serverCtx, serverCancel := withCancelCtx()
@@ -161,8 +160,26 @@ func TestRealAIBalanceFlow(t *testing.T) {
 	}
 }
 
-// TestGoroutineTracing 追踪每个 goroutine 的创建
+// TestGoroutineTracing 追踪每个 goroutine 的创建。
+//
+// 重要：在 batch 测试场景下，全局 LatencyWatcher (latencyWatcherOnce 触发
+// 的单例) 会持续每 10 秒 (fastInterval) 给前面 test 留下的 stale provider
+// fork 大量 dialPlainTCPConnWithRetry goroutine，污染 baseline 与 final。
+// 因此本测试在采样 baseline 之前先 Pause 全局 watcher，等 in-flight dial
+// 走完，再做 chat 流测量；测试结束后再 Resume，避免影响后续测试。
+//
+// 关键词: TestGoroutineTracing pause LatencyWatcher, baseline 净化, dial 噪声排除
 func TestGoroutineTracing(t *testing.T) {
+	// 暂停全局 LatencyWatcher (单例)，防止 chat 6 秒窗口内 fast-tick 又 fork
+	// 一批 dial goroutine。等待 in-flight dial 重试结束 (max 4 * 200ms*指数退避)。
+	if w := GetGlobalLatencyWatcher(); w != nil {
+		w.Stop()
+		// dialPlainTCPConnWithRetry 单次重试 sleep 100~300ms，4 次重试 < 2s。
+		time.Sleep(2 * time.Second)
+		// 测试结束后恢复，避免影响后续测试 (Start 已支持 stopChan 重建)。
+		defer w.Start()
+	}
+
 	// 创建 mock server
 	mockServer := createDetailedMockAIServer(t)
 	defer mockServer.Close()

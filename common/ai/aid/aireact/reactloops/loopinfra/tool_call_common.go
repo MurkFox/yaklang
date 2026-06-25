@@ -7,6 +7,7 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
 	"github.com/yaklang/yaklang/common/utils"
 )
 
@@ -28,17 +29,23 @@ func handleToolCallResult(
 		invoker.AddToTimeline("[TOOL_EXECUTION_ERROR]", errMsg)
 
 		resolved := loop.ResolveIdentifier(toolPayload)
-		if !resolved.IsUnknown() && resolved.IdentityType != aicommon.ResolvedAs_Tool {
+		if buildinaitools.IsMCPToolName(toolPayload) && buildinaitools.IsMCPInitializingError(err) {
+			operator.Feedback(errMsg + "\n\n[MCP] This MCP tool is still connecting to its remote server. " +
+				"Wait a few seconds and call the same tool again with require_tool; do NOT switch to an unrelated tool.")
+			operator.SetReflectionLevel(reactloops.ReflectionLevel_Standard)
+		} else if !resolved.IsUnknown() && resolved.IdentityType != aicommon.ResolvedAs_Tool {
 			invoker.AddToTimeline("identifier_resolved", resolved.Suggestion)
 			operator.Feedback(errMsg + "\n\n" + resolved.Suggestion)
+			operator.SetReflectionLevel(reactloops.ReflectionLevel_Critical)
 		} else {
 			operator.Feedback(errMsg + " Please try a different tool or approach.")
+			operator.SetReflectionLevel(reactloops.ReflectionLevel_Critical)
 		}
-
-		operator.SetReflectionLevel(reactloops.ReflectionLevel_Critical)
 		operator.SetReflectionData("tool_error", err.Error())
 		operator.SetReflectionData("tool_name", toolPayload)
-		operator.SetReflectionData("resolved_type", string(resolved.IdentityType))
+		if operator.GetReflectionLevel() == reactloops.ReflectionLevel_Critical {
+			operator.SetReflectionData("resolved_type", string(resolved.IdentityType))
+		}
 		operator.Continue()
 		return
 	}
@@ -62,37 +69,37 @@ func handleToolCallResult(
 		return
 	}
 
+	if result.Success {
+		reactloops.MarkEditBeforeExecutionCompleted(loop, toolPayload)
+	}
+
 	if result.Error != "" {
 		invoker.AddToTimeline("call["+toolPayload+"] error", result.Error)
+		if buildinaitools.IsMCPToolName(toolPayload) && buildinaitools.IsMCPInitializingMessage(result.Error) {
+			operator.Feedback(
+				"[MCP] Tool '" + toolPayload + "' is still initializing. " +
+					"Wait briefly, then retry the same tool with require_tool. Do NOT substitute an unrelated tool.",
+			)
+		}
 	}
 
 	task := loop.GetCurrentTask()
-	verifyResult, verifyErr := invoker.VerifyUserSatisfaction(ctx, task.GetUserInput(), true, toolPayload)
+	if task == nil {
+		operator.Continue()
+		return
+	}
+
+	verifyResult, triggered, verifyErr := loop.MaybeVerifyUserSatisfaction(ctx, task.GetUserInput(), true, toolPayload)
 	if verifyErr != nil {
 		operator.Fail(verifyErr)
 		return
 	}
-
-	if len(verifyResult.OutputFiles) > 0 {
-		cfg := loop.GetConfig()
-		for _, filePath := range verifyResult.OutputFiles {
-			providerName := "output_file:" + filePath
-			cfg.GetContextProviderManager().RegisterTracedContent(
-				providerName,
-				aicommon.OutputFileContextProvider(filePath),
-			)
-			if emitter := cfg.GetEmitter(); emitter != nil {
-				emitter.EmitPinFilename(filePath)
-			}
-		}
+	if !triggered || verifyResult == nil {
+		operator.Continue()
+		return
 	}
 
-	loop.PushSatisfactionRecordWithCompletedTaskIndex(
-		verifyResult.Satisfied, verifyResult.Reasoning,
-		verifyResult.CompletedTaskIndex, verifyResult.NextMovements,
-	)
-
-	if verifyResult.Satisfied {
+	if verifyResult.Satisfied && !aicommon.HasNewTodoAddOps(verifyResult.NextMovements) {
 		operator.Exit()
 		return
 	}

@@ -323,57 +323,65 @@ func DialX(target string, opt ...DialXOption) (net.Conn, error) {
 		if config.Debug {
 			log.Infof("dial %v with tls strategy: %v, SNI: %s", target, strategy, tempTlsConfig.ServerName)
 		}
-		conn, err := dialPlainTCPConnWithRetry(target, config)
-		if err != nil {
-			return nil, err
-		}
+		var tlsConn net.Conn
+		var tlsErr error
+		var tlsHandshakeDur time.Duration
 
 		switch strategy {
 		case TLS_Strategy_Ordinary:
 			tempTlsConfig.GMSupport = nil
+			tlsConn, tlsHandshakeDur, tlsErr = dialTLSWithRetry(target, config, tempTlsConfig, sni, tlsTimeout, clientHelloSpec, strategy)
 		case TLS_Strategy_GMDail:
-			tempTlsConfig.GMSupport = &gmtls.GMSupport{
-				WorkMode: gmtls.ModeGMSSLOnly,
+			if len(errs) > 0 {
+				config.TraceInfo.AddTLSRetryTip("普通 TLS 失败，已尝试国密 TLS 兼容握手")
+			} else {
+				config.TraceInfo.AddTLSRetryTip("已尝试国密 TLS 兼容握手")
 			}
+			tlsConn, tlsHandshakeDur, tlsErr = dialTLSWithGMTLSCipherFallback(target, config, tempTlsConfig, sni, tlsTimeout, clientHelloSpec)
 		default:
 			return nil, utils.Errorf("unknown tls strategy %v", strategy)
 		}
 
-		startTLSHandshake := time.Now()
-		tlsConn, err := UpgradeToTLSConnectionWithTimeout(conn, sni, tempTlsConfig, tlsTimeout, clientHelloSpec, config.TLSNextProto...)
-		if err != nil {
-			errs = append(errs, err)
+		if tlsErr != nil {
+			errs = append(errs, tlsErr)
 			continue
 		}
-		config.TraceInfo.SetTLSHandshakeDuration(time.Since(startTLSHandshake))
+		config.TraceInfo.SetTLSHandshakeDuration(tlsHandshakeDur)
 		return tlsConn, nil
 	}
 	if len(errs) > 0 {
 		lastErr := errs[len(errs)-1]
-		reasonEN, reasonCN, suggestion := getFriendlyTLSError(lastErr)
-
-		var configParts []string
-		if config.ForceDisableProxy {
-			configParts = append(configParts, "proxy=disabled")
-		} else if len(config.Proxy) > 0 {
-			configParts = append(configParts, fmt.Sprintf("proxy=%v", config.Proxy))
-		} else if config.EnableSystemProxyFromEnv {
-			configParts = append(configParts, "proxy=system")
-		} else {
-			configParts = append(configParts, "proxy=none")
-		}
-		if config.SNI != "" {
-			sniInfo := fmt.Sprintf("sni=%v", config.SNI)
-			if config.ShouldOverrideSNI {
-				sniInfo += "(override)"
+		displayErr := lastErr
+		retrySummary := ""
+		tlsReason := ""
+		tlsSuggestion := ""
+		var retryErr *tlsRetryError
+		if errors.As(lastErr, &retryErr) {
+			if retryErr.LastError() != nil {
+				displayErr = retryErr.LastError()
 			}
-			configParts = append(configParts, sniInfo)
+			tlsReason = retryErr.Reason()
+			retrySummary = retryErr.RetrySummary()
+			tlsSuggestion = retryErr.suggestion
 		}
-		configStr := strings.Join(configParts, ", ")
-
-		return nil, utils.Errorf("all tls strategy failed: TLS Connection Failed(%s): %s | Raw Error: %v | Config: %s\nTLS连接失败(%s): %s | 原始错误: %v | 调试配置: %s\n%s",
-			target, reasonEN, lastErr, configStr,
-			target, reasonCN, lastErr, configStr, suggestion)
+		_, reasonCN, suggestion := getFriendlyTLSError(displayErr)
+		if tlsReason != "" {
+			reasonCN = tlsReason
+		}
+		if tlsSuggestion != "" {
+			suggestion = "建议: " + tlsSuggestion
+		}
+		errLines := []string{fmt.Sprintf("TLS连接失败(%s): %s", target, reasonCN)}
+		if displayErr != nil {
+			errLines = append(errLines, fmt.Sprintf("原始错误: %v", displayErr))
+		}
+		if retrySummary != "" {
+			errLines = append(errLines, fmt.Sprintf("TLS重试: %s", retrySummary))
+		}
+		if suggestion != "" {
+			errLines = append(errLines, suggestion)
+		}
+		return nil, utils.Error(strings.Join(errLines, "\n"))
 	}
 	return nil, utils.Error("unknown tls strategy error, BUG here!")
 }

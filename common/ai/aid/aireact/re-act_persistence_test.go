@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -453,7 +454,11 @@ func TestReAct_PersistentSession_FreeInput(t *testing.T) {
 	round1Input := "first-round-path-/tmp/alpha-" + ksuid.New().String()
 	round2Input := "second-round-path-/tmp/beta-" + ksuid.New().String()
 
+	// 去 Exit 化后 directly_answer 只发答复并继续, 真正收尾交给唯一终结器 finish.
+	// 每个 round 新建一个 ReAct, 故在闭包内用独立计数器实现 "先答复再 finish" 两步式.
+	// 关键词: directly_answer 永不 Exit, finish 唯一终结器, 答复后追加 finish
 	newAnsweringReAct := func(inputChan chan *ypb.AIInputEvent, outputChan chan *ypb.AIOutputEvent) (*ReAct, error) {
+		var decisionCount int32
 		return NewTestReAct(
 			aicommon.WithEventInputChan(inputChan),
 			aicommon.WithEventHandler(func(e *schema.AiOutputEvent) {
@@ -463,7 +468,18 @@ func TestReAct_PersistentSession_FreeInput(t *testing.T) {
 				}
 			}),
 			aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+				prompt := r.GetPrompt()
 				rsp := i.NewAIResponse()
+				if isVerifySatisfactionPrompt(prompt) {
+					rsp.EmitOutputStream(bytes.NewBufferString(`{"@action":"verify-satisfaction","user_satisfied":true,"reasoning":"done"}`))
+					rsp.Close()
+					return rsp, nil
+				}
+				if isPrimaryDecisionPrompt(prompt) && atomic.AddInt32(&decisionCount, 1) > 1 {
+					rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "finish"}, "human_readable_thought": "finish after answer delivered"}`))
+					rsp.Close()
+					return rsp, nil
+				}
 				rsp.EmitOutputStream(bytes.NewBufferString(`{"@action": "object", "next_action": {"type": "directly_answer", "answer_payload": "done"}, "human_readable_thought": "done", "cumulative_summary": "done"}`))
 				rsp.Close()
 				return rsp, nil
@@ -513,7 +529,7 @@ func TestReAct_PersistentSession_FreeInput(t *testing.T) {
 	assert.Equal(t, 1, history2Before[0].Round)
 	assert.Equal(t, round1Input, history2Before[0].UserInput)
 	assert.False(t, history2Before[0].Timestamp.IsZero())
-	assert.Equal(t, round1Input, ins2.config.PrevSessionUserInput)
+	assert.Equal(t, round1Input, ins2.config.GetPrevSessionUserInput())
 
 	dynamic2 := ins2.promptManager.DynamicContext()
 	assert.Contains(t, dynamic2, "Session User Input History")
@@ -540,7 +556,7 @@ func TestReAct_PersistentSession_FreeInput(t *testing.T) {
 	assert.Equal(t, 2, history3[1].Round)
 	assert.Equal(t, round2Input, history3[1].UserInput)
 	assert.False(t, history3[1].Timestamp.IsZero())
-	assert.Equal(t, round2Input, ins3.config.PrevSessionUserInput)
+	assert.Equal(t, round2Input, ins3.config.GetPrevSessionUserInput())
 
 	dynamic3 := ins3.promptManager.DynamicContext()
 	assert.Contains(t, dynamic3, "Session User Input History")
@@ -551,4 +567,156 @@ func TestReAct_PersistentSession_FreeInput(t *testing.T) {
 	assert.Contains(t, dynamic3, "Time:")
 
 	close(in3)
+}
+
+// TestReAct_PersistentSession_Evidence verifies that session-level evidence persists
+// across two conversations within the same persistent session:
+//  1. Session 1 applies evidence operations (WAF findings, parameter discovery, test results)
+//  2. Evidence is persisted to DB via ApplySessionEvidenceOps
+//  3. Session 2 with the same persistent session ID restores evidence
+//  4. GetSessionEvidenceRendered returns the same content
+//  5. A session without persistent ID has no evidence
+func TestReAct_PersistentSession_Evidence(t *testing.T) {
+	pid := uuid.New().String()
+
+	newMinimalReAct := func() (*ReAct, error) {
+		in := make(chan *ypb.AIInputEvent, 1)
+		return NewTestReAct(
+			aicommon.WithEventInputChan(in),
+			aicommon.WithEventHandler(func(e *schema.AiOutputEvent) {}),
+			aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+				return nil, nil
+			}),
+			aicommon.WithPersistentSessionId(pid),
+		)
+	}
+
+	// === Session 1: Generate evidence ===
+	ins1, err := newMinimalReAct()
+	require.NoError(t, err)
+	require.NotNil(t, ins1)
+
+	// Before applying ops, evidence should be empty
+	require.Empty(t, ins1.config.GetSessionEvidenceRendered(),
+		"session 1 should start with empty evidence")
+
+	// Apply evidence operations simulating real tool execution findings
+	ops1 := []aicommon.EvidenceOperation{
+		{ID: "waf-regex", Op: "add", Content: "WAF regex filter: /cat|more|less|head|tac|tail|nl|od|vi|vim|sort|flag| |;|[0-9]|\\*|`|%|>|<|'|\"/i"},
+		{ID: "param-channel", Op: "add", Content: "Vulnerable parameter: rce via GET method ($_GET['rce']). POST body is NOT read by the application."},
+		{ID: "bypass-test-1", Op: "add", Content: "Tested: rce=ls${IFS}/ via GET -> 200 OK, body contains directory listing. Command injection confirmed."},
+	}
+	ins1.config.ApplySessionEvidenceOps(ops1)
+
+	// Verify evidence is rendered
+	rendered1 := ins1.config.GetSessionEvidenceRendered()
+	require.NotEmpty(t, rendered1, "evidence should be rendered after applying ops")
+	assert.Contains(t, rendered1, "waf-regex")
+	assert.Contains(t, rendered1, "WAF regex filter")
+	assert.Contains(t, rendered1, "param-channel")
+	assert.Contains(t, rendered1, "GET method")
+	assert.Contains(t, rendered1, "bypass-test-1")
+	assert.Contains(t, rendered1, "Command injection confirmed")
+	log.Infof("session 1 evidence rendered (length=%d): %s", len(rendered1), rendered1[:min(200, len(rendered1))])
+
+	// Apply more evidence (update existing + add new)
+	ops2 := []aicommon.EvidenceOperation{
+		{ID: "bypass-test-2", Op: "add", Content: "Tested: rce=/???/??t${IFS}/fla? via GET -> 200 OK, body=60KB binary. Wildcard bypass successful, target file found."},
+		{ID: "bypass-test-1", Op: "update", Content: "Tested: rce=ls${IFS}/ via GET -> 200 OK, directory listing shows /flag file exists. Command injection confirmed."},
+	}
+	ins1.config.ApplySessionEvidenceOps(ops2)
+
+	rendered1After := ins1.config.GetSessionEvidenceRendered()
+	assert.Contains(t, rendered1After, "bypass-test-2")
+	assert.Contains(t, rendered1After, "Wildcard bypass successful")
+	assert.Contains(t, rendered1After, "/flag file exists")
+
+	// Verify evidence is persisted in DB
+	runtime1, err := yakit.GetLatestAIAgentRuntimeByPersistentSession(consts.GetGormProjectDatabase(), pid)
+	require.NoError(t, err)
+	require.NotNil(t, runtime1)
+	dbEvidence := runtime1.GetEvidence()
+	require.NotEmpty(t, dbEvidence, "evidence should be persisted in DB")
+	assert.Contains(t, dbEvidence, "waf-regex")
+	assert.Contains(t, dbEvidence, "bypass-test-2")
+	log.Infof("session 1 DB evidence length: %d", len(dbEvidence))
+
+	// === Session 2: Restore evidence from persistent session ===
+	ins2, err := newMinimalReAct()
+	require.NoError(t, err)
+	require.NotNil(t, ins2)
+
+	rendered2 := ins2.config.GetSessionEvidenceRendered()
+	require.NotEmpty(t, rendered2, "session 2 should have restored evidence from persistent session")
+	assert.Contains(t, rendered2, "waf-regex")
+	assert.Contains(t, rendered2, "WAF regex filter")
+	assert.Contains(t, rendered2, "param-channel")
+	assert.Contains(t, rendered2, "bypass-test-1")
+	assert.Contains(t, rendered2, "/flag file exists")
+	assert.Contains(t, rendered2, "bypass-test-2")
+	assert.Contains(t, rendered2, "Wildcard bypass successful")
+	log.Infof("session 2 restored evidence (length=%d)", len(rendered2))
+
+	// Session 2 can also add more evidence
+	ops3 := []aicommon.EvidenceOperation{
+		{ID: "final-payload", Op: "add", Content: "Final working payload: rce=c\\at${IFS}/fla? via GET -> 200 OK, flag content retrieved."},
+	}
+	ins2.config.ApplySessionEvidenceOps(ops3)
+
+	rendered2After := ins2.config.GetSessionEvidenceRendered()
+	assert.Contains(t, rendered2After, "final-payload")
+	assert.Contains(t, rendered2After, "flag content retrieved")
+
+	// === Session 3: Verify evidence accumulates across sessions ===
+	ins3, err := newMinimalReAct()
+	require.NoError(t, err)
+	require.NotNil(t, ins3)
+
+	rendered3 := ins3.config.GetSessionEvidenceRendered()
+	require.NotEmpty(t, rendered3, "session 3 should restore all accumulated evidence")
+	assert.Contains(t, rendered3, "waf-regex")
+	assert.Contains(t, rendered3, "bypass-test-2")
+	assert.Contains(t, rendered3, "final-payload")
+	assert.Contains(t, rendered3, "flag content retrieved")
+	log.Infof("session 3 accumulated evidence (length=%d)", len(rendered3))
+
+	// === Session 4: Without persistent session ID - should have no evidence ===
+	in4 := make(chan *ypb.AIInputEvent, 1)
+	ins4, err := NewTestReAct(
+		aicommon.WithEventInputChan(in4),
+		aicommon.WithEventHandler(func(e *schema.AiOutputEvent) {}),
+		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
+			return nil, nil
+		}),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, ins4)
+	assert.Empty(t, ins4.config.GetSessionEvidenceRendered(),
+		"session without persistent ID should have no evidence")
+
+	// === Test evidence delete operation ===
+	ins5, err := newMinimalReAct()
+	require.NoError(t, err)
+	require.NotNil(t, ins5)
+
+	deleteOps := []aicommon.EvidenceOperation{
+		{ID: "bypass-test-1", Op: "delete"},
+	}
+	ins5.config.ApplySessionEvidenceOps(deleteOps)
+
+	rendered5 := ins5.config.GetSessionEvidenceRendered()
+	assert.NotContains(t, rendered5, "bypass-test-1")
+	assert.Contains(t, rendered5, "waf-regex")
+	assert.Contains(t, rendered5, "final-payload")
+
+	// Verify deletion persisted
+	ins6, err := newMinimalReAct()
+	require.NoError(t, err)
+	rendered6 := ins6.config.GetSessionEvidenceRendered()
+	assert.NotContains(t, rendered6, "bypass-test-1",
+		"deleted evidence should not appear in subsequent sessions")
+	assert.Contains(t, rendered6, "waf-regex",
+		"non-deleted evidence should persist")
+
+	log.Infof("persistent session evidence test passed")
 }

@@ -17,12 +17,11 @@ import (
 )
 
 const (
-	// SkillsContextMaxBytes is the total size limit for all skills context.
-	SkillsContextMaxBytes = 64 * 1024 // 64KB
+	// SkillsContextMaxTokens is the total size limit (in tokens) for all skills context.
+	SkillsContextMaxTokens = 32 * 1024 // 32k tokens
 
-	// MetadataListMaxBytes caps the metadata listing in the prompt when no skills are loaded.
-	// Prevents unbounded context growth as the number of registered skills increases.
-	MetadataListMaxBytes = 4 * 1024 // 4KB
+	// MetadataListMaxTokens caps the metadata listing (in tokens) in the prompt when no skills are loaded.
+	MetadataListMaxTokens = 8 * 1024 // 8k tokens
 )
 
 // skillContextState tracks the display state of a loaded skill.
@@ -59,18 +58,17 @@ func WithManagerSearchAICallback(cb SkillSearchAICallback) ManagerOption {
 	}
 }
 
-// WithManagerMaxBytes sets context max bytes at initialization.
-func WithManagerMaxBytes(maxBytes int) ManagerOption {
+// WithManagerMaxTokens sets the context max size (in tokens) at initialization.
+func WithManagerMaxTokens(maxTokens int) ManagerOption {
 	return func(m *SkillsContextManager) {
-		if maxBytes > 0 {
-			m.maxBytes = maxBytes
+		if maxTokens > 0 {
+			m.maxTokens = maxTokens
 		}
 	}
 }
 
 // WithManagerTokenEstimator sets an optional token estimator function.
-// When provided, context size limits are enforced in estimated tokens instead of raw bytes.
-// For mixed CJK/ASCII text, a simple approximation is: func(s string) int { return len([]rune(s)) }
+// When nil (default), ytoken.CalcTokenCount is used.
 func WithManagerTokenEstimator(estimator func(string) int) ManagerOption {
 	return func(m *SkillsContextManager) {
 		m.tokenEstimator = estimator
@@ -90,17 +88,16 @@ type SkillsContextManager struct {
 	// Ordering is by load time (oldest first).
 	loadedSkills *omap.OrderedMap[string, *skillContextState]
 
-	// maxBytes is the total size limit for the skills context.
-	maxBytes int
+	// maxTokens is the total size limit (in tokens) for the skills context.
+	maxTokens int
 
 	// cachedContextSize stores the last computed context size to avoid repeated rendering.
 	// Invalidated by setting contextSizeDirty to true when skills are loaded/folded/changed.
 	cachedContextSize int
 	contextSizeDirty  bool
 
-	// tokenEstimator is an optional function that estimates token count from a string.
-	// When set, context limits are enforced in tokens rather than bytes.
-	// A simple approximation: len([]rune(s)) works for mixed CJK/ASCII text.
+	// tokenEstimator overrides the default ytoken.CalcTokenCount for measuring size.
+	// When nil, the built-in ytoken.CalcTokenCount is used.
 	tokenEstimator func(string) int
 
 	// Optional DB and AI callback for manager-level search capabilities.
@@ -113,7 +110,7 @@ func NewSkillsContextManager(loader SkillLoader, opts ...ManagerOption) *SkillsC
 	m := &SkillsContextManager{
 		loader:           loader,
 		loadedSkills:     omap.NewOrderedMap[string, *skillContextState](map[string]*skillContextState{}),
-		maxBytes:         SkillsContextMaxBytes,
+		maxTokens:        SkillsContextMaxTokens,
 		contextSizeDirty: true,
 	}
 	for _, opt := range opts {
@@ -133,11 +130,11 @@ func (m *SkillsContextManager) initializeSkillSearchPersistence() {
 	}
 }
 
-// SetMaxBytes sets the total context size limit.
-func (m *SkillsContextManager) SetMaxBytes(maxBytes int) {
+// SetMaxTokens sets the total context size limit (in tokens).
+func (m *SkillsContextManager) SetMaxTokens(maxTokens int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.maxBytes = maxBytes
+	m.maxTokens = maxTokens
 }
 
 // HasRegisteredSkills returns true if the loader has any skills available.
@@ -284,6 +281,23 @@ func (m *SkillsContextManager) LoadSkill(skillName string) error {
 	return nil
 }
 
+// UnloadSkill removes a loaded skill from the context manager.
+func (m *SkillsContextManager) UnloadSkill(skillName string) bool {
+	skillName = strings.TrimSpace(skillName)
+	if skillName == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.loadedSkills.Have(skillName) {
+		return false
+	}
+	m.loadedSkills.Delete(skillName)
+	m.contextSizeDirty = true
+	log.Infof("unloaded skill %q from context", skillName)
+	return true
+}
+
 // LoadSkills loads multiple skills into the context manager in batch.
 // Returns a map of skill name to error (nil error means success).
 func (m *SkillsContextManager) LoadSkills(names []string) map[string]error {
@@ -369,7 +383,8 @@ func (m *SkillsContextManager) GetSkillViewSummary(skillName string) string {
 
 	buf.WriteString(fmt.Sprintf("Skill '%s' is loaded and ACTIVE in the SKILLS_CONTEXT section of your prompt. ", skillName))
 	buf.WriteString("View Windows:\n")
-	for filePath, vw := range state.ViewWindows {
+	for _, vw := range sortedViewWindows(state.ViewWindows) {
+		filePath := vw.FilePath
 		totalLines := vw.TotalLines()
 		offset := vw.GetOffset()
 		truncInfo := ""
@@ -386,62 +401,114 @@ func (m *SkillsContextManager) GetLoader() SkillLoader {
 	return m.loader
 }
 
+// TokenEstimator returns the optional custom token estimator for prompt sizing.
+func (m *SkillsContextManager) TokenEstimator() func(string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.tokenEstimator
+}
+
 // Render generates the full skills context string for injection into the prompt.
 func (m *SkillsContextManager) Render(nonce string) string {
+	if strings.TrimSpace(nonce) == "" {
+		nonce = "skills_context"
+	}
+	return m.renderWithTag(nonce)
+}
+
+// RenderStable generates a deterministic skills context block so unchanged skill
+// state can participate in prompt prefix caching.
+func (m *SkillsContextManager) RenderStable() string {
+	return m.renderWithTag("skills_context")
+}
+
+// renderWithTag 输出固定双段结构, 让 0->1 加载只增量改"Currently Loaded"上半段,
+// "Available Skills" registry listing 字节稳定。这是 Prompt 按稳定性分层路径下
+// SkillsContext 进入 AI_CACHE_FROZEN 块时保持前缀缓存命中的核心前置:
+//
+//	<|SKILLS_CONTEXT_<tag>|>
+//	== Currently Loaded Skills ==
+//	(none)                               // 或 sortedLoadedSkillStates 渲染输出
+//
+//	== Available Skills (use loading_skills action to load) ==
+//	  - skill-a: ...
+//	  - skill-b: ...
+//	  ... and N more skills.             // 大列表时尾段提示
+//	  ... plus N database-backed skills.
+//	<|SKILLS_CONTEXT_END_<tag>|>
+//
+// 注意: 上半段在零加载时仅一行 "(none)"; 加载后包含具体内容。这样无论加载与否,
+// 整体段落结构 (header / 上半段 / 分隔空行 / 下半段) 都保持。
+//
+// 关键词: SkillsContext renderWithTag, dual-section, 字节稳定, prefix cache
+func (m *SkillsContextManager) renderWithTag(tag string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.loadedSkills.Len() == 0 {
-		if m.HasRegisteredSkills() {
-			skills := m.loader.AllSkillMetas()
-			stats := GetSkillSourceStats(m.loader)
-			if len(skills) == 0 {
-				if stats.DatabaseCount > 0 {
-					return fmt.Sprintf(
-						"<|SKILLS_CONTEXT_%s|>\nAvailable database-backed skills: %d. Use search_capabilities or loading_skills with an exact skill name to access them.\n<|SKILLS_CONTEXT_END_%s|>",
-						nonce, stats.DatabaseCount, nonce,
-					)
-				}
-				return ""
-			}
-			var buf bytes.Buffer
-			buf.WriteString(fmt.Sprintf("<|SKILLS_CONTEXT_%s|>\n", nonce))
-			buf.WriteString("Available Skills (use loading_skills action to load):\n")
-			listed := 0
-			for _, s := range skills {
-				line := fmt.Sprintf("  - %s: %s\n", s.Name, s.Description)
-				if buf.Len()+len(line) > MetadataListMaxBytes {
-					remaining := len(skills) - listed
-					buf.WriteString(fmt.Sprintf("  ... and %d more skills. Use search_capabilities to find specific skills.\n", remaining))
-					break
-				}
-				buf.WriteString(line)
-				listed++
-			}
-			if stats.DatabaseCount > 0 {
-				buf.WriteString(fmt.Sprintf("  ... plus %d database-backed skills available via search.\n", stats.DatabaseCount))
-			}
-			buf.WriteString(fmt.Sprintf("<|SKILLS_CONTEXT_END_%s|>", nonce))
-			return buf.String()
-		}
+	hasRegistered := m.HasRegisteredSkills()
+	hasLoaded := m.loadedSkills.Len() > 0
+
+	if !hasRegistered && !hasLoaded {
 		return ""
 	}
 
 	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprintf("<|SKILLS_CONTEXT_%s|>\n", nonce))
+	buf.WriteString(fmt.Sprintf("<|SKILLS_CONTEXT_%s|>\n", tag))
 
-	m.loadedSkills.ForEach(func(name string, state *skillContextState) bool {
-		if state.IsFolded {
-			buf.WriteString(m.renderFolded(state))
-		} else {
-			buf.WriteString(m.renderFull(state))
+	buf.WriteString("== Currently Loaded Skills ==\n")
+	if hasLoaded {
+		for _, item := range m.sortedLoadedSkillStates() {
+			state := item.state
+			if state.IsFolded {
+				buf.WriteString(m.renderFolded(state))
+			} else {
+				buf.WriteString(m.renderFull(state))
+			}
+			buf.WriteString("\n")
 		}
-		buf.WriteString("\n")
-		return true
-	})
+	} else {
+		buf.WriteString("(none)\n")
+	}
 
-	buf.WriteString(fmt.Sprintf("<|SKILLS_CONTEXT_END_%s|>", nonce))
+	if hasRegistered {
+		buf.WriteString("\n")
+		m.appendAvailableSkillsSection(&buf)
+	}
+
+	buf.WriteString(fmt.Sprintf("<|SKILLS_CONTEXT_END_%s|>", tag))
 	return buf.String()
+}
+
+// appendAvailableSkillsSection 写入"Available Skills"下半段。
+// 内容仅依赖 loader.AllSkillMetas() + GetSkillSourceStats(loader), 不读 loadedSkills,
+// 保证字节稳定性 (registry 不变 -> 输出不变)。
+//
+// 关键词: SkillsContext appendAvailableSkillsSection, registry listing 稳定
+func (m *SkillsContextManager) appendAvailableSkillsSection(buf *bytes.Buffer) {
+	skills := m.loader.AllSkillMetas()
+	stats := GetSkillSourceStats(m.loader)
+
+	if len(skills) == 0 {
+		buf.WriteString("== Available Skills ==\n")
+		if stats.DatabaseCount > 0 {
+			buf.WriteString(fmt.Sprintf("Available database-backed skills: %d. Use search_capabilities or loading_skills with an exact skill name to access them.\n", stats.DatabaseCount))
+		} else {
+			buf.WriteString("(none)\n")
+		}
+		return
+	}
+
+	listed, omitted := SelectSkillMetasForPromptRegistry(skills, m.tokenEstimator)
+	buf.WriteString(AvailableSkillsRegistryHeader)
+	for _, meta := range listed {
+		buf.WriteString(FormatAvailableSkillRegistryLine(meta))
+	}
+	if omitted > 0 {
+		buf.WriteString(AvailableSkillsOverflowHint(omitted))
+	}
+	if stats.DatabaseCount > 0 {
+		buf.WriteString(fmt.Sprintf("  ... plus %d database-backed skills available via search.\n", stats.DatabaseCount))
+	}
 }
 
 // renderFolded renders a skill in folded mode (metadata + compact file tree).
@@ -471,12 +538,89 @@ func (m *SkillsContextManager) renderFull(state *skillContextState) string {
 	buf.WriteString(RenderFileSystemTreeFull(state.Skill.FileSystem))
 
 	// Render all active view windows
-	for _, vw := range state.ViewWindows {
+	for _, vw := range sortedViewWindows(state.ViewWindows) {
 		buf.WriteString("\n")
 		buf.WriteString(vw.RenderWithInfo())
 	}
 
 	return buf.String()
+}
+
+type namedSkillState struct {
+	name  string
+	state *skillContextState
+}
+
+func (m *SkillsContextManager) sortedLoadedSkillStates() []namedSkillState {
+	items := make([]namedSkillState, 0, m.loadedSkills.Len())
+	m.loadedSkills.ForEach(func(name string, state *skillContextState) bool {
+		items = append(items, namedSkillState{name: name, state: state})
+		return true
+	})
+	sort.Slice(items, func(i, j int) bool {
+		left := items[i].name
+		right := items[j].name
+		if items[i].state != nil && items[i].state.Skill != nil && items[i].state.Skill.Meta != nil && items[i].state.Skill.Meta.Name != "" {
+			left = items[i].state.Skill.Meta.Name
+		}
+		if items[j].state != nil && items[j].state.Skill != nil && items[j].state.Skill.Meta != nil && items[j].state.Skill.Meta.Name != "" {
+			right = items[j].state.Skill.Meta.Name
+		}
+		if left == right {
+			return items[i].name < items[j].name
+		}
+		return left < right
+	})
+	return items
+}
+
+func sortSkillMetasByName(metas []*SkillMeta) []*SkillMeta {
+	if len(metas) <= 1 {
+		return metas
+	}
+	sorted := append([]*SkillMeta(nil), metas...)
+	sort.Slice(sorted, func(i, j int) bool {
+		leftName := ""
+		rightName := ""
+		if sorted[i] != nil {
+			leftName = sorted[i].Name
+		}
+		if sorted[j] != nil {
+			rightName = sorted[j].Name
+		}
+		if leftName == rightName {
+			leftDesc := ""
+			rightDesc := ""
+			if sorted[i] != nil {
+				leftDesc = sorted[i].Description
+			}
+			if sorted[j] != nil {
+				rightDesc = sorted[j].Description
+			}
+			return leftDesc < rightDesc
+		}
+		return leftName < rightName
+	})
+	return sorted
+}
+
+func sortedViewWindows(viewWindows map[string]*ViewWindow) []*ViewWindow {
+	if len(viewWindows) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(viewWindows))
+	for key := range viewWindows {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	result := make([]*ViewWindow, 0, len(keys))
+	for _, key := range keys {
+		if vw := viewWindows[key]; vw != nil {
+			result = append(result, vw)
+		}
+	}
+	return result
 }
 
 var crossSkillRefRegexp = regexp.MustCompile(`\.\.\/([a-zA-Z0-9][a-zA-Z0-9_-]*)\/`)
@@ -510,7 +654,7 @@ func DetectCrossSkillReferences(content string, currentSkillName string) []strin
 func (m *SkillsContextManager) ensureContextFits() {
 	for {
 		totalSize := m.estimateContextSize()
-		if totalSize <= m.maxBytes {
+		if totalSize <= m.maxTokens {
 			return
 		}
 
@@ -527,14 +671,14 @@ func (m *SkillsContextManager) ensureContextFits() {
 		})
 
 		if lruName == "" {
-			log.Warnf("all skills are folded but context still exceeds limit (total: %d, limit: %d)", totalSize, m.maxBytes)
+			log.Warnf("all skills are folded but context still exceeds limit (total: %d, limit: %d)", totalSize, m.maxTokens)
 			return
 		}
 
 		if state, ok := m.loadedSkills.Get(lruName); ok {
 			state.IsFolded = true
 			m.contextSizeDirty = true
-			log.Infof("folded LRU skill %q to fit context limit (total: %d, limit: %d)", lruName, totalSize, m.maxBytes)
+			log.Infof("folded LRU skill %q to fit context limit (total: %d, limit: %d)", lruName, totalSize, m.maxTokens)
 		}
 	}
 }
@@ -564,13 +708,9 @@ func (m *SkillsContextManager) estimateContextSize() int {
 	return total
 }
 
-// measureSize returns the size of a rendered string using the token estimator if available,
-// otherwise falls back to byte length.
+// measureSize returns the size of a rendered string in tokens.
 func (m *SkillsContextManager) measureSize(rendered string) int {
-	if m.tokenEstimator != nil {
-		return m.tokenEstimator(rendered)
-	}
-	return len(rendered)
+	return MeasureStringTokens(rendered, m.tokenEstimator)
 }
 
 func buildKeywordsString(meta *SkillMeta) string {

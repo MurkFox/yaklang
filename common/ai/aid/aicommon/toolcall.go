@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,12 +21,58 @@ import (
 
 	"github.com/segmentio/ksuid"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
 	"gopkg.in/yaml.v3"
 )
 
-var toolParamAITagStartRegexp = regexp.MustCompile(`<\|TOOL_PARAM_([A-Za-z0-9_]+)_([A-Za-z0-9]+)\|>`)
+// toolParamAITagStartRegexp nonce 段允许 [a-zA-Z0-9_\-\[\]], 既支持历史
+// turn nonce (uuid 风格 a-f0-9-), 又支持新引入的占位符字面量 nonce
+// "[current-nonce]" (含方括号). 包含 `[` `]` 是正则字符类内字面量,
+// 已用 `[A-Za-z0-9_\[\]\-]+` 写法明确表达.
+//
+// 关键词: toolParamAITagStartRegexp, nonce 占位符, [current-nonce]
+var toolParamAITagStartRegexp = regexp.MustCompile(`<\|TOOL_PARAM_([A-Za-z0-9_]+)_([A-Za-z0-9_\[\]\-]+)\|>`)
 
 const toolParamAITagActionKeyPrefix = "__aitag__"
+
+// RecentToolCacheStableNonce 是 CACHE_TOOL_CALL 块及其内部所有 AITAG (TOOL_xxx /
+// TOOL_PARAM_xxx) 渲染时使用的稳定 nonce 字面量. 跨 react turn 不变, 让承载
+// 该块的 prompt 段保持字节级稳定, 进入 prefix cache.
+//
+// 字面量选 "[current-nonce]" 带方括号占位符语义, 用意:
+//   - 让 LLM 一眼看出"这是个占位符, 应该替换为 prompt 上下文里的 current nonce
+//     (USER_QUERY 等其他 AITAG 用的 turn nonce)"
+//   - 即使 LLM 不替换、直接照抄字面量输出, ActionMaker 端通过 ExtraNonces
+//     双注册也能命中 (turn nonce + [current-nonce] 同时注册 callback)
+//
+// 必须与渲染侧 (buildinaitools.GetRecentToolsSummary) 与解析侧
+// (reactloops.syncRecentToolParamAITagFields 注册的 LoopAITagField.ExtraNonces)
+// 保持一致, 否则字面量被改变后任一侧落后都会导致解析丢失.
+//
+// 关键词: RecentToolCacheStableNonce, [current-nonce], 占位符语义,
+//
+//	prefix cache 字节稳定, 双注册兜底
+const RecentToolCacheStableNonce = "[current-nonce]"
+
+// LiteralCurrentNoncePlaceholder 是各 react loop 在 persistent_instruction /
+// output_example 等示例 prompt 里使用的 nonce 占位符字面量, 例如
+// `<|FACTS_CURRENT_NONCE|>` / `<|FINAL_ANSWER_CURRENT_NONCE|>` /
+// `<|GEN_CODE_CURRENT_NONCE|>` 等.
+//
+// 设计本意是让 AI 把 `CURRENT_NONCE` 替换为本 turn 实际生效的 nonce. 但实测
+// 部分模型会把这个占位符当作字面量直接照抄输出, 导致 AITag 解析器只用 turn
+// nonce 注册 callback 时根本匹配不到, 内容丢失, verifier 误判为"AI 没提供
+// 内容", 触发 5 次重试黑洞甚至致命中断 (实例: output_facts: facts content
+// is required).
+//
+// 为了兼容这种照抄行为, ReActLoop.buildActionTagOption 会默认把这个字面量
+// 作为 ExtraNonces 候选注册, 与 turn nonce 并列双注册, AI 用任一格式输出
+// AITag 块都能被正确捕获到 action 字段.
+//
+// 关键词: LiteralCurrentNoncePlaceholder, CURRENT_NONCE 字面量兼容,
+//
+//	AI 占位符照抄, AITag 双注册兜底
+const LiteralCurrentNoncePlaceholder = "CURRENT_NONCE"
 
 func GetToolParamAITagActionKey(paramName string) string {
 	return toolParamAITagActionKeyPrefix + paramName
@@ -436,6 +483,7 @@ func (t *ToolCaller) generateParams(tool *aitool.Tool, handleError func(i any)) 
 		request.SetTaskIndex(t.task.GetIndex())
 		return t.ai.CallAI(request)
 	}, func(rsp *AIResponse) error {
+		boundEmitter := rsp.BindEmitter(emitter)
 		pr, pw := utils.NewPipe()
 
 		stream := rsp.GetOutputStreamReader("call-tools", true, emitter)
@@ -461,9 +509,9 @@ func (t *ToolCaller) generateParams(tool *aitool.Tool, handleError func(i any)) 
 			log.Debugf("registered AITAG handlers for tool[%s] params: %v with nonce: %s", tool.Name, promptMeta.ParamNames, promptMeta.Nonce)
 		}
 
-		event, err := emitter.EmitDefaultStreamEvent("generating-tool-call-params", pr, t.task.GetIndex())
+		event, err := boundEmitter.EmitDefaultStreamEvent("generating-tool-call-params", pr, t.task.GetIndex())
 		if err != nil {
-			emitter.EmitError("error emit default stream event for tool[%s] params: %v", tool.Name, err)
+			boundEmitter.EmitError("error emit default stream event for tool[%s] params: %v", tool.Name, err)
 		}
 		_ = event
 
@@ -477,7 +525,7 @@ func (t *ToolCaller) generateParams(tool *aitool.Tool, handleError func(i any)) 
 				paramDuration = cost
 				rawAIResponse = response.String()
 				pw.WriteString(" [done] 耗时(Cost): " + fmt.Sprintf("%.2f", cost.Seconds()) + "s")
-				emitter.EmitTextReferenceMaterial(event.GetContentJSONPath(`$.event_writer_id`), rawAIResponse)
+				boundEmitter.EmitTextReferenceMaterial(event.GetContentJSONPath(`$.event_writer_id`), rawAIResponse)
 				pw.Close()
 			}),
 			WithActionFieldStreamHandler(paramNames, func(key string, r io.Reader) {
@@ -506,7 +554,7 @@ func (t *ToolCaller) generateParams(tool *aitool.Tool, handleError func(i any)) 
 
 		callToolAction, err := ExtractValidActionFromStream(t.config.GetContext(), stream, "call-tool", actionOpts...)
 		if err != nil {
-			emitter.EmitError("error extract tool params: %v", err)
+			boundEmitter.EmitError("error extract tool params: %v", err)
 			return utils.Errorf("error extracting action params: %v", err)
 		}
 
@@ -562,7 +610,7 @@ func (t *ToolCaller) generateParams(tool *aitool.Tool, handleError func(i any)) 
 		}
 
 		return nil
-	})
+	}, WithAIRequest_CallerLabel("toolcall-params"))
 	if err != nil {
 		emitter.EmitError("error calling AI for tool[%v] params: %v", tool.Name, err)
 		handleError(fmt.Sprintf("error calling AI for tool[%v] params: %v", tool.Name, err))
@@ -652,6 +700,11 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, presetParams b
 	}
 
 	callToolId := t.callToolId
+	defer func() {
+		if useful, err := yakit.UsefulRuntimeId(consts.GetGormProjectDatabase(), callToolId); err == nil && useful {
+			t.config.AppendRelatedRuntimeID(callToolId)
+		}
+	}()
 
 	toolResult := &aitool.ToolResult{}
 	defer t.emitter.EmitToolCallSummary(t.callToolId, SummaryRank(t.task, toolResult))
@@ -813,6 +866,13 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, presetParams b
 		}
 		t.emitter.EmitInteractiveJSON(ep.GetId(), schema.EVENT_TYPE_TOOL_USE_REVIEW_REQUIRE, "review-require", reqs)
 
+		// 审批前快照原始提议参数 (original_value), 供价值评估比对是否被改动.
+		originalReviewParams := make(aitool.InvokeParams, len(invokeParams))
+		for k, v := range invokeParams {
+			originalReviewParams[k] = v
+		}
+		reviewQuestion := fmt.Sprintf("determite tool[%v]'s params is proper? what should I do?", tool.Name)
+
 		// wait for agree
 		config.DoWaitAgree(t.ctx, ep)
 		params := ep.GetParams()
@@ -820,10 +880,14 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, presetParams b
 		config.CallAfterInteractiveEventReleased(ep.GetId(), params)
 		config.CallAfterReview(
 			ep.GetSeq(),
-			fmt.Sprintf("determite tool[%v]'s params is proper? what should I do?", tool.Name),
+			reviewQuestion,
 			params,
 		)
 		if params == nil {
+			// 价值评估: 用户取消工具审批 (空响应释放) 是高价值的人工否决信号, 不能漏采.
+			if cfg, ok := config.(*Config); ok {
+				cfg.SubmitToolReviewValueFeedback(ep, reviewQuestion, originalReviewParams, nil)
+			}
 			t.emitter.EmitError("tool use [%v] review params is nil, user may cancel the review", tool.Name)
 			handleError(fmt.Sprintf("tool use [%v] review params is nil, user may cancel the review", tool.Name))
 			return nil, false, fmt.Errorf("tool use [%v] review params is nil", tool.Name)
@@ -837,6 +901,12 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, presetParams b
 			t.emitter.EmitError("error handling tool use review: %v", err)
 			handleError(fmt.Sprintf("error handling tool use review: %v", err))
 			return nil, false, err
+		}
+
+		// 价值评估 (review_decision): 记录审批事实 (original/final 参数 + 运行时来源),
+		// invokeParams 此时已是 review 应用后的最终参数. 非阻塞, 绝不影响主流程.
+		if cfg, ok := config.(*Config); ok {
+			cfg.SubmitToolReviewValueFeedback(ep, reviewQuestion, originalReviewParams, invokeParams)
 		}
 
 		switch next {
@@ -855,15 +925,45 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, presetParams b
 	stderrReader, stderrWriter := utils.NewPipe()
 	defer stderrWriter.Close()
 
-	// Create buffers to capture stdout and stderr for file saving
-	stdoutBuffer := &bytes.Buffer{}
-	stderrBuffer := &bytes.Buffer{}
+	// Create buffers to capture stdout and stderr for interval review and file saving.
+	stdoutBuffer := &toolOutputBuffer{}
+	stderrBuffer := &toolOutputBuffer{}
 
 	// Use MultiWriter to write to both the pipe (for streaming) and the buffer (for file saving)
 	stdoutMultiWriter := io.MultiWriter(stdoutWriter, stdoutBuffer)
 	stderrMultiWriter := io.MultiWriter(stderrWriter, stderrBuffer)
 
 	waitToolStdFlush := t.emitter.EmitToolCallStd(tool.Name, stdoutReader, stderrReader, t.task.GetIndex())
+
+	// Refresh MCP tools from the manager immediately before invoke. Parameter generation
+	// may take several seconds; background loadMCPServers can replace stubs with live
+	// tools while the AI is still drafting params.
+	if buildinaitools.IsMCPToolName(tool.Name) {
+		if mgr := t.config.GetAiToolManager(); mgr != nil {
+			waitCtx := t.ctx
+			if waitCtx == nil {
+				waitCtx = t.config.GetContext()
+			}
+			liveTool, waitErr := buildinaitools.WaitForMCPLiveTool(
+				waitCtx, mgr, tool.Name,
+				buildinaitools.MCPToolInitWaitTimeout,
+				buildinaitools.MCPToolInitPollInterval,
+				func(elapsed time.Duration) {
+					t.emitter.EmitInfo(
+						"MCP tool %q still connecting (elapsed %v), waiting for remote server before invoke...",
+						tool.Name, elapsed.Round(time.Second),
+					)
+				},
+			)
+			if waitErr != nil {
+				return nil, false, waitErr
+			}
+			if liveTool != nil {
+				tool = liveTool
+			}
+		}
+	}
+
 	t.emitter.EmitInfo("start to invoke tool: %v", tool.Name)
 	t.m.Lock()
 	// Measure pure plugin execution time from real invoke start to invoke return.
@@ -871,6 +971,7 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, presetParams b
 	pluginInvokeDuration = 0
 	t.m.Unlock()
 
+	t.emitter.EmitToolCallParam(callToolId, invokeParams)
 	toolResult, err = t.invoke(
 		tool, invokeParams, handleUserCancel, handleError,
 		stdoutMultiWriter, stderrMultiWriter,
@@ -917,6 +1018,8 @@ func (t *ToolCaller) CallToolWithExistedParams(tool *aitool.Tool, presetParams b
 		}
 	}
 
+	NotifySessionSnapshotToolCall(t.config, toolResult)
+
 	return toolResult, false, nil
 }
 
@@ -928,8 +1031,8 @@ func (t *ToolCaller) saveToolCallFiles(
 	callToolId string,
 	destinationIdentifier string,
 	params aitool.InvokeParams,
-	stdoutBuffer *bytes.Buffer,
-	stderrBuffer *bytes.Buffer,
+	stdoutBuffer *toolOutputBuffer,
+	stderrBuffer *toolOutputBuffer,
 	toolResult *aitool.ToolResult,
 	paramGenDuration time.Duration,
 	rawAIParamResponse string,

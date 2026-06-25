@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -103,9 +104,11 @@ func checkPrintBinary(t *testing.T, code string, expectedVals ...int64) {
 }
 
 type runBinaryConfig struct {
-	env         map[string]string
-	compileOpts []compiler.CompileOption
-	cleanup     []func()
+	env             map[string]string
+	args            []string
+	compileOpts     []compiler.CompileOption
+	cleanup         []func()
+	useDebugRuntime bool
 }
 
 type runBinaryOption func(*runBinaryConfig) error
@@ -138,9 +141,32 @@ func withCompilePrintEntryResult(enabled bool) runBinaryOption {
 	}
 }
 
+func withCompilePluginType(pluginType string) runBinaryOption {
+	return func(cfg *runBinaryConfig) error {
+		cfg.compileOpts = append(cfg.compileOpts, compiler.WithCompilePluginType(pluginType))
+		return nil
+	}
+}
+
 func withCompileObfuscators(names ...string) runBinaryOption {
 	return func(cfg *runBinaryConfig) error {
 		cfg.compileOpts = append(cfg.compileOpts, compiler.WithCompileObfuscators(names...))
+		return nil
+	}
+}
+
+func withArgs(args ...string) runBinaryOption {
+	return func(cfg *runBinaryConfig) error {
+		cfg.args = append(cfg.args, args...)
+		return nil
+	}
+}
+
+// withDebugRuntimeLib links against libyak.debug.a (ssa2llvm_runtime_debug); pair
+// with GCLOG or other diagnostics as needed.
+func withDebugRuntimeLib() runBinaryOption {
+	return func(cfg *runBinaryConfig) error {
+		cfg.useDebugRuntime = true
 		return nil
 	}
 }
@@ -159,10 +185,16 @@ func runBinaryWithEnv(t *testing.T, code string, entry string, env map[string]st
 	tmpBin, cleanup := compileBinary(t, code, entry, cfg)
 	defer cleanup()
 
-	cmd := exec.Command(tmpBin)
-	if len(cfg.env) > 0 {
+	return runCompiledBinaryWithEnv(t, tmpBin, cfg.env, cfg.args...)
+}
+
+func runCompiledBinaryWithEnv(t *testing.T, bin string, env map[string]string, args ...string) string {
+	t.Helper()
+
+	cmd := exec.Command(bin, args...)
+	if len(env) > 0 {
 		cmd.Env = append([]string{}, os.Environ()...)
-		for k, v := range cfg.env {
+		for k, v := range env {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 		}
 	}
@@ -170,7 +202,6 @@ func runBinaryWithEnv(t *testing.T, code string, entry string, env map[string]st
 	if err != nil {
 		t.Fatalf("Binary execution failed: %v\nOutput: %s", err, output)
 	}
-
 	return string(output)
 }
 
@@ -194,7 +225,12 @@ func newRunBinaryConfig(t *testing.T, options ...runBinaryOption) *runBinaryConf
 func compileBinary(t *testing.T, code string, entry string, cfg *runBinaryConfig) (string, func()) {
 	t.Helper()
 
-	ensureRuntimeArchiveOnce(t)
+	repoRoot := RepoRoot(t)
+	if cfg.useDebugRuntime {
+		EnsureDebugRuntimeArchive(t, repoRoot)
+	} else {
+		ensureRuntimeArchiveOnce(t)
+	}
 
 	cleanup := func() {
 		for i := len(cfg.cleanup) - 1; i >= 0; i-- {
@@ -220,13 +256,17 @@ func compileBinary(t *testing.T, code string, entry string, cfg *runBinaryConfig
 		_ = os.Remove(tmpBin)
 	})
 
-	options := make([]compiler.CompileOption, 0, 8+len(cfg.compileOpts))
+	options := make([]compiler.CompileOption, 0, 10+len(cfg.compileOpts))
 	options = append(options,
 		compiler.WithCompileSourceFile(tmpFile.Name()),
 		compiler.WithCompileOutputFile(tmpBin),
 		compiler.WithCompileLanguage("yak"),
 		compiler.WithCompileEntryFunction(entry),
 	)
+	if cfg.useDebugRuntime {
+		debugArc := filepath.Join(repoRoot, "common", "yak", "ssa2llvm", "runtime", "libyak.debug.a")
+		options = append(options, compiler.WithCompileRuntimeArchive(debugArc))
+	}
 	options = append(options, cfg.compileOpts...)
 
 	if _, err := compiler.CompileToExecutable(options...); err != nil {
@@ -247,7 +287,7 @@ func runBinaryExitCodeWithEnv(t *testing.T, code string, entry string, env map[s
 	tmpBin, cleanup := compileBinary(t, code, entry, cfg)
 	defer cleanup()
 
-	cmd := exec.Command(tmpBin)
+	cmd := exec.Command(tmpBin, cfg.args...)
 	if len(cfg.env) > 0 {
 		cmd.Env = append([]string{}, os.Environ()...)
 		for k, v := range cfg.env {

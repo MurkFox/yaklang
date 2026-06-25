@@ -12,12 +12,14 @@ func buildInitTask(r aicommon.AIInvokeRuntime) func(loop *reactloops.ReActLoop, 
 	return func(loop *reactloops.ReActLoop, task aicommon.AIStatefulTask, operator *reactloops.InitTaskOperator) {
 		config := r.GetConfig()
 
+		attachedDatas := task.GetAttachedDatas()
+		attachedResources := reactloops.RunAttachedExtraResourcesInit(r, loop, attachedDatas)
+
 		// Original logic: process attached data (knowledge bases, files, etc.)
 		mustProcessMentionedInfo := config.GetConfigBool("MustProcessAttachedData")
-		attachedDatas := task.GetAttachedDatas()
-		if mustProcessMentionedInfo && len(attachedDatas) > 0 {
+		if mustProcessMentionedInfo && hasAttachedKnowledgeBaseResource(attachedResources) {
 			loop.LoadingStatus("开始处理用户提及的数据（@ Mentionup） / Start to process user-mentioned data (@ Mentionup)")
-			err := ProcessAttachedData(r, loop, task, operator)
+			err := ProcessAttachedData(r, loop, task, operator, attachedResources)
 			if err != nil {
 				log.Errorf("failed to process attached data: %v", err)
 				loop.GetInvoker().AddToTimeline("error", fmt.Sprintf("failed to process attached data: %v", err))
@@ -45,6 +47,7 @@ func buildInitTask(r aicommon.AIInvokeRuntime) func(loop *reactloops.ReActLoop, 
 
 		loop.LoadingStatus("开始意图识别 / Start intent recognition")
 		userInput := task.GetUserInput()
+		capabilityNameMatches := reactloops.MatchCapabilitiesByTextWithConfig(r.GetConfig(), userInput)
 
 		scale := ClassifyInputScale(userInput)
 		log.Infof("input scale classified as %s for input length %d runes", scale.String(), len([]rune(userInput)))
@@ -66,6 +69,7 @@ func buildInitTask(r aicommon.AIInvokeRuntime) func(loop *reactloops.ReActLoop, 
 			// Fast mode: rules + BM25 matching
 			result := FastIntentMatch(r, userInput)
 			if result != nil {
+				applyCapabilityMatchesToFastMatchResult(result, capabilityNameMatches)
 				applyFastMatchResult(r, loop, result)
 				if result.IsSimpleQuery {
 					log.Infof("simple query detected, skipping deep intent recognition")
@@ -88,6 +92,7 @@ func buildInitTask(r aicommon.AIInvokeRuntime) func(loop *reactloops.ReActLoop, 
 			log.Infof("invoking deep intent recognition (scale=%s)", scale.String())
 			deepResult := executeDeepIntentRecognition(r, loop, task)
 			if deepResult != nil {
+				reactloops.ApplyCapabilityMatchesToDeepIntentResult(deepResult, capabilityNameMatches)
 				applyDeepIntentResult(r, loop, deepResult)
 			} else {
 				log.Infof("deep intent recognition returned no result, proceeding with default loop")

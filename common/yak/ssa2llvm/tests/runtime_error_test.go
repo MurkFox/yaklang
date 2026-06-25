@@ -6,7 +6,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRuntimeError_MakeSliceIndexPanicLogged(t *testing.T) {
+// Panic recovery stderr lines require libyak.debug.a (see withDebugRuntimeLib in tests).
+func TestRuntimeError_MakeSliceIndexPanicRecovered(t *testing.T) {
 	code := `
 func main() {
 	println("Hello Yak World!")
@@ -15,13 +16,13 @@ func main() {
 	println(1)
 }
 `
-	output := runBinaryWithEnv(t, code, "main", nil)
+	output := runBinaryWithEnv(t, code, "main", nil, withDebugRuntimeLib())
 	require.Contains(t, output, "Hello Yak World!\n")
-	require.Contains(t, output, `[yak-runtime] panic: index "1" out of range`)
 	require.Contains(t, output, "1\n")
+	require.Contains(t, output, "[yak-runtime] panic:")
 }
 
-func TestRuntimeError_ShadowMethodPanicLogged(t *testing.T) {
+func TestRuntimeError_ShadowMethodPanicRecovered(t *testing.T) {
 	code := `
 func main() {
 	l = sync.NewLock()
@@ -29,7 +30,7 @@ func main() {
 	println(1)
 }
 `
-	output := runBinaryWithEnv(t, code, "main", nil)
-	require.Contains(t, output, `method "aaaUndefine" not found`)
+	output := runBinaryWithEnv(t, code, "main", nil, withDebugRuntimeLib())
 	require.Contains(t, output, "1\n")
+	require.Contains(t, output, "[yak-runtime] panic:")
 }

@@ -2,24 +2,25 @@ package tests
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/antlr/antlr4/runtime/Go/antlr/v4"
-	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils/filesys"
 	"github.com/yaklang/yaklang/common/yak/antlr4util"
 	phpparser "github.com/yaklang/yaklang/common/yak/php/parser"
 	"github.com/yaklang/yaklang/common/yak/ssa"
 	"github.com/yaklang/yaklang/common/yak/ssaapi"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
-	"github.com/yaklang/yaklang/common/yak/ssaapi/ssareducer"
 
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/yak/php/php2ssa"
@@ -28,11 +29,96 @@ import (
 //go:embed syntax/***
 var syntaxFs embed.FS
 
+//go:embed large/***
+var largeSyntaxFs embed.FS
+
 var phpTestAntlrCache = func() *ssa.AntlrCache {
 	return php2ssa.CreateBuilder().GetAntlrCache()
 }()
 
-func validateSource(t *testing.T, filename string, src string) {
+const phpFreshSyntaxCacheMinBytes = 64 * 1024
+
+var phpTestCacheResetState = struct {
+	mu          sync.Mutex
+	filesParsed int
+	resetEvery  int
+}{
+	resetEvery: phpTestCacheResetEveryFiles(),
+}
+
+func newPHPTestAntlrCache() *ssa.AntlrCache {
+	return php2ssa.CreateBuilder().GetAntlrCache()
+}
+
+func phpTestCacheResetEveryFiles() int {
+	raw := strings.TrimSpace(os.Getenv("YAK_ANTLR_CACHE_RESET_FILES"))
+	if raw == "" {
+		return 100
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
+}
+
+func nextPHPTestAntlrCache(src string) *ssa.AntlrCache {
+	if len(src) >= phpFreshSyntaxCacheMinBytes {
+		return newPHPTestAntlrCache()
+	}
+
+	phpTestCacheResetState.mu.Lock()
+	defer phpTestCacheResetState.mu.Unlock()
+
+	phpTestCacheResetState.filesParsed++
+	if phpTestAntlrCache != nil && phpTestCacheResetState.resetEvery > 0 && phpTestCacheResetState.filesParsed%phpTestCacheResetState.resetEvery == 0 {
+		phpTestAntlrCache.ResetRuntimeCaches()
+	}
+	return phpTestAntlrCache
+}
+
+var syntaxNonASTAssets = map[string]struct{}{
+	"syntax/composer.lock": {},
+}
+
+func phpFixtureParseBudget() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("YAK_PHP_FIXTURE_PARSE_BUDGET_SEC"))
+	if raw == "" {
+		return 30 * time.Second
+	}
+	sec, err := strconv.Atoi(raw)
+	if err != nil || sec <= 0 {
+		return 0
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func phpLargeFixtureParseBudget() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("YAK_PHP_LARGE_FIXTURE_PARSE_BUDGET_SEC"))
+	if raw == "" {
+		return 0
+	}
+	sec, err := strconv.Atoi(raw)
+	if err != nil || sec <= 0 {
+		return 0
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func flattenedProjectFixtureName(filePath string) string {
+	return strings.NewReplacer("/", "__", "\\", "__").Replace(filePath)
+}
+
+func isSyntaxASTFixture(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".php", ".inc", ".php1":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateSourceWithBudget(t *testing.T, filename string, src string, budget time.Duration) {
 	t.Run(fmt.Sprintf("syntax file: %v", filename), func(t *testing.T) {
 		errListener := antlr4util.NewErrorListener()
 		lexer := phpparser.NewPHPLexer(antlr.NewInputStream(src))
@@ -81,8 +167,44 @@ func validateSource(t *testing.T, filename string, src string) {
 			t.Fatalf("Lexer failed: %v", errListener.GetErrorString())
 		}
 
-		_, err := php2ssa.Frontend(src, phpTestAntlrCache)
+		cache := nextPHPTestAntlrCache(src)
+
+		start := time.Now()
+		_, err := php2ssa.Frontend(src, cache)
+		elapsed := time.Since(start)
 		require.Nil(t, err, "parse AST FrontEnd error: %v", err)
+		if budget > 0 && elapsed > budget {
+			t.Fatalf("parse AST exceeded budget for %s: elapsed=%s budget=%s", filename, elapsed, budget)
+		}
+	})
+}
+
+func validateSource(t *testing.T, filename string, src string) {
+	validateSourceWithBudget(t, filename, src, phpFixtureParseBudget())
+}
+
+func validateProjectBuild(t *testing.T, filename string, src string) {
+	t.Run(fmt.Sprintf("build file: %v", filename), func(t *testing.T) {
+		vf := filesys.NewVirtualFs()
+		vf.AddFile(filepath.ToSlash(filepath.Join("fixture", filename)), src)
+
+		prog, err := ssaapi.ParseProjectWithFS(
+			vf,
+			ssaapi.WithLanguage(ssaconfig.PHP),
+			ssaapi.WithConcurrency(1),
+		)
+		if errors.Is(err, ssaapi.ErrNoFoundCompiledFile) {
+			singleProg, singleErr := ssaapi.Parse(
+				src,
+				ssaapi.WithLanguage(ssaconfig.PHP),
+				ssaapi.WithProgramName("fixture-"+flattenedProjectFixtureName(filename)),
+			)
+			require.NoError(t, singleErr, "parse/build single-file fixture %s", filename)
+			require.NotNil(t, singleProg, "nil single-file program for %s", filename)
+			return
+		}
+		require.NoError(t, err, "parse/build fixture %s", filename)
+		require.NotNil(t, prog, "nil program for %s", filename)
 	})
 }
 
@@ -94,9 +216,7 @@ func TestAllSyntaxForPHP_G4(t *testing.T) {
 		if d.IsDir() {
 			return nil
 		}
-		switch strings.ToLower(filepath.Ext(syntaxPath)) {
-		case ".php", ".inc":
-		default:
+		if !isSyntaxASTFixture(syntaxPath) {
 			return nil
 		}
 		raw, err := syntaxFs.ReadFile(syntaxPath)
@@ -107,6 +227,103 @@ func TestAllSyntaxForPHP_G4(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err, "walk syntax fixtures")
+}
+
+func TestAllSyntaxProjectBuildForPHP(t *testing.T) {
+	err := fs.WalkDir(syntaxFs, "syntax", func(syntaxPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !isSyntaxASTFixture(syntaxPath) {
+			return nil
+		}
+		raw, err := syntaxFs.ReadFile(syntaxPath)
+		if err != nil {
+			return fmt.Errorf("cannot found syntax fs %s: %w", syntaxPath, err)
+		}
+		validateProjectBuild(t, syntaxPath, string(raw))
+		return nil
+	})
+	require.NoError(t, err, "walk syntax fixtures for project build")
+}
+
+func TestAllLargeSyntaxForPHP_G4(t *testing.T) {
+	if os.Getenv("YAK_PHP_RUN_LARGE_FIXTURES") == "" {
+		t.Skip("set YAK_PHP_RUN_LARGE_FIXTURES=1 to run deferred large PHP syntax fixtures")
+	}
+
+	err := fs.WalkDir(largeSyntaxFs, "large", func(syntaxPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !isSyntaxASTFixture(syntaxPath) {
+			return nil
+		}
+		raw, err := largeSyntaxFs.ReadFile(syntaxPath)
+		if err != nil {
+			return fmt.Errorf("cannot found large syntax fs %s: %w", syntaxPath, err)
+		}
+		validateSourceWithBudget(t, syntaxPath, string(raw), phpLargeFixtureParseBudget())
+		return nil
+	})
+	require.NoError(t, err, "walk large syntax fixtures")
+}
+
+func TestAllLargeSyntaxProjectBuildForPHP(t *testing.T) {
+	if os.Getenv("YAK_PHP_RUN_BUILD_FIXTURES") == "" {
+		t.Skip("set YAK_PHP_RUN_BUILD_FIXTURES=1 to run PHP large syntax fixture project-build checks")
+	}
+	if os.Getenv("YAK_PHP_RUN_LARGE_FIXTURES") == "" {
+		t.Skip("set YAK_PHP_RUN_LARGE_FIXTURES=1 to run deferred large PHP syntax fixtures")
+	}
+
+	err := fs.WalkDir(largeSyntaxFs, "large", func(syntaxPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !isSyntaxASTFixture(syntaxPath) {
+			return nil
+		}
+		raw, err := largeSyntaxFs.ReadFile(syntaxPath)
+		if err != nil {
+			return fmt.Errorf("cannot found large syntax fs %s: %w", syntaxPath, err)
+		}
+		validateProjectBuild(t, syntaxPath, string(raw))
+		return nil
+	})
+	require.NoError(t, err, "walk large syntax fixtures for project build")
+}
+
+func TestSyntaxFixtureCoverage(t *testing.T) {
+	var missing []string
+	err := fs.WalkDir(syntaxFs, "syntax", func(syntaxPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if isSyntaxASTFixture(syntaxPath) {
+			return nil
+		}
+		if _, ok := syntaxNonASTAssets[syntaxPath]; ok {
+			return nil
+		}
+		missing = append(missing, syntaxPath)
+		return nil
+	})
+	require.NoError(t, err)
+	sort.Strings(missing)
+	require.Empty(t, missing, "syntax directory contains files not covered by AST fixtures or explicit non-AST assets: %v", missing)
 }
 
 func TestSyntax_(t *testing.T) {
@@ -263,84 +480,48 @@ func TestPHPBackQuoteWithEscapedBacktick(t *testing.T) {
 	validateSource(t, "backquote-escaped-backtick", "<?php $key = trim(`KEY=\\`dd count=1 2>/dev/null\\`; echo \\$KEY`);")
 }
 
-type ParseError struct {
-	Duration time.Duration
-	Message  string
+func TestPHPUseFunctionDefineDefinedImport(t *testing.T) {
+	validateSource(t, "use-function-define-defined-import", `<?php
+namespace Grav\Common;
+
+use function define;
+use function defined;
+
+if (!defined('GRAV_REQUEST_TIME')) {
+	define('GRAV_REQUEST_TIME', microtime(true));
+}
+`)
 }
 
-func phpProjectASTRoot(t *testing.T) string {
-	t.Helper()
-
-	if root := os.Getenv("YAK_PHP_PROJECT_AST_TARGET"); root != "" {
-		return root
+func TestPHPDefineMethodAndQualifiedCall(t *testing.T) {
+	validateSource(t, "define-method-and-qualified-call", `<?php
+class YamlUpdater {
+	public function define(string $variable, $value): void {
 	}
-
-	home, err := os.UserHomeDir()
-	require.NoError(t, err)
-	return filepath.Join(home, "Target", "pfsense")
 }
 
-func TestProjectAst(t *testing.T) {
-	if os.Getenv("YAK_PHP_RUN_PROJECT_AST") == "" {
-		t.Skip("set YAK_PHP_RUN_PROJECT_AST=1 to run local pfsense project AST integration")
-	}
+\define('GRAV_CLI', true);
+if (\defined('GRAV_CLI')) {
+	$yaml = new YamlUpdater();
+	$yaml->define('twig.autoescape', false);
+}
+`)
+}
 
-	path := phpProjectASTRoot(t)
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("project ast target unavailable: %s: %v", path, err)
-	}
+func TestPHPStaticPropertyNestedIndexAssignment(t *testing.T) {
+	validateSource(t, "static-property-nested-index-assignment", `<?php
+class NonceStore {
+	protected static $nonces = [];
 
-	errorFiles := make(map[string]*ssareducer.FileContent)
-
-	fileList := make([]string, 0, 100)
-	fileMap := make(map[string]struct{})
-
-	refFs := filesys.NewRelLocalFs(path)
-	filesys.Recursive(".",
-		filesys.WithFileSystem(refFs),
-		filesys.WithDirStat(func(s string, fi fs.FileInfo) error {
-			if s == ".git" {
-				return fs.SkipDir
-			}
-			return nil
-		}),
-		filesys.WithFileStat(func(filePath string, fi fs.FileInfo) error {
-			extern := filepath.Ext(filePath)
-			if extern == ".php" || extern == ".inc" {
-				fileList = append(fileList, filePath)
-				fileMap[filePath] = struct{}{}
-				return nil
-			}
-			return nil
-		}),
-	)
-	log.Errorf("file to parse: %+v", fileList)
-
-	config, err := ssaapi.DefaultConfig(
-		ssaapi.WithFileSystem(refFs),
-		ssaapi.WithLanguage(ssaconfig.PHP),
-	)
-	require.NoError(t, err)
-	require.NotNil(t, config)
-
-	start := time.Now()
-	ch := config.GetFileHandler(
-		refFs, fileList, fileMap,
-	)
-
-	for fileContent := range ch {
-		log.Errorf("file parse: %s: size[%s] time: %s", fileContent.Path, ssaapi.Size(len(fileContent.Content)), fileContent.Duration)
-		if fileContent.Err != nil {
-			errorFiles[fileContent.Path] = fileContent
+	public static function getNonce($action, $previousTick = false) {
+		if (isset(static::$nonces[$action][$previousTick])) {
+			return static::$nonces[$action][$previousTick];
 		}
+		$nonce = md5($action);
+		static::$nonces[$action][$previousTick] = $nonce;
+
+		return static::$nonces[$action][$previousTick];
 	}
-	end := time.Since(start)
-	log.Infof("Total parse %d files cost: %v", len(fileMap), end)
-	failedFiles := make([]string, 0, len(errorFiles))
-	for fname, fc := range errorFiles {
-		failedFiles = append(failedFiles, fname)
-		log.Errorf("Parse file %s failed: %v", fname, fc.Err)
-	}
-	sort.Strings(failedFiles)
-	require.Empty(t, failedFiles, "project AST parse failed for %d files under %s: %v", len(failedFiles), path, failedFiles)
+}
+`)
 }

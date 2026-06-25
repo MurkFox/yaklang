@@ -34,7 +34,35 @@ func strVisible(key string) bool {
 	return true
 }
 
-// fuzz
+// Strings 使用 fuzztag 渲染规则，将一个模板字符串展开成一组字符串结果
+// 参数:
+//   - i: 含 fuzztag 的模板（如 "{{i(1-3)}}"），也可以是普通字符串
+//
+// 返回值:
+//   - 渲染展开后的字符串列表
+//
+// <|EXAMPLE_START|> 示例：fuzz.Strings 的基本用法(整数范围展开)
+// ```
+// // 关键词: fuzz.Strings, fuzztag, 整数范围
+// // {{int(a-b)}} 把闭区间内每个整数都展开成一个结果, 常用于遍历 id/页码等
+// results = fuzz.Strings("id={{int(1-3)}}")
+// println(results)   // 预期输出: [id=1 id=2 id=3]
+// assert len(results) == 3, "int(1-3) should expand to 3 results"
+// ```
+// <|EXAMPLE_END|>
+// <|EXAMPLE_START|> 示例：fuzz.Strings 的列表与笛卡尔组合
+// ```
+// // 关键词: fuzz.Strings, list, 笛卡尔积
+// // {{list(a|b|c)}} 按 | 分隔逐项展开
+// single = fuzz.Strings("{{list(admin|root|guest)}}")
+// println(single)    // 预期输出: [admin root guest]
+// assert len(single) == 3, "list should expand to 3 payloads"
+// // 同一模板里有多个 fuzztag 时, 各标签的结果做笛卡尔积组合
+// combo = fuzz.Strings("{{int(1-2)}}-{{list(x|y)}}") // 2 x 2 = 4 种组合
+// println(combo)     // 预期输出: [1-x 2-x 1-y 2-y]
+// assert len(combo) == 4, "two tags should form a cartesian product"
+// ```
+// <|EXAMPLE_END|>
 func _fuzz(i interface{}) []string {
 	res := mutate.InterfaceToFuzzResults(i)
 	if res != nil {
@@ -43,6 +71,20 @@ func _fuzz(i interface{}) []string {
 	return []string{fmt.Sprint(i)}
 }
 
+// StringsWithParam 使用 fuzztag 渲染模板，并允许传入额外的命名参数表参与渲染
+// 参数:
+//   - i: 含 fuzztag 的模板字符串
+//   - i2: 额外参数表（map），可被模板中的 {{params(...)}} 等标签引用
+//
+// 返回值:
+//   - 渲染展开后的字符串列表
+//
+// Example:
+// ```
+// results = fuzz.StringsWithParam("{{params(p)}}", {"p": "abc"})
+// println(results)   // OUT: [abc]
+// assert results[0] == "abc", "param p should be rendered into result"
+// ```
 func _fuzzFuncEx(i interface{}, i2 interface{}) []string {
 	res, _ := mutate.QuickMutate(
 		utils.InterfaceToString(i),
@@ -56,6 +98,20 @@ func _fuzzFuncEx(i interface{}, i2 interface{}) []string {
 	return []string{utils.InterfaceToString(i)}
 }
 
+// UrlToHTTPRequest 根据请求方法与 URL 构造一个 HTTP Fuzz 请求对象，便于后续做参数变形与发包
+// 参数:
+//   - method: 请求方法，如 "GET"、"POST"
+//   - i: 目标 URL
+//
+// 返回值:
+//   - 构造好的 HTTP Fuzz 请求对象
+//   - 错误信息，URL 解析失败时返回非空
+//
+// Example:
+// ```
+// freq = fuzz.UrlToHTTPRequest("GET", "https://www.example.com/a?b=1")~
+// freq.Show()
+// ```
 func _urlToFuzzRequest(method string, i interface{}) (*mutate.FuzzHTTPRequest, error) {
 	https, reqBytes, err := lowhttp.ParseUrlToHttpRequestRaw(method, i)
 	if err != nil {
@@ -64,6 +120,23 @@ func _urlToFuzzRequest(method string, i interface{}) (*mutate.FuzzHTTPRequest, e
 	return mutate.NewFuzzHTTPRequest(reqBytes, mutate.OptHTTPS(https))
 }
 
+// StringsFunc 使用 fuzztag 渲染模板，并为每个渲染结果回调一次，便于流式处理大量结果
+// 参数:
+//   - i: 含 fuzztag 的模板字符串
+//   - cb: 针对每个渲染结果触发的回调函数，参数为单个变形结果
+//   - params: 可选的额外参数表，参与模板渲染
+//
+// 返回值:
+//   - 错误信息，渲染失败时返回非空
+//
+// Example:
+// ```
+//
+//	fuzz.StringsFunc("{{i(1-3)}}", func(result) {
+//	    println(result.Result)
+//	})~
+//
+// ```
 func _fuzzFunc(i interface{}, cb func(i *mutate.MutateResult), params ...interface{}) error {
 	var res = make(map[string][]string)
 	for _, i := range params {
@@ -526,6 +599,19 @@ func _protobufRecordFromBytes(b []byte) ([]byte, []*ProtobufRecord, error) {
 	return b, records, nil
 }
 
+// ProtobufBytes 解析 Protobuf 编码的字节流，返回可读取/变形的 Protobuf 记录集合对象
+// 参数:
+//   - i: Protobuf 编码的字节流（字符串或字节数组）
+//
+// 返回值:
+//   - Protobuf 记录集合对象，可用于查看与 fuzz 变形
+//
+// Example:
+// ```
+// // 解析 protobuf 字节流并打印结构，此处仅作示意
+// records = fuzz.ProtobufBytes(raw)
+// println(records.String())
+// ```
 func _protobufRecordsFromBytes(i interface{}) *ProtobufRecords {
 	var (
 		b = utils.InterfaceToBytes(i)
@@ -550,6 +636,19 @@ func _protobufRecordsFromBytes(i interface{}) *ProtobufRecords {
 	return newRecords
 }
 
+// ProtobufHex 解析十六进制字符串表示的 Protobuf 编码数据，返回可读取/变形的 Protobuf 记录集合对象
+// 参数:
+//   - i: 十六进制编码的 Protobuf 数据字符串
+//
+// 返回值:
+//   - Protobuf 记录集合对象，可用于查看与 fuzz 变形
+//
+// Example:
+// ```
+// // 解析 hex 形式的 protobuf 数据，此处仅作示意
+// records = fuzz.ProtobufHex("0a0568656c6c6f")
+// println(records.String())
+// ```
 func _protobufRecordsFromHex(i interface{}) *ProtobufRecords {
 	var records *ProtobufRecords
 
@@ -565,6 +664,19 @@ func _protobufRecordsFromHex(i interface{}) *ProtobufRecords {
 	return records
 }
 
+// ProtobufJSON 从 JSON 描述还原 Protobuf 记录集合对象（与 ProtobufRecords.ToJSON 互逆）
+// 参数:
+//   - i: 描述 Protobuf 记录的 JSON 字符串
+//
+// 返回值:
+//   - Protobuf 记录集合对象，可用于序列化回字节流或 fuzz 变形
+//
+// Example:
+// ```
+// // 从 JSON 还原 protobuf 记录，此处仅作示意
+// records = fuzz.ProtobufJSON(jsonStr)
+// println(records.ToHex())
+// ```
 func _protobufRecordsFromJSON(i interface{}) *ProtobufRecords {
 	records := newProtobufRecords()
 	b := utils.InterfaceToBytes(i)
@@ -575,6 +687,19 @@ func _protobufRecordsFromJSON(i interface{}) *ProtobufRecords {
 	return records
 }
 
+// ProtobufYAML 从 YAML 描述还原 Protobuf 记录集合对象（与 ProtobufRecords.ToYAML 互逆）
+// 参数:
+//   - i: 描述 Protobuf 记录的 YAML 字符串
+//
+// 返回值:
+//   - Protobuf 记录集合对象，可用于序列化回字节流或 fuzz 变形
+//
+// Example:
+// ```
+// // 从 YAML 还原 protobuf 记录，此处仅作示意
+// records = fuzz.ProtobufYAML(yamlStr)
+// println(records.ToHex())
+// ```
 func _protobufRecordsFromYAML(i interface{}) *ProtobufRecords {
 	records := newProtobufRecords()
 	b := utils.InterfaceToBytes(i)

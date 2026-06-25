@@ -2,6 +2,9 @@ package aibalance
 
 import (
 	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jinzhu/gorm"
@@ -9,16 +12,37 @@ import (
 	"github.com/yaklang/yaklang/common/schema"
 )
 
+// coreTablesMigrateOnce 保证 aibalance 专属基础表（原 schema.ProfileTables 中的
+// AiProvider/AiApiKeys/LoginSession/OpsUser/OpsActionLog）在首次访问 DB 时一定被迁移。
+// 这些类型已从全局 schema.ProfileTables 搬回本包，全局自动迁移不再覆盖它们，
+// 这里用 Once 恢复「访问即存在」的旧保证，且不污染普通 yak 用户的 profile 库。
+// 关键词: aibalance 核心表自治迁移, GetDB Once 迁移, 不进 ProfileTables
+var coreTablesMigrateOnce sync.Once
+
 func GetDB() *gorm.DB {
-	return schema.GetGormProfileDatabase()
+	db := schema.GetGormProfileDatabase()
+	if db != nil {
+		coreTablesMigrateOnce.Do(func() {
+			if err := db.AutoMigrate(
+				&AiProvider{},
+				&AiApiKeys{},
+				&LoginSession{},
+				&OpsUser{},
+				&OpsActionLog{},
+			).Error; err != nil {
+				log.Warnf("auto-migrate aibalance core tables failed: %v", err)
+			}
+		})
+	}
+	return db
 }
 
-func SaveAiProvider(provider *schema.AiProvider) error {
+func SaveAiProvider(provider *AiProvider) error {
 	return GetDB().Create(provider).Error
 }
 
-func GetOrCreateAiProvider(provider *schema.AiProvider) (*schema.AiProvider, error) {
-	var existingProvider schema.AiProvider
+func GetOrCreateAiProvider(provider *AiProvider) (*AiProvider, error) {
+	var existingProvider AiProvider
 	if err := GetDB().Where("wrapper_name = ? AND model_name = ? AND api_key = ?",
 		provider.WrapperName, provider.ModelName, provider.APIKey).First(&existingProvider).Error; err != nil {
 		// If record not found, create a new one
@@ -31,8 +55,8 @@ func GetOrCreateAiProvider(provider *schema.AiProvider) (*schema.AiProvider, err
 	return &existingProvider, nil
 }
 
-func GetAllAiProviders() ([]*schema.AiProvider, error) {
-	var providers []*schema.AiProvider
+func GetAllAiProviders() ([]*AiProvider, error) {
+	var providers []*AiProvider
 	if err := schema.GetGormProfileDatabase().Find(&providers).Error; err != nil {
 		return nil, err
 	}
@@ -40,8 +64,8 @@ func GetAllAiProviders() ([]*schema.AiProvider, error) {
 }
 
 // GetAiProvidersByModelName gets all providers with specified model name (WrapperName) from database
-func GetAiProvidersByModelName(modelName string) ([]*schema.AiProvider, error) {
-	var providers []*schema.AiProvider
+func GetAiProvidersByModelName(modelName string) ([]*AiProvider, error) {
+	var providers []*AiProvider
 	if err := GetDB().Where("wrapper_name = ?", modelName).Find(&providers).Error; err != nil {
 		return nil, err
 	}
@@ -49,8 +73,8 @@ func GetAiProvidersByModelName(modelName string) ([]*schema.AiProvider, error) {
 }
 
 // GetAiProvidersByModelType gets all providers with specified model type (TypeName) from database
-func GetAiProvidersByModelType(typeName string) ([]*schema.AiProvider, error) {
-	var providers []*schema.AiProvider
+func GetAiProvidersByModelType(typeName string) ([]*AiProvider, error) {
+	var providers []*AiProvider
 	if err := GetDB().Where("type_name = ?", typeName).Find(&providers).Error; err != nil {
 		return nil, err
 	}
@@ -64,9 +88,9 @@ func GetAiProvidersByModelType(typeName string) ([]*schema.AiProvider, error) {
 // domainOrUrl: API domain or URL
 // apiKey: API key
 // noHTTPS: whether to disable HTTPS
-func RegisterAiProvider(wrapperName, modelName, typeName, domainOrUrl, apiKey string, noHTTPS bool) (*schema.AiProvider, error) {
+func RegisterAiProvider(wrapperName, modelName, typeName, domainOrUrl, apiKey string, noHTTPS bool) (*AiProvider, error) {
 	// Create provider object
-	provider := &schema.AiProvider{
+	provider := &AiProvider{
 		WrapperName:           wrapperName,
 		ModelName:             modelName,
 		TypeName:              typeName,
@@ -85,7 +109,7 @@ func RegisterAiProvider(wrapperName, modelName, typeName, domainOrUrl, apiKey st
 	}
 
 	// Check if provider with same details exists
-	var existingProvider schema.AiProvider
+	var existingProvider AiProvider
 	if err := GetDB().Where("wrapper_name = ? AND model_name = ? AND api_key = ?",
 		wrapperName, modelName, apiKey).First(&existingProvider).Error; err == nil {
 		// If exists, return existing provider
@@ -104,13 +128,13 @@ func RegisterAiProvider(wrapperName, modelName, typeName, domainOrUrl, apiKey st
 	return provider, nil
 }
 
-func UpdateAiProvider(provider *schema.AiProvider) error {
+func UpdateAiProvider(provider *AiProvider) error {
 	return GetDB().Save(provider).Error
 }
 
 // SaveAiApiKey saves API key to database
 func SaveAiApiKey(apiKey string, allowedModels string) error {
-	key := &schema.AiApiKeys{
+	key := &AiApiKeys{
 		APIKey:        apiKey,
 		AllowedModels: allowedModels,
 		InputBytes:    0,
@@ -124,8 +148,8 @@ func SaveAiApiKey(apiKey string, allowedModels string) error {
 }
 
 // GetAiApiKey gets database record by API key
-func GetAiApiKey(apiKey string) (*schema.AiApiKeys, error) {
-	var key schema.AiApiKeys
+func GetAiApiKey(apiKey string) (*AiApiKeys, error) {
+	var key AiApiKeys
 	if err := GetDB().Where("api_key = ?", apiKey).First(&key).Error; err != nil {
 		return nil, err
 	}
@@ -133,8 +157,8 @@ func GetAiApiKey(apiKey string) (*schema.AiApiKeys, error) {
 }
 
 // GetAllAiApiKeys gets all API keys
-func GetAllAiApiKeys() ([]*schema.AiApiKeys, error) {
-	var keys []*schema.AiApiKeys
+func GetAllAiApiKeys() ([]*AiApiKeys, error) {
+	var keys []*AiApiKeys
 	if err := GetDB().Find(&keys).Error; err != nil {
 		return nil, err
 	}
@@ -143,18 +167,51 @@ func GetAllAiApiKeys() ([]*schema.AiApiKeys, error) {
 
 // DeleteAiApiKey deletes API key
 func DeleteAiApiKey(apiKey string) error {
-	return GetDB().Where("api_key = ?", apiKey).Delete(&schema.AiApiKeys{}).Error
+	return GetDB().Where("api_key = ?", apiKey).Delete(&AiApiKeys{}).Error
 }
 
 // UpdateAiApiKey updates allowed models for API key
 func UpdateAiApiKey(apiKey string, allowedModels string) error {
-	return GetDB().Model(&schema.AiApiKeys{}).Where("api_key = ?", apiKey).
+	return GetDB().Model(&AiApiKeys{}).Where("api_key = ?", apiKey).
 		Update("allowed_models", allowedModels).Error
 }
 
+// SaveAiApiKeyRecord 直接落库一条完整 API Key 记录（含 Username/Remark/MetaInfo 等扩展字段）。
+// 与 SaveAiApiKey 的区别：后者只支持 api_key + allowed_models，本函数支持任意字段。
+// 关键词: SaveAiApiKeyRecord, API Key 创建携带 Username Remark MetaInfo
+func SaveAiApiKeyRecord(key *AiApiKeys) error {
+	if key == nil {
+		return fmt.Errorf("SaveAiApiKeyRecord: key is nil")
+	}
+	if key.LastUsedTime.IsZero() {
+		key.LastUsedTime = time.Now()
+	}
+	return GetDB().Create(key).Error
+}
+
+// UpdateAiApiKeyMeta 更新 API Key 的用户绑定与管理元信息字段。
+// 仅更新 username/remark/metainfo 三个字段，其他统计/限额字段保持不变。
+// 关键词: UpdateAiApiKeyMeta, 更新 Username Remark MetaInfo
+func UpdateAiApiKeyMeta(id uint, username, remark, metainfo string) error {
+	// 注意：GORM v1 默认按字段名 snake_case 推导列名，MetaInfo -> meta_info（而非 json tag 的 metainfo）。
+	// 关键词: UpdateAiApiKeyMeta 列名 meta_info, GORM 默认列名推导
+	result := GetDB().Model(&AiApiKeys{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"username":  strings.TrimSpace(username),
+		"remark":    remark,
+		"meta_info": metainfo,
+	})
+	if result.Error != nil {
+		return fmt.Errorf("failed to update API key meta: %v", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("API key not found: id=%d", id)
+	}
+	return nil
+}
+
 // GetAiProviderByID gets single AI provider by ID
-func GetAiProviderByID(id uint) (*schema.AiProvider, error) {
-	var provider schema.AiProvider
+func GetAiProviderByID(id uint) (*AiProvider, error) {
+	var provider AiProvider
 	if err := GetDB().Where("id = ?", id).First(&provider).Error; err != nil {
 		return nil, err
 	}
@@ -170,7 +227,7 @@ func DeleteAiProviderByID(id uint) error {
 	}
 
 	// Execute delete operation
-	if err := GetDB().Delete(&schema.AiProvider{}, id).Error; err != nil {
+	if err := GetDB().Delete(&AiProvider{}, id).Error; err != nil {
 		return fmt.Errorf("Failed to delete provider: %v", err)
 	}
 
@@ -188,7 +245,7 @@ func DeleteAiProviderByID(id uint) error {
 // success：请求是否成功
 func UpdateAiApiKeyStats(apiKey string, inputBytes, outputBytes int64, success bool) error {
 	// 获取数据库中的 API Key 记录
-	var key schema.AiApiKeys
+	var key AiApiKeys
 	if err := GetDB().Where("api_key = ?", apiKey).First(&key).Error; err != nil {
 		return fmt.Errorf("Failed to find API key: %v", err)
 	}
@@ -211,7 +268,7 @@ func UpdateAiApiKeyStats(apiKey string, inputBytes, outputBytes int64, success b
 
 // IncrementAiApiKeyWebSearchCount increments the web search usage count for an API key
 func IncrementAiApiKeyWebSearchCount(apiKey string) error {
-	return GetDB().Model(&schema.AiApiKeys{}).Where("api_key = ?", apiKey).
+	return GetDB().Model(&AiApiKeys{}).Where("api_key = ?", apiKey).
 		UpdateColumn("web_search_count", gorm.Expr("web_search_count + ?", 1)).Error
 }
 
@@ -224,13 +281,13 @@ func UpdateFreeUserStats(inputBytes, outputBytes int64, success bool) error {
 	const freeUserKey = "free-user"
 
 	// 尝试获取 free-user 记录
-	var key schema.AiApiKeys
+	var key AiApiKeys
 	err := GetDB().Where("api_key = ?", freeUserKey).First(&key).Error
 
 	if err != nil {
 		if gorm.IsRecordNotFoundError(err) {
 			// 创建 free-user 记录
-			key = schema.AiApiKeys{
+			key = AiApiKeys{
 				APIKey:        freeUserKey,
 				AllowedModels: "*-free", // 允许所有免费模型
 				InputBytes:    0,
@@ -268,7 +325,7 @@ func UpdateFreeUserStats(inputBytes, outputBytes int64, success bool) error {
 
 // UpdateAiApiKeyStatus 更新单个 API Key 的激活状态
 func UpdateAiApiKeyStatus(id uint, active bool) error {
-	result := GetDB().Model(&schema.AiApiKeys{}).Where("id = ?", id).Update("active", active)
+	result := GetDB().Model(&AiApiKeys{}).Where("id = ?", id).Update("active", active)
 	if result.Error != nil {
 		return fmt.Errorf("failed to update status for API key ID %d: %w", id, result.Error)
 	}
@@ -289,7 +346,7 @@ func BatchUpdateAiApiKeyStatus(ids []uint, active bool) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil // 没有 ID 需要更新
 	}
-	result := GetDB().Model(&schema.AiApiKeys{}).Where("id IN (?)", ids).Update("active", active)
+	result := GetDB().Model(&AiApiKeys{}).Where("id IN (?)", ids).Update("active", active)
 	if result.Error != nil {
 		return 0, fmt.Errorf("failed to batch update status for %d API keys: %w", len(ids), result.Error)
 	}
@@ -303,7 +360,7 @@ func BatchUpdateAiApiKeyStatus(ids []uint, active bool) (int64, error) {
 
 // UpdateAiApiKeyAllowedModels updates allowed models for API key by ID
 func UpdateAiApiKeyAllowedModels(id uint, allowedModels string) error {
-	result := GetDB().Model(&schema.AiApiKeys{}).Where("id = ?", id).
+	result := GetDB().Model(&AiApiKeys{}).Where("id = ?", id).
 		Update("allowed_models", allowedModels)
 
 	if result.Error != nil {
@@ -318,12 +375,24 @@ func UpdateAiApiKeyAllowedModels(id uint, allowedModels string) error {
 }
 
 // AiModelMeta stores metadata for a model (WrapperName)
+//
+// Token 倍率四维（input/output/cache_create/cache_hit）于本批次新增，
+// 用于精确控制免费用户 Token 限额扣费、付费 key Token 累加。
+// 兼容策略：当任一新字段为 0/缺省，回落到老 TrafficMultiplier；
+// 老 TrafficMultiplier 同样为 0 时按 1.0 兜底，旧版数据不破坏。
+// 关键词: AiModelMeta Token 倍率, 多维倍率, dashscope cache_creation, cache_hit
 type AiModelMeta struct {
 	gorm.Model
-	ModelName         string  `gorm:"uniqueIndex;not null"`  // The platform model name (WrapperName)
+	ModelName         string  `gorm:"uniqueIndex;not null"` // The platform model name (WrapperName)
 	Description       string  `gorm:"type:text"`
-	Tags              string  `gorm:"type:text"`             // Comma-separated tags or JSON
-	TrafficMultiplier float64 `gorm:"default:1.0"`           // Traffic consumption multiplier, default 1.0
+	Tags              string  `gorm:"type:text"`   // Comma-separated tags or JSON
+	TrafficMultiplier float64 `gorm:"default:1.0"` // 老字段：字节流量倍数（已停用，DB 列保留兼容）
+
+	// 四维 Token 倍率（与上游 SSE 末帧 ChatUsage 字段一一对应）
+	InputTokenMultiplier    float64 `gorm:"default:0"` // 输入 token 倍率（=prompt_tokens - cached - cache_create）
+	OutputTokenMultiplier   float64 `gorm:"default:0"` // 输出 token 倍率（=completion_tokens）
+	CacheCreationMultiplier float64 `gorm:"default:0"` // 缓存创建倍率（=cache_creation_input_tokens，dashscope 显式缓存）
+	CacheHitMultiplier      float64 `gorm:"default:0"` // 缓存命中倍率（=cached_tokens）
 }
 
 // EnsureModelMetaTable ensures the AiModelMeta table exists
@@ -336,13 +405,31 @@ func SaveModelMeta(modelName, description, tags string) error {
 	return SaveModelMetaWithMultiplier(modelName, description, tags, -1) // -1 means don't update multiplier
 }
 
-// SaveModelMetaWithMultiplier saves or updates model metadata with traffic multiplier
+// SaveModelMetaWithMultiplier saves or updates model metadata with traffic multiplier.
+// 老接口保留作为薄包装：仅写老 TrafficMultiplier，不动新四维倍率。
+// 关键词: SaveModelMetaWithMultiplier 兼容包装
 func SaveModelMetaWithMultiplier(modelName, description, tags string, trafficMultiplier float64) error {
+	return SaveModelMetaWithMultipliers(modelName, description, tags, trafficMultiplier, -1, -1, -1, -1)
+}
+
+// SaveModelMetaWithMultipliers saves or updates model metadata with both legacy traffic
+// multiplier and four-dimensional Token multipliers. Pass -1 for any multiplier to skip
+// updating that specific field (creation will use 0/default).
+//
+// 入参语义：
+//   - trafficMultiplier < 0  -> 不更新老 TrafficMultiplier；新建时按 1.0
+//   - input/output/cacheCreate/cacheHit < 0  -> 不更新该维度；新建时按 0
+//
+// 关键词: SaveModelMetaWithMultipliers, 四维 Token 倍率写库
+func SaveModelMetaWithMultipliers(
+	modelName, description, tags string,
+	trafficMultiplier float64,
+	inputMul, outputMul, cacheCreateMul, cacheHitMul float64,
+) error {
 	var meta AiModelMeta
 	err := GetDB().Where("model_name = ?", modelName).First(&meta).Error
 	if err != nil {
 		if gorm.IsRecordNotFoundError(err) {
-			// Create new
 			multiplier := 1.0
 			if trafficMultiplier >= 0 {
 				multiplier = trafficMultiplier
@@ -353,16 +440,39 @@ func SaveModelMetaWithMultiplier(modelName, description, tags string, trafficMul
 				Tags:              tags,
 				TrafficMultiplier: multiplier,
 			}
+			if inputMul >= 0 {
+				meta.InputTokenMultiplier = inputMul
+			}
+			if outputMul >= 0 {
+				meta.OutputTokenMultiplier = outputMul
+			}
+			if cacheCreateMul >= 0 {
+				meta.CacheCreationMultiplier = cacheCreateMul
+			}
+			if cacheHitMul >= 0 {
+				meta.CacheHitMultiplier = cacheHitMul
+			}
 			return GetDB().Create(&meta).Error
 		}
 		return err
 	}
 
-	// Update existing
 	meta.Description = description
 	meta.Tags = tags
 	if trafficMultiplier >= 0 {
 		meta.TrafficMultiplier = trafficMultiplier
+	}
+	if inputMul >= 0 {
+		meta.InputTokenMultiplier = inputMul
+	}
+	if outputMul >= 0 {
+		meta.OutputTokenMultiplier = outputMul
+	}
+	if cacheCreateMul >= 0 {
+		meta.CacheCreationMultiplier = cacheCreateMul
+	}
+	if cacheHitMul >= 0 {
+		meta.CacheHitMultiplier = cacheHitMul
 	}
 	return GetDB().Save(&meta).Error
 }
@@ -426,11 +536,304 @@ func GetAllModelMetas() (map[string]*AiModelMeta, error) {
 	return result, nil
 }
 
+// ==================== Model Multiplier (实际模型计费) / Global Default ====================
+//
+// 计费以「实际模型(内部转发名 InternalModelName)」为唯一标识：同一个实际模型无论被哪个
+// 对外 wrapper 暴露，单价都一致。这是 APIKEY 付费系统计费准确的基础。计费时逐维回落
+// （见 cost_calc.go ResolveModelMultipliers）：
+//
+//	实际模型倍率(InternalModelName) -> 全局默认 -> 系统常量
+//
+// wrapper(AiModelMeta) 级别的倍率不再参与计费，仅保留描述/标签/老 TrafficMultiplier 兼容字段。
+//
+// 关键词: 实际模型计费, 内部转发名, 分层兜底, 批量应用
+
+// AiModelMultiplier 是「实际模型(内部转发名 InternalModelName)」维度的四维 Token 倍率。
+// 这是计费的主维度：优先级高于全局默认，低于则回落全局默认/系统常量。
+//
+// 回落策略（逐维，见 ResolveModelMultipliers）：
+//   - 某维 > 0  -> 采用本表该维
+//   - 某维 <= 0 -> 回落到 全局默认 -> 系统常量
+//
+// 关键词: AiModelMultiplier, 实际模型倍率, 内部转发名唯一, 逐维回落
+type AiModelMultiplier struct {
+	gorm.Model
+	InternalModelName string `gorm:"size:128;unique_index:idx_model_multiplier;not null"` // 内部转发给上游的真实模型名（计费唯一标识）
+
+	InputTokenMultiplier    float64 `gorm:"default:0"` // 输入 token 倍率（0 表示回落下一层）
+	OutputTokenMultiplier   float64 `gorm:"default:0"` // 输出 token 倍率
+	CacheCreationMultiplier float64 `gorm:"default:0"` // 缓存创建倍率
+	CacheHitMultiplier      float64 `gorm:"default:0"` // 缓存命中倍率
+
+	// IsFree 把该实际模型标记为「计费豁免」：开启后无论四维倍率如何设置，
+	// ComputeModelWeightedTokens 一律返回 0，免费用户日桶、付费 key Token、
+	// 付费用户全局日 Token 三道计费都因 weighted=0 而自动豁免。
+	// 这是替代旧 config per-model exempt 的统一计费豁免开关，便于用户理解「免费模型」。
+	// 关键词: AiModelMultiplier IsFree, 实际模型免费计费豁免, 倍率失效
+	IsFree bool `gorm:"default:false"` // true=该实际模型完全免费（不计费）
+}
+
+func (a *AiModelMultiplier) TableName() string {
+	return "ai_model_multipliers"
+}
+
+// AiModelMultiplierConfig 是全局默认四维 Token 倍率的单例配置（ID=1）。
+// 当实际模型层缺该维时，回落到这里；本表也缺则用系统常量。
+// 关键词: AiModelMultiplierConfig, 全局默认倍率, singleton ID=1
+type AiModelMultiplierConfig struct {
+	gorm.Model
+	InputTokenMultiplier    float64 `gorm:"default:0"`
+	OutputTokenMultiplier   float64 `gorm:"default:0"`
+	CacheCreationMultiplier float64 `gorm:"default:0"`
+	CacheHitMultiplier      float64 `gorm:"default:0"`
+}
+
+func (a *AiModelMultiplierConfig) TableName() string {
+	return "ai_model_multiplier_configs"
+}
+
+// EnsureModelMultiplierTable ensures the AiModelMultiplier table exists.
+func EnsureModelMultiplierTable() error {
+	return GetDB().AutoMigrate(&AiModelMultiplier{}).Error
+}
+
+// EnsureModelMultiplierConfigTable ensures the AiModelMultiplierConfig table exists.
+func EnsureModelMultiplierConfigTable() error {
+	return GetDB().AutoMigrate(&AiModelMultiplierConfig{}).Error
+}
+
+// GetModelMultiplier retrieves the multiplier for an actual model (internalModelName);
+// returns (nil, nil) when not found.
+// 关键词: GetModelMultiplier, 实际模型倍率读取
+func GetModelMultiplier(internalModelName string) (*AiModelMultiplier, error) {
+	var m AiModelMultiplier
+	err := GetDB().Where("internal_model_name = ?", internalModelName).First(&m).Error
+	if err != nil {
+		if gorm.IsRecordNotFoundError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &m, nil
+}
+
+// SaveModelMultiplier upserts the four-dimensional multiplier for an actual model
+// (internalModelName). Pass a value < 0 to skip updating that specific dimension
+// (creation uses 0 for skipped fields). The IsFree flag is left unchanged on update
+// and defaults to false on creation; use SaveModelMultiplierWithFree to control it.
+// 关键词: SaveModelMultiplier, 实际模型倍率 upsert
+func SaveModelMultiplier(internalModelName string, inputMul, outputMul, cacheCreateMul, cacheHitMul float64) error {
+	return SaveModelMultiplierWithFree(internalModelName, inputMul, outputMul, cacheCreateMul, cacheHitMul, -1)
+}
+
+// SaveModelMultiplierWithFree upserts the four-dimensional multiplier plus the IsFree flag
+// for an actual model (internalModelName).
+//
+// 入参语义：
+//   - input/output/cacheCreate/cacheHit < 0 -> 不更新该维度；新建时按 0
+//   - isFree < 0  -> 不更新 IsFree（新建时按 false）；isFree == 0 -> false；isFree >= 1 -> true
+//
+// 关键词: SaveModelMultiplierWithFree, 实际模型倍率 + IsFree upsert, 免费计费豁免写库
+func SaveModelMultiplierWithFree(internalModelName string, inputMul, outputMul, cacheCreateMul, cacheHitMul float64, isFree int) error {
+	if internalModelName == "" {
+		return fmt.Errorf("internalModelName is required")
+	}
+	// 用 Unscoped 查找：连「软删除残留行」也命中。
+	// 否则之前对该模型执行过「清除」(旧实现是 GORM 软删除，仅置 deleted_at) 后，
+	// 默认作用域的 First 查不到它，于是走 Create；而库级 UNIQUE 索引 idx_model_multiplier
+	// 并不区分 deleted_at，残留行仍占用 internal_model_name 唯一键，导致
+	// "UNIQUE constraint failed: ai_model_multipliers.internal_model_name"。
+	// 这里命中残留行后直接复活并按「新建基线」重置，自愈历史脏数据。
+	// 关键词: SaveModelMultiplierWithFree Unscoped 复活软删除行, UNIQUE constraint 自愈
+	var m AiModelMultiplier
+	err := GetDB().Unscoped().Where("internal_model_name = ?", internalModelName).First(&m).Error
+	if err != nil && !gorm.IsRecordNotFoundError(err) {
+		return err
+	}
+	if gorm.IsRecordNotFoundError(err) {
+		m = AiModelMultiplier{InternalModelName: internalModelName}
+	} else if m.DeletedAt != nil {
+		// 命中软删除残留行：清空 deleted_at 复活，并按新建基线归零四维 + IsFree，
+		// 避免沿用历史脏值（与全新建表语义一致）。
+		m.DeletedAt = nil
+		m.InputTokenMultiplier = 0
+		m.OutputTokenMultiplier = 0
+		m.CacheCreationMultiplier = 0
+		m.CacheHitMultiplier = 0
+		m.IsFree = false
+	}
+	if inputMul >= 0 {
+		m.InputTokenMultiplier = inputMul
+	}
+	if outputMul >= 0 {
+		m.OutputTokenMultiplier = outputMul
+	}
+	if cacheCreateMul >= 0 {
+		m.CacheCreationMultiplier = cacheCreateMul
+	}
+	if cacheHitMul >= 0 {
+		m.CacheHitMultiplier = cacheHitMul
+	}
+	if isFree >= 0 {
+		m.IsFree = isFree >= 1
+	}
+	if m.ID == 0 {
+		return GetDB().Create(&m).Error
+	}
+	// Unscoped().Save 才能把 deleted_at 写回 NULL（复活），并按主键全字段更新。
+	return GetDB().Unscoped().Save(&m).Error
+}
+
+// DeleteModelMultiplier removes the multiplier for an actual model (internalModelName),
+// making it fall back to the global default.
+//
+// 这是配置表：删除语义就是「回落全局默认」，没有「恢复已删除倍率」的需求，
+// 因此用 Unscoped 硬删除，避免软删除残留行占用 internal_model_name 唯一键，
+// 进而导致下次保存同名模型撞 UNIQUE 约束。
+// 关键词: DeleteModelMultiplier, 实际模型倍率清除, 硬删除避免唯一键残留
+func DeleteModelMultiplier(internalModelName string) error {
+	return GetDB().Unscoped().Where("internal_model_name = ?", internalModelName).
+		Delete(&AiModelMultiplier{}).Error
+}
+
+// GetAllModelMultipliers returns all actual-model multipliers indexed by InternalModelName.
+// 关键词: GetAllModelMultipliers, 实际模型倍率全量加载
+func GetAllModelMultipliers() (map[string]*AiModelMultiplier, error) {
+	var list []AiModelMultiplier
+	if err := GetDB().Find(&list).Error; err != nil {
+		return nil, err
+	}
+	result := make(map[string]*AiModelMultiplier)
+	for i := range list {
+		result[list[i].InternalModelName] = &list[i]
+	}
+	return result, nil
+}
+
+// GetGlobalMultiplierConfig retrieves the singleton global default multipliers (ID=1);
+// returns a zero-value instance (non-nil) when not yet configured.
+func GetGlobalMultiplierConfig() (*AiModelMultiplierConfig, error) {
+	var cfg AiModelMultiplierConfig
+	err := GetDB().Where("id = ?", 1).First(&cfg).Error
+	if err != nil {
+		if gorm.IsRecordNotFoundError(err) {
+			return &AiModelMultiplierConfig{}, nil
+		}
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// SaveGlobalMultiplierConfig upserts the singleton global default multipliers (ID=1).
+// Pass a value < 0 to skip updating that specific dimension.
+// 关键词: SaveGlobalMultiplierConfig, 全局默认倍率写库
+func SaveGlobalMultiplierConfig(inputMul, outputMul, cacheCreateMul, cacheHitMul float64) error {
+	var cfg AiModelMultiplierConfig
+	err := GetDB().Where("id = ?", 1).First(&cfg).Error
+	if err != nil {
+		if gorm.IsRecordNotFoundError(err) {
+			cfg = AiModelMultiplierConfig{}
+			cfg.ID = 1
+			if inputMul >= 0 {
+				cfg.InputTokenMultiplier = inputMul
+			}
+			if outputMul >= 0 {
+				cfg.OutputTokenMultiplier = outputMul
+			}
+			if cacheCreateMul >= 0 {
+				cfg.CacheCreationMultiplier = cacheCreateMul
+			}
+			if cacheHitMul >= 0 {
+				cfg.CacheHitMultiplier = cacheHitMul
+			}
+			return GetDB().Create(&cfg).Error
+		}
+		return err
+	}
+	if inputMul >= 0 {
+		cfg.InputTokenMultiplier = inputMul
+	}
+	if outputMul >= 0 {
+		cfg.OutputTokenMultiplier = outputMul
+	}
+	if cacheCreateMul >= 0 {
+		cfg.CacheCreationMultiplier = cacheCreateMul
+	}
+	if cacheHitMul >= 0 {
+		cfg.CacheHitMultiplier = cacheHitMul
+	}
+	return GetDB().Save(&cfg).Error
+}
+
+// InternalModelInfo 表示一个「实际模型(内部转发名)」及其关联的对外 wrapper 列表。
+// 这是计费的主体单位：同一实际模型可被多个 wrapper 暴露，但只有一个计费单价。
+// 关键词: InternalModelInfo, 实际模型枚举, 关联 wrapper
+type InternalModelInfo struct {
+	InternalModelName string   `json:"internal_model_name"`
+	Wrappers          []string `json:"wrappers"`       // 暴露该实际模型的对外名（去重排序）
+	ProviderCount     int      `json:"provider_count"` // 路由到该实际模型的 provider 条目数
+}
+
+// GetDistinctInternalModels 从 AiProvider 表枚举所有 distinct 的实际模型(内部转发名 ModelName)，
+// 并聚合每个实际模型关联的对外 wrapper 列表与 provider 数量。结果按内部模型名排序。
+// 这是「实际模型计费」表与批量应用（按模式/按勾选）的数据源。
+// 关键词: GetDistinctInternalModels, 实际模型枚举, 批量应用数据源
+func GetDistinctInternalModels() ([]InternalModelInfo, error) {
+	providers, err := GetAllAiProviders()
+	if err != nil {
+		return nil, err
+	}
+	type agg struct {
+		wrappers map[string]bool
+		count    int
+	}
+	byInternal := make(map[string]*agg)
+	for _, p := range providers {
+		internal := p.ModelName
+		if internal == "" {
+			continue
+		}
+		wrapper := p.WrapperName
+		if wrapper == "" {
+			wrapper = internal
+		}
+		a := byInternal[internal]
+		if a == nil {
+			a = &agg{wrappers: make(map[string]bool)}
+			byInternal[internal] = a
+		}
+		a.wrappers[wrapper] = true
+		a.count++
+	}
+
+	internals := make([]string, 0, len(byInternal))
+	for internal := range byInternal {
+		internals = append(internals, internal)
+	}
+	sort.Strings(internals)
+
+	result := make([]InternalModelInfo, 0, len(internals))
+	for _, internal := range internals {
+		a := byInternal[internal]
+		wrappers := make([]string, 0, len(a.wrappers))
+		for w := range a.wrappers {
+			wrappers = append(wrappers, w)
+		}
+		sort.Strings(wrappers)
+		result = append(result, InternalModelInfo{
+			InternalModelName: internal,
+			Wrappers:          wrappers,
+			ProviderCount:     a.count,
+		})
+	}
+	return result, nil
+}
+
 // ==================== API Key Traffic Limit Functions ====================
 
 // UpdateAiApiKeyTrafficLimit updates the traffic limit settings for an API key
 func UpdateAiApiKeyTrafficLimit(id uint, limit int64, enable bool) error {
-	result := GetDB().Model(&schema.AiApiKeys{}).Where("id = ?", id).Updates(map[string]interface{}{
+	result := GetDB().Model(&AiApiKeys{}).Where("id = ?", id).Updates(map[string]interface{}{
 		"traffic_limit":        limit,
 		"traffic_limit_enable": enable,
 	})
@@ -446,7 +849,7 @@ func UpdateAiApiKeyTrafficLimit(id uint, limit int64, enable bool) error {
 
 // ResetAiApiKeyTrafficUsed resets the traffic used counter for an API key
 func ResetAiApiKeyTrafficUsed(id uint) error {
-	result := GetDB().Model(&schema.AiApiKeys{}).Where("id = ?", id).Update("traffic_used", 0)
+	result := GetDB().Model(&AiApiKeys{}).Where("id = ?", id).Update("traffic_used", 0)
 	if result.Error != nil {
 		return fmt.Errorf("failed to reset traffic used for API key ID %d: %w", id, result.Error)
 	}
@@ -460,43 +863,43 @@ func ResetAiApiKeyTrafficUsed(id uint) error {
 // CheckAiApiKeyTrafficLimit checks if an API key has exceeded its traffic limit
 // Returns (isAllowed, error) - isAllowed is true if the key can be used
 func CheckAiApiKeyTrafficLimit(apiKey string) (bool, error) {
-	var key schema.AiApiKeys
+	var key AiApiKeys
 	if err := GetDB().Where("api_key = ?", apiKey).First(&key).Error; err != nil {
 		return false, fmt.Errorf("failed to find API key: %v", err)
 	}
-	
+
 	// If traffic limit is not enabled, always allow
 	if !key.TrafficLimitEnable {
 		return true, nil
 	}
-	
+
 	// If limit is 0, it means unlimited
 	if key.TrafficLimit <= 0 {
 		return true, nil
 	}
-	
+
 	// Check if used traffic exceeds limit
 	if key.TrafficUsed >= key.TrafficLimit {
 		return false, nil
 	}
-	
+
 	return true, nil
 }
 
 // UpdateAiApiKeyTrafficUsed adds to the traffic used counter for an API key
 func UpdateAiApiKeyTrafficUsed(apiKey string, additionalTraffic int64) error {
-	var key schema.AiApiKeys
+	var key AiApiKeys
 	if err := GetDB().Where("api_key = ?", apiKey).First(&key).Error; err != nil {
 		return fmt.Errorf("failed to find API key: %v", err)
 	}
-	
+
 	key.TrafficUsed += additionalTraffic
 	return GetDB().Save(&key).Error
 }
 
 // GetAiApiKeyByID retrieves an API key by its ID
-func GetAiApiKeyByID(id uint) (*schema.AiApiKeys, error) {
-	var key schema.AiApiKeys
+func GetAiApiKeyByID(id uint) (*AiApiKeys, error) {
+	var key AiApiKeys
 	if err := GetDB().Where("id = ?", id).First(&key).Error; err != nil {
 		return nil, err
 	}
@@ -512,7 +915,7 @@ func DeleteAiApiKeyByID(id uint) error {
 	}
 
 	// Execute delete operation
-	if err := GetDB().Delete(&schema.AiApiKeys{}, id).Error; err != nil {
+	if err := GetDB().Delete(&AiApiKeys{}, id).Error; err != nil {
 		return fmt.Errorf("failed to delete API key: %v", err)
 	}
 
@@ -530,7 +933,7 @@ func BatchDeleteAiApiKeys(ids []uint) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	result := GetDB().Where("id IN (?)", ids).Delete(&schema.AiApiKeys{})
+	result := GetDB().Where("id IN (?)", ids).Delete(&AiApiKeys{})
 	if result.Error != nil {
 		return 0, fmt.Errorf("failed to batch delete API keys: %w", result.Error)
 	}
@@ -546,10 +949,18 @@ func BatchDeleteAiApiKeys(ids []uint) (int64, error) {
 // sortBy: field to sort by (created_at, usage_count, traffic_used, etc.)
 // sortOrder: "asc" or "desc"
 // Returns: keys, total count, error
-func GetAiApiKeysPaginated(page, pageSize int, sortBy, sortOrder string) ([]*schema.AiApiKeys, int64, error) {
-	var keys []*schema.AiApiKeys
+func GetAiApiKeysPaginated(page, pageSize int, sortBy, sortOrder string) ([]*AiApiKeys, int64, error) {
+	return GetAiApiKeysPaginatedFiltered(page, pageSize, sortBy, sortOrder, "")
+}
+
+// GetAiApiKeysPaginatedFiltered 在分页基础上支持按绑定用户名过滤。
+// usernameFilter 为空时等价于不过滤；非空时按精确用户名匹配（用户名可重复，
+// 因此一个用户名可能对应多条 API Key）。
+// 关键词: GetAiApiKeysPaginatedFiltered, username 过滤, 按用户查看 API Key
+func GetAiApiKeysPaginatedFiltered(page, pageSize int, sortBy, sortOrder, usernameFilter string) ([]*AiApiKeys, int64, error) {
+	var keys []*AiApiKeys
 	var total int64
-	
+
 	// Validate and set defaults
 	if page < 1 {
 		page = 1
@@ -560,45 +971,57 @@ func GetAiApiKeysPaginated(page, pageSize int, sortBy, sortOrder string) ([]*sch
 	if pageSize > 100 {
 		pageSize = 100 // Max page size
 	}
-	
+
 	// Validate sort field to prevent SQL injection
 	allowedSortFields := map[string]bool{
-		"id":           true,
-		"created_at":   true,
-		"updated_at":   true,
-		"usage_count":  true,
-		"success_count": true,
-		"failure_count": true,
-		"input_bytes":  true,
-		"output_bytes": true,
-		"traffic_used": true,
-		"traffic_limit": true,
+		"id":             true,
+		"created_at":     true,
+		"updated_at":     true,
+		"usage_count":    true,
+		"success_count":  true,
+		"failure_count":  true,
+		"input_bytes":    true,
+		"output_bytes":   true,
+		"traffic_used":   true,
+		"traffic_limit":  true,
+		"token_used":     true,
+		"token_limit":    true,
 		"last_used_time": true,
-		"active":       true,
+		"active":         true,
+		"username":       true,
 	}
-	
+
 	if !allowedSortFields[sortBy] {
 		sortBy = "created_at"
 	}
-	
+
 	if sortOrder != "asc" && sortOrder != "desc" {
 		sortOrder = "desc"
 	}
-	
+
+	// 基础查询：按用户名过滤（如有）
+	countQuery := GetDB().Model(&AiApiKeys{})
+	listQuery := GetDB().Model(&AiApiKeys{})
+	usernameFilter = strings.TrimSpace(usernameFilter)
+	if usernameFilter != "" {
+		countQuery = countQuery.Where("username = ?", usernameFilter)
+		listQuery = listQuery.Where("username = ?", usernameFilter)
+	}
+
 	// Get total count
-	if err := GetDB().Model(&schema.AiApiKeys{}).Count(&total).Error; err != nil {
+	if err := countQuery.Count(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to count API keys: %v", err)
 	}
-	
+
 	// Calculate offset
 	offset := (page - 1) * pageSize
-	
+
 	// Query with pagination and sorting
 	orderClause := fmt.Sprintf("%s %s", sortBy, sortOrder)
-	if err := GetDB().Order(orderClause).Offset(offset).Limit(pageSize).Find(&keys).Error; err != nil {
+	if err := listQuery.Order(orderClause).Offset(offset).Limit(pageSize).Find(&keys).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get API keys: %v", err)
 	}
-	
+
 	return keys, total, nil
 }
 
@@ -606,17 +1029,17 @@ func GetAiApiKeysPaginated(page, pageSize int, sortBy, sortOrder string) ([]*sch
 
 // EnsureHealthRecordTable ensures the AiProviderHealthRecord table exists
 func EnsureHealthRecordTable() error {
-	return GetDB().AutoMigrate(&schema.AiProviderHealthRecord{}).Error
+	return GetDB().AutoMigrate(&AiProviderHealthRecord{}).Error
 }
 
 // SaveHealthRecord saves a single health check record
-func SaveHealthRecord(record *schema.AiProviderHealthRecord) error {
+func SaveHealthRecord(record *AiProviderHealthRecord) error {
 	return GetDB().Create(record).Error
 }
 
 // GetHealthRecordsByModel retrieves health records for a specific model since a given time
-func GetHealthRecordsByModel(wrapperName string, since time.Time) ([]*schema.AiProviderHealthRecord, error) {
-	var records []*schema.AiProviderHealthRecord
+func GetHealthRecordsByModel(wrapperName string, since time.Time) ([]*AiProviderHealthRecord, error) {
+	var records []*AiProviderHealthRecord
 	err := GetDB().Where("wrapper_name = ? AND check_time >= ?", wrapperName, since).
 		Order("check_time ASC").Find(&records).Error
 	if err != nil {
@@ -638,12 +1061,12 @@ func GetAllHealthSummary(since time.Time) ([]HealthSummary, error) {
 	start := time.Now()
 
 	var totalRecords int64
-	GetDB().Model(&schema.AiProviderHealthRecord{}).Where("check_time >= ?", since).Count(&totalRecords)
+	GetDB().Model(&AiProviderHealthRecord{}).Where("check_time >= ?", since).Count(&totalRecords)
 	log.Infof("GetAllHealthSummary: querying records since %v, total records in range: %d, count query took %v",
 		since.Format("2006-01-02 15:04:05"), totalRecords, time.Since(start))
 
 	var results []HealthSummary
-	rows, err := GetDB().Model(&schema.AiProviderHealthRecord{}).
+	rows, err := GetDB().Model(&AiProviderHealthRecord{}).
 		Select("wrapper_name, COUNT(*) as total_checks, SUM(CASE WHEN is_healthy THEN 1 ELSE 0 END) as healthy_count").
 		Where("check_time >= ?", since).
 		Group("wrapper_name").Rows()
@@ -714,7 +1137,7 @@ func GetRecentLatencyByModel(limit int, modelNames []string) (map[string][]Laten
 	result := make(map[string][]LatencyPoint)
 	totalPoints := 0
 	for _, name := range names {
-		var records []schema.AiProviderHealthRecord
+		var records []AiProviderHealthRecord
 		if err := GetDB().Where("wrapper_name = ?", name).
 			Order("check_time DESC").Limit(limit).Find(&records).Error; err != nil {
 			continue
@@ -741,7 +1164,7 @@ func GetRecentLatencyByModel(limit int, modelNames []string) (map[string][]Laten
 
 // CleanupOldHealthRecords removes health records older than the given time
 func CleanupOldHealthRecords(before time.Time) (int64, error) {
-	result := GetDB().Where("check_time < ?", before).Delete(&schema.AiProviderHealthRecord{})
+	result := GetDB().Where("check_time < ?", before).Delete(&AiProviderHealthRecord{})
 	if result.Error != nil {
 		return 0, result.Error
 	}

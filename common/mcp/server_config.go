@@ -8,8 +8,6 @@ import (
 	"strings"
 
 	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/mcp/mcp-go/mcp"
-	"github.com/yaklang/yaklang/common/mcp/mcp-go/server"
 	"github.com/yaklang/yaklang/common/mcp/yakcliconvert"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yak/static_analyzer"
@@ -17,43 +15,72 @@ import (
 
 type MCPServerConfig struct {
 	enableTools      map[string]*ToolWithHandler
-	enableAITools    map[string]*ToolWithHandler
 	disableTools     map[string]*ToolWithHandler
 	enableResources  map[string]*ResourceWithHandler
 	disableResources map[string]*ResourceWithHandler
 	dynamicScript    []string
+	// grpcClient, when set, is used instead of NewLocalClient() (integration tests).
+	grpcClient YakClientInterface
+	// extraAITools holds aitool.Tool instances registered via WithAITools.
+	// They are merged last and override globalTools entries with the same name.
+	extraAITools map[string]*ToolWithHandler
+	// bridgeClientClosers holds outbound MCP clients for bridged aitools; each
+	// client is closed once when the Yak MCP server shuts down.
+	bridgeClientClosers []io.Closer
 }
 
 func NewMCPServerConfig() *MCPServerConfig {
 	return &MCPServerConfig{
 		enableTools:      make(map[string]*ToolWithHandler),
-		enableAITools:    make(map[string]*ToolWithHandler),
 		disableTools:     make(map[string]*ToolWithHandler),
 		enableResources:  make(map[string]*ResourceWithHandler),
 		disableResources: make(map[string]*ResourceWithHandler),
+		extraAITools:     make(map[string]*ToolWithHandler),
 	}
 }
 
+func (cfg *MCPServerConfig) trackBridgeClientCloser(c io.Closer) {
+	if c == nil {
+		return
+	}
+	for _, existing := range cfg.bridgeClientClosers {
+		if existing == c {
+			return
+		}
+	}
+	cfg.bridgeClientClosers = append(cfg.bridgeClientClosers, c)
+}
+
 func (cfg *MCPServerConfig) ApplyConfig(s *MCPServer) {
-	tools := maps.Clone(globalTools)
-	if len(tools) == 0 {
-		tools = globalTools
+	// Legacy MCP tools are only exposed when at least one tool set was enabled
+	// via WithEnableToolSet / WithEnableAllToolSets (CLI defaults to all enabled;
+	// Yakit uses StartMcpServerRequest.EnableAll).
+	tools := make(map[string]*ToolWithHandler)
+	if len(cfg.enableTools) > 0 {
+		for name, tool := range cfg.enableTools {
+			if _, disabled := cfg.disableTools[name]; disabled {
+				continue
+			}
+			tools[name] = tool
+		}
 	}
 
-	for name, tool := range cfg.enableAITools {
+	// extraAITools (registered via WithAITools) are merged last and override
+	// any legacy entry with the same name.
+	for name, tool := range cfg.extraAITools {
+		if _, disabled := cfg.disableTools[name]; disabled {
+			continue
+		}
 		tools[name] = tool
 	}
 
-	for name, tool := range tools {
-		if _, ok := cfg.disableTools[name]; ok {
-			continue
-		}
+	for _, tool := range tools {
 		s.server.AddTool(tool.tool, tool.handler(s))
 	}
 
 	resources := cfg.enableResources
 	if len(resources) == 0 {
-		resources = globalResources
+		resources = nil
 	}
 	for name, resource := range resources {
 		if _, ok := cfg.disableResources[name]; ok {
@@ -121,6 +148,18 @@ func WithEnableToolSet(name string) McpServerOption {
 			return utils.Errorf("undefined tool set: %s", name)
 		}
 		maps.Copy(cfg.enableTools, toolSet.Tools)
+		return nil
+	}
+}
+
+// WithEnableAllToolSets registers every legacy tool set, matching StartMcpServer EnableAll.
+func WithEnableAllToolSets() McpServerOption {
+	return func(cfg *MCPServerConfig) error {
+		for _, name := range GlobalToolSetList() {
+			if err := WithEnableToolSet(name)(cfg); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 }
@@ -274,15 +313,31 @@ func WithDisableSSAToolSet() McpServerOption {
 	return WithDisableToolSet("ssa")
 }
 
-func WithYakScriptTools(tools ...*mcp.Tool) McpServerOption {
+func WithEnableGlobalHotPatchToolSet() McpServerOption {
+	return WithEnableToolSet("global_hotpatch")
+}
+
+func WithDisableGlobalHotPatchToolSet() McpServerOption {
+	return WithDisableToolSet("global_hotpatch")
+}
+
+// WithGRPCClient pins the MCP server to a specific gRPC client (integration tests).
+func WithGRPCClient(client YakClientInterface) McpServerOption {
 	return func(cfg *MCPServerConfig) error {
-		for _, tool := range tools {
-			cfg.enableAITools[tool.Name] = &ToolWithHandler{
-				tool: tool,
-				handler: func(s *MCPServer) server.ToolHandlerFunc {
-					return s.execYakScriptWrapper(tool.Name, tool.YakScript)
-				},
-			}
+		cfg.grpcClient = client
+		return nil
+	}
+}
+
+// WithDisabledToolNames registers a set of tool names that should be excluded
+// from the MCP server even if they are part of an enabled tool set. This is
+// used to apply per-tool enable/disable state stored in the profile DB.
+func WithDisabledToolNames(names map[string]struct{}) McpServerOption {
+	return func(cfg *MCPServerConfig) error {
+		for name := range names {
+			// We use a sentinel ToolWithHandler (nil tool) — ApplyConfig only
+			// checks key presence in disableTools to decide whether to skip.
+			cfg.disableTools[name] = &ToolWithHandler{}
 		}
 		return nil
 	}

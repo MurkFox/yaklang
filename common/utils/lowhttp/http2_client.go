@@ -3,6 +3,7 @@ package lowhttp
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -32,8 +33,22 @@ type http2ClientConn struct {
 	streams         map[uint32]*http2ClientStream
 	currentStreamID uint32
 
+	// Idle-timeout management
 	idleTimeout time.Duration
 	idleTimer   *time.Timer
+
+	pingInterval time.Duration
+	pingTimeout  time.Duration
+	pingSeq      int64 // atomic counter; generates unique PING data
+	pingMu       sync.Mutex
+	pendingPings map[[8]byte]chan struct{} // awaiting PING ACK responses
+
+	// activeStreams counts in-flight streams (accessed under mu).
+	// The idle timer only runs when activeStreams == 0.
+	// streamsCond is signalled whenever a stream completes or the connection
+	// closes, allowing goroutines blocked in newStream to re-check the limit.
+	activeStreams int
+	streamsCond   *sync.Cond // based on mu
 
 	maxFrameSize      uint32
 	initialWindowSize uint32
@@ -45,11 +60,31 @@ type http2ClientConn struct {
 	readGoAway   bool
 	lastStreamID uint32
 
-	closeCond       *sync.Cond
 	closed          bool
 	clientPrefaceOk *utils.AtomicBool
 	closeCh         chan struct{}
 	closeOnce       sync.Once
+
+	// readLoopRunning is 1 while the readLoop goroutine is active, 0 after it exits.
+	// Accessed atomically; used by the debug printer to show goroutine liveness.
+	readLoopRunning int32
+
+	// readLoopExited is closed by readLoop's defer after readLoopRunning is set
+	// to 0.  Anything that needs to observe "readLoop has fully exited" (e.g.
+	// the tombstone recorder) waits on this channel instead of polling the
+	// atomic flag, avoiding a busy-wait race.
+	readLoopExited chan struct{}
+
+	// closeReason records a human-readable explanation for why this connection
+	// was closed.  Written once (by whichever path triggers the close first)
+	// and read by removeConn when building the tombstone.  Protected by closeOnce
+	// semantics — the first writer wins and subsequent writes are ignored.
+	closeReasonOnce sync.Once
+	closeReason     string // set before setClose(); read in removeConn()
+
+	// pc is the owning persistConn; used by setClose to evict the connection
+	// from h2ConnMap when it transitions to closed.
+	pc *persistConn
 
 	hDec *hpack.Decoder
 
@@ -166,9 +201,8 @@ func (s *http2ClientStream) startBodyStreamHandler(headerRaw []byte) {
 	s.bodyStreamOnce.Do(func() {
 		go func() {
 			defer func() {
-				if err := recover(); err != nil {
-					log.Errorf("BodyStreamReaderHandler panic in http2: %v", err)
-					utils.PrintCurrentGoroutineRuntimeStack()
+				if r := recover(); r != nil {
+					log.Errorf("BodyStreamReaderHandler panic in http2: %v", r)
 				}
 			}()
 			handler(headerCopy, reader)
@@ -211,9 +245,20 @@ func (h2Conn *http2ClientConn) preface() error {
 		{ID: http2.SettingMaxConcurrentStreams, Val: defaultMaxConcurrentStreamSize},
 		{ID: http2.SettingMaxHeaderListSize, Val: defaultMaxHeaderListSize},
 	}...)
+	if err != nil {
+		h2Conn.frWriteMutex.Unlock()
+		return utils.Wrapf(err, "write h2 setting failed")
+	}
+	// Increase connection-level flow control window from default 65535 to our desired size.
+	// RFC 7540 Section 6.9.2: SETTINGS only affects stream-level windows.
+	// Connection window must be increased via WINDOW_UPDATE.
+	connWindowIncrease := defaultStreamReceiveWindowSize - 65535
+	if connWindowIncrease > 0 {
+		err = h2Conn.fr.WriteWindowUpdate(0, uint32(connWindowIncrease))
+	}
 	h2Conn.frWriteMutex.Unlock()
 	if err != nil {
-		return utils.Wrapf(err, "write h2 setting failed")
+		return utils.Wrapf(err, "write h2 connection window update failed")
 	}
 	h2Conn.setPreface()
 	return nil
@@ -246,14 +291,31 @@ func (h2Conn *http2ClientConn) preface() error {
 	//}
 }
 
+// setCloseReason records the first (winning) reason this connection was closed.
+// All subsequent callers are ignored so the tombstone always shows the root cause.
+func (h2Conn *http2ClientConn) setCloseReason(reason string) {
+	h2Conn.closeReasonOnce.Do(func() {
+		h2Conn.closeReason = reason
+	})
+}
+
 func (h2Conn *http2ClientConn) setClose() {
-	h2Conn.closeCond.L.Lock()
+	// Mark closed while holding mu so newStream's wait loop sees it consistently.
+	h2Conn.mu.Lock()
 	h2Conn.closed = true
-	h2Conn.closeCond.L.Unlock()
-	h2Conn.closeCond.Broadcast()
+	h2Conn.mu.Unlock()
+
 	h2Conn.closeOnce.Do(func() {
 		close(h2Conn.closeCh)
+		// Evict this connection from the pool's h2ConnMap exactly once,
+		// so the debug printer and getOrCreateH2Conn never see a CLOSED
+		// entry lingering in the map.
+		if h2Conn.pc != nil {
+			h2Conn.pc.removeConn()
+		}
 	})
+	// Wake all goroutines blocked in newStream waiting for a stream slot.
+	h2Conn.streamsCond.Broadcast()
 	h2Conn.conn.Close()
 }
 
@@ -263,16 +325,39 @@ func (h2Conn *http2ClientConn) setPreface() {
 
 var CreateStreamAfterGoAwayErr = utils.Errorf("h2 conn can not create new stream, because read go away flag")
 
-// new stream
+// newStream obtains an http2ClientStream from the pool and initialises it for
+// the given request.  If the connection is already at SETTINGS_MAX_CONCURRENT_STREAMS,
+// the call blocks until a slot becomes available or the connection is closed —
+// the same behaviour as Go's net/http H2 transport.
 func (h2Conn *http2ClientConn) newStream(req *http.Request, packet []byte, option *LowhttpExecConfig) (*http2ClientStream, error) {
-	if h2Conn.readGoAway {
+	// Wait for a concurrent-stream slot.  Access activeStreams and the
+	// connection-state flags under mu so that streamsCond.Wait() is race-free.
+	h2Conn.mu.Lock()
+	for h2Conn.activeStreams >= int(h2Conn.maxStreamsCount) {
+		if h2Conn.closed || h2Conn.readGoAway {
+			h2Conn.mu.Unlock()
+			return nil, CreateStreamAfterGoAwayErr
+		}
+		// Atomically releases mu and suspends goroutine.
+		// Woken by streamsCond.Broadcast() in waitResponse / setClose / processGoAway.
+		h2Conn.streamsCond.Wait()
+	}
+	if h2Conn.closed || h2Conn.readGoAway {
+		h2Conn.mu.Unlock()
 		return nil, CreateStreamAfterGoAwayErr
 	}
+	// Reserve the slot before releasing the lock to prevent TOCTOU races.
+	h2Conn.activeStreams++
+	firstStream := h2Conn.activeStreams == 1
+	h2Conn.mu.Unlock()
 
-	newStreamID := h2Conn.getNewStreamID()
+	if firstStream {
+		h2Conn.idleTimer.Stop()
+	}
+
 	cs := h2Conn.http2StreamPool.Get().(*http2ClientStream)
 	cs.h2Conn = h2Conn
-	cs.ID = newStreamID
+	cs.ID = 0 // assigned later in doRequest under frWriteMutex to guarantee wire order
 	cs.resp = new(http.Response)
 	cs.resp.ProtoMajor = 2
 	cs.streamWindowControl = newControl(int64(h2Conn.initialWindowSize))
@@ -303,13 +388,6 @@ func (h2Conn *http2ClientConn) newStream(req *http.Request, packet []byte, optio
 		}
 	}
 
-	h2Conn.mu.Lock()
-	h2Conn.streams[newStreamID] = cs
-	h2Conn.mu.Unlock()
-
-	if (cs.ID/2)+1 >= h2Conn.maxStreamsCount {
-		h2Conn.full = true
-	}
 	return cs, nil
 }
 
@@ -322,40 +400,66 @@ func (h2Conn *http2ClientConn) getNewStreamID() uint32 {
 
 // read frame loop
 func (h2Conn *http2ClientConn) readLoop() {
+	atomic.StoreInt32(&h2Conn.readLoopRunning, 1)
 	defer func() {
+		// Order matters:
+		//  1. setClose() evicts the conn from h2ConnMap and triggers tombstone
+		//     recording (async, waiting on readLoopExited).
+		//  2. Clear readLoopRunning so the tombstone goroutine sees 0.
+		//  3. Close readLoopExited to unblock the tombstone goroutine.
 		h2Conn.setClose()
+		atomic.StoreInt32(&h2Conn.readLoopRunning, 0)
+		close(h2Conn.readLoopExited)
 	}()
-	h2Conn.idleTimer.Reset(h2Conn.idleTimeout) // read new frame reset timer
+	h2Conn.idleTimer.Reset(h2Conn.idleTimeout)
 	var rl = http2ClientConnReadLoop{h2Conn: h2Conn}
-	//var gotSettings = false
-	var readIdleTimeout = h2Conn.idleTimeout
-	var t *time.Timer
+
+	// Ping-based health check: if no frame is received for pingInterval,
+	// probe the server with a PING frame.  A missing ACK within pingTimeout
+	// means the connection is dead and it is closed immediately.
+	var pingTimer *time.Timer
+	if h2Conn.pingInterval > 0 {
+		pingTimer = time.AfterFunc(h2Conn.pingInterval, h2Conn.healthCheck)
+		defer pingTimer.Stop()
+	}
 
 	for !h2Conn.closed {
 		select {
 		case <-h2Conn.ctx.Done():
+			h2Conn.setCloseReason("ctx-cancelled")
 			return
 		default:
 		}
 
 		frame, err := h2Conn.fr.ReadFrame()
-		if t != nil {
-			t.Reset(readIdleTimeout)
+		// Any received frame proves the connection is still alive;
+		// reset the ping timer so we only probe truly silent connections.
+		if pingTimer != nil {
+			pingTimer.Reset(h2Conn.pingInterval)
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Debugf("http2: Transport readFrame error on conn %p: %v", rl.h2Conn.conn, err)
+			if errors.Is(err, io.EOF) {
+				h2Conn.setCloseReason("remote-EOF")
+				log.Infof("http2: conn %v readLoop: server closed connection (EOF)", h2Conn.conn.RemoteAddr())
+			} else {
+				reason := fmt.Sprintf("readFrame-err: %v", err)
+				h2Conn.setCloseReason(reason)
+				log.Infof("http2: conn %v readLoop: readFrame error: %v", h2Conn.conn.RemoteAddr(), err)
 			}
 			return
 		}
-		if !h2Conn.clientPrefaceOk.IsSet() { // check start read frame after preface
-			if _, ok := frame.(*http2.SettingsFrame); !ok {
-				log.Errorf("http2: Transport received non-SETTINGS frame before SETTINGS: %v", frame)
+		if !h2Conn.clientPrefaceOk.IsSet() {
+			// readLoop may start before preface() sets clientPrefaceOk.
+			// The first frame from server must be SETTINGS; process it and continue.
+			if sf, ok := frame.(*http2.SettingsFrame); ok {
+				rl.processSettings(sf)
+				continue
 			}
+			reason := fmt.Sprintf("unexpected-frame-before-settings: %T", frame)
+			h2Conn.setCloseReason(reason)
+			log.Errorf("http2: Transport received non-SETTINGS frame before SETTINGS: %v", frame)
 			return
 		}
-
-		// log.Infof("h2 stream-id %v found frame: %v", frame.Header().StreamID, frame)
 
 		switch f := frame.(type) {
 		case *http2.HeadersFrame:
@@ -387,13 +491,13 @@ func (cs *http2ClientStream) doRequest() error {
 		return utils.Error("h2 connection is nil")
 	}
 
-	// Check connection state before proceeding
-	cs.h2Conn.closeCond.L.Lock()
-	if cs.h2Conn.closed {
-		cs.h2Conn.closeCond.L.Unlock()
+	// Check connection state before proceeding (use mu for consistency with newStream).
+	cs.h2Conn.mu.Lock()
+	closed := cs.h2Conn.closed
+	cs.h2Conn.mu.Unlock()
+	if closed {
 		return utils.Error("h2 connection already closed")
 	}
-	cs.h2Conn.closeCond.L.Unlock()
 
 	cs.h2Conn.idleTimer.Reset(cs.h2Conn.idleTimeout) // new request reset timer
 	fr := cs.h2Conn.fr
@@ -494,6 +598,20 @@ func (cs *http2ClientStream) doRequest() error {
 		cs.h2Conn.frWriteMutex.Unlock()
 		return utils.Error("h2 connection closed during write")
 	}
+	if cs.h2Conn.readGoAway {
+		cs.h2Conn.frWriteMutex.Unlock()
+		return CreateStreamAfterGoAwayErr
+	}
+	// Assign stream ID under frWriteMutex to guarantee wire-order matches ID order.
+	// RFC 7540 Section 5.1.1: stream IDs must be strictly increasing on the wire.
+	cs.ID = cs.h2Conn.getNewStreamID()
+	cs.h2Conn.mu.Lock()
+	cs.h2Conn.streams[cs.ID] = cs
+	cs.h2Conn.mu.Unlock()
+	if (cs.ID/2)+1 >= cs.h2Conn.maxStreamsCount {
+		cs.h2Conn.full = true
+	}
+	// activeStreams was already incremented in newStream when the slot was reserved.
 	err := h2HeaderWriter(fr, cs.ID, false, cs.h2Conn.maxFrameSize, hPackBuf.Bytes())
 	cs.h2Conn.frWriteMutex.Unlock()
 	if err != nil {
@@ -501,12 +619,17 @@ func (cs *http2ClientStream) doRequest() error {
 		if strings.Contains(err.Error(), "use of closed connection") || strings.Contains(err.Error(), "broken pipe") {
 			return CreateStreamAfterGoAwayErr // This will trigger retry logic
 		}
+		cs.h2Conn.setCloseReason(fmt.Sprintf("write-headers-err: %v", err))
 		cs.h2Conn.setClose()
 		return utils.Errorf("yak.h2 framer write headers failed: %s", err)
 	}
 	cs.sentHeaders = true
 	if len(body) > 0 {
-		chunks := funk.Chunk(body, defaultMaxFrameSize).([][]byte)
+		maxFrame := int(cs.h2Conn.maxFrameSize)
+		if maxFrame <= 0 {
+			maxFrame = defaultMaxFrameSize
+		}
+		chunks := funk.Chunk(body, maxFrame).([][]byte)
 		for index, dataFrameBytes := range chunks {
 			dataLen := len(dataFrameBytes)
 
@@ -555,6 +678,21 @@ func (cs *http2ClientStream) waitResponse(timeout time.Duration) (http.Response,
 	case <-cs.h2Conn.closeCh:
 		err = utils.Wrapf(errH2ConnClosed, "h2 stream-id %v wait response conn closed : %s", cs.ID, flow)
 	}
+
+	// Cleanup: remove stream from map, decrement slot, restart idle timer if idle.
+	cs.h2Conn.mu.Lock()
+	if cs.ID > 0 {
+		delete(cs.h2Conn.streams, cs.ID)
+	}
+	cs.h2Conn.activeStreams--
+	idleNow := cs.h2Conn.activeStreams <= 0
+	cs.h2Conn.mu.Unlock()
+	// Broadcast wakes any goroutines blocked in newStream waiting for a free slot.
+	cs.h2Conn.streamsCond.Broadcast()
+	if idleNow {
+		cs.h2Conn.idleTimer.Reset(cs.h2Conn.idleTimeout)
+	}
+
 	cs.resp.Body = io.NopCloser(cs.bodyBuffer)
 	cs.respPacket, _ = utils.DumpHTTPResponse(cs.resp, len(cs.bodyBuffer.Bytes()) > 0)
 	cs.h2Conn.http2StreamPool.Put(cs) // gc
@@ -671,7 +809,8 @@ func (rl *http2ClientConnReadLoop) processContinuation(f *http2.ContinuationFram
 func (rl *http2ClientConnReadLoop) processData(f *http2.DataFrame) {
 	cs := rl.h2Conn.streamByID(f.StreamID) // get stream by id
 	if err := streamAliveCheck(cs, f.StreamID); err != nil {
-		log.Errorf("h2 stream-id %v processData error: %v", f.StreamID, err)
+		// Server sent DATA after END_STREAM — protocol violation, silently ignore.
+		log.Warnf("h2 stream-id %v processData ignored: %v", f.StreamID, err)
 		return
 	}
 
@@ -682,25 +821,22 @@ func (rl *http2ClientConnReadLoop) processData(f *http2.DataFrame) {
 
 	fr := cs.h2Conn.fr
 
-	if f.StreamEnded() { // end stream flag
-		cs.setEndStream()
-	}
+	// Process data before marking END_STREAM so the body bytes are captured
+	// and WINDOW_UPDATE is sent even when END_STREAM is set on the same frame.
 	if dataLen := len(f.Data()); dataLen > 0 {
-		if !cs.readEndStream {
-			cs.h2Conn.frWriteMutex.Lock()
-			err := fr.WriteWindowUpdate(0, uint32(dataLen))
-			cs.h2Conn.frWriteMutex.Unlock()
-			if err != nil {
-				log.Errorf("h2 stream-id %v write window update(connect level) error: %v", f.StreamID, err)
-				return
-			}
-			cs.h2Conn.frWriteMutex.Lock()
-			err = fr.WriteWindowUpdate(f.StreamID, uint32(dataLen))
-			cs.h2Conn.frWriteMutex.Unlock()
-			if err != nil {
-				log.Errorf("h2 server write window update(stream level) error: %v", err)
-				return
-			}
+		cs.h2Conn.frWriteMutex.Lock()
+		err := fr.WriteWindowUpdate(0, uint32(dataLen))
+		cs.h2Conn.frWriteMutex.Unlock()
+		if err != nil {
+			log.Errorf("h2 stream-id %v write window update(connect level) error: %v", f.StreamID, err)
+			return
+		}
+		cs.h2Conn.frWriteMutex.Lock()
+		err = fr.WriteWindowUpdate(f.StreamID, uint32(dataLen))
+		cs.h2Conn.frWriteMutex.Unlock()
+		if err != nil {
+			log.Errorf("h2 server write window update(stream level) error: %v", err)
+			return
 		}
 		if cs.bodyStreamWriter != nil {
 			_, _ = cs.bodyStreamWriter.Write(f.Data())
@@ -708,6 +844,10 @@ func (rl *http2ClientConnReadLoop) processData(f *http2.DataFrame) {
 		if !cs.noBodyBuffer {
 			cs.bodyBuffer.Write(f.Data())
 		}
+	}
+
+	if f.StreamEnded() { // end stream flag, must come after body is written
+		cs.setEndStream()
 	}
 
 	return
@@ -719,14 +859,34 @@ func (rl *http2ClientConnReadLoop) processSettings(f *http2.SettingsFrame) {
 	}
 
 	f.ForeachSetting(func(setting http2.Setting) error {
-		// log.Infof("h2 stream found server setting: %v", setting.String())
 		switch setting.ID {
 		case http2.SettingMaxHeaderListSize:
 			rl.h2Conn.headerListMaxSize = setting.Val
+		case http2.SettingMaxConcurrentStreams:
+			rl.h2Conn.maxStreamsCount = setting.Val
+		case http2.SettingMaxFrameSize:
+			if setting.Val >= 1<<14 && setting.Val <= 1<<24-1 {
+				rl.h2Conn.maxFrameSize = setting.Val
+			}
+		case http2.SettingInitialWindowSize:
+			if setting.Val > 1<<31-1 {
+				return nil
+			}
+			delta := int64(setting.Val) - int64(rl.h2Conn.initialWindowSize)
+			rl.h2Conn.initialWindowSize = setting.Val
+			rl.h2Conn.mu.Lock()
+			for _, cs := range rl.h2Conn.streams {
+				if cs.streamWindowControl != nil {
+					cs.streamWindowControl.adjustWindowSize(delta)
+				}
+			}
+			rl.h2Conn.mu.Unlock()
+		case http2.SettingHeaderTableSize:
+			rl.h2Conn.hDec.SetMaxDynamicTableSize(setting.Val)
 		}
 		return nil
 	})
-	// write settings ack
+
 	rl.h2Conn.frWriteMutex.Lock()
 	err := rl.h2Conn.fr.WriteSettingsAck()
 	rl.h2Conn.frWriteMutex.Unlock()
@@ -734,7 +894,6 @@ func (rl *http2ClientConnReadLoop) processSettings(f *http2.SettingsFrame) {
 		log.Errorf("h2 client write settings ack error: %v", err)
 		return
 	}
-	return
 }
 
 func (rl *http2ClientConnReadLoop) processWindowUpdate(f *http2.WindowUpdateFrame) {
@@ -753,13 +912,25 @@ func (rl *http2ClientConnReadLoop) processWindowUpdate(f *http2.WindowUpdateFram
 }
 
 func (rl *http2ClientConnReadLoop) processPing(f *http2.PingFrame) {
+	if f.IsAck() {
+		// Server is acknowledging our PING; unblock the waiting sendPing call.
+		rl.h2Conn.pingMu.Lock()
+		if ch, ok := rl.h2Conn.pendingPings[f.Data]; ok {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+		rl.h2Conn.pingMu.Unlock()
+		return
+	}
+	// Server-initiated PING — respond with ACK (RFC 7540 Section 6.7).
 	rl.h2Conn.frWriteMutex.Lock()
 	err := rl.h2Conn.fr.WritePing(true, f.Data)
 	rl.h2Conn.frWriteMutex.Unlock()
 	if err != nil {
-		log.Errorf("h2 server write ping ack error: %v", err)
+		log.Errorf("h2 client write ping ack error: %v", err)
 	}
-	return
 }
 
 func (rl *http2ClientConnReadLoop) processResetStream(f *http2.RSTStreamFrame) {
@@ -775,9 +946,85 @@ func (rl *http2ClientConnReadLoop) processResetStream(f *http2.RSTStreamFrame) {
 
 func (rl *http2ClientConnReadLoop) processGoAway(f *http2.GoAwayFrame) {
 	flow := fmt.Sprintf("%v->%v", rl.h2Conn.conn.LocalAddr(), rl.h2Conn.conn.RemoteAddr())
-	log.Infof("connection: %s is going away by %v", flow, f.ErrCode.String())
-	log.Infof("flow: %v last stream id: %v", flow, f.LastStreamID)
+	log.Infof("connection: %s is going away by %v, lastStreamID=%v", flow, f.ErrCode.String(), f.LastStreamID)
+
+	reason := fmt.Sprintf("goaway: errCode=%s lastStreamID=%d", f.ErrCode.String(), f.LastStreamID)
+	rl.h2Conn.setCloseReason(reason)
+
+	// Set readGoAway under mu so newStream's wait loop and canUse checks are consistent.
+	rl.h2Conn.mu.Lock()
 	rl.h2Conn.readGoAway = true
 	rl.h2Conn.lastStreamID = f.LastStreamID
-	return
+	for id, cs := range rl.h2Conn.streams {
+		if id > f.LastStreamID {
+			cs.setEndStream()
+		}
+	}
+	rl.h2Conn.mu.Unlock()
+	// Wake any goroutines blocked in newStream so they see readGoAway == true.
+	rl.h2Conn.streamsCond.Broadcast()
+}
+
+// healthCheck sends a PING frame to verify the connection is still alive.
+// It is called by the ping timer in readLoop after pingInterval of silence.
+// If the server does not ACK within pingTimeout, the connection is closed.
+func (h2Conn *http2ClientConn) healthCheck() {
+	if h2Conn.closed {
+		return
+	}
+	log.Debugf("h2 conn %p: sending PING health-check to %v", h2Conn, h2Conn.conn.RemoteAddr())
+	if err := h2Conn.sendPing(); err != nil {
+		reason := fmt.Sprintf("ping-failed: %v", err)
+		h2Conn.setCloseReason(reason)
+		log.Infof("h2 conn %v: PING failed (%v), closing connection", h2Conn.conn.RemoteAddr(), err)
+		h2Conn.setClose()
+	}
+}
+
+// sendPing writes a PING frame and waits for the server's ACK.
+// It returns nil on success, or an error if the ACK does not arrive within
+// pingTimeout or the connection is closed in the meantime.
+func (h2Conn *http2ClientConn) sendPing() error {
+	if h2Conn.pendingPings == nil {
+		return utils.Error("h2 conn: pendingPings not initialised")
+	}
+
+	// Build a unique 8-byte PING payload from a per-connection counter.
+	seq := atomic.AddInt64(&h2Conn.pingSeq, 1)
+	var data [8]byte
+	binary.BigEndian.PutUint64(data[:], uint64(seq))
+
+	ackCh := make(chan struct{}, 1)
+	h2Conn.pingMu.Lock()
+	h2Conn.pendingPings[data] = ackCh
+	h2Conn.pingMu.Unlock()
+
+	defer func() {
+		h2Conn.pingMu.Lock()
+		delete(h2Conn.pendingPings, data)
+		h2Conn.pingMu.Unlock()
+	}()
+
+	h2Conn.frWriteMutex.Lock()
+	err := h2Conn.fr.WritePing(false, data)
+	h2Conn.frWriteMutex.Unlock()
+	if err != nil {
+		return utils.Wrapf(err, "h2 conn: write PING failed")
+	}
+
+	timeout := h2Conn.pingTimeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-ackCh:
+		return nil
+	case <-timer.C:
+		return utils.Errorf("h2 conn: PING ACK timeout after %v", timeout)
+	case <-h2Conn.closeCh:
+		return utils.Error("h2 conn: connection closed while waiting for PING ACK")
+	}
 }

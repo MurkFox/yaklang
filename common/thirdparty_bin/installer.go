@@ -10,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"time"
 
 	"github.com/gobwas/glob"
+	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/lowhttp"
@@ -52,6 +54,25 @@ func NewInstaller(defaultInstallDir, downloadDir string) Installer {
 	}
 }
 
+// resolveInstallDir 根据 descriptor.InstallRoot 决定使用哪个安装根目录
+// 取值 "ai-skills" 落到 ~/yakit-projects/ai-skills/，便于 AutoSkillLoader 自动发现
+// 取值 "libs" 或空字符串保持现有 yakit-projects/libs/ 默认行为
+// 关键词: install_root, ai-skills, libs, 安装根目录覆盖, resolveInstallDir
+func (bi *BaseInstaller) resolveInstallDir(descriptor *BinaryDescriptor) string {
+	if descriptor == nil {
+		return bi.defaultInstallDir
+	}
+	switch descriptor.InstallRoot {
+	case "ai-skills":
+		return consts.GetDefaultAISkillsDir()
+	case "libs", "":
+		return bi.defaultInstallDir
+	default:
+		log.Warnf("unknown install_root %q for %s, falling back to default libs dir", descriptor.InstallRoot, descriptor.Name)
+		return bi.defaultInstallDir
+	}
+}
+
 // Uninstall 卸载二进制文件
 func (bi *BaseInstaller) Uninstall(descriptor *BinaryDescriptor, options *InstallOptions) error {
 	if options == nil {
@@ -76,21 +97,35 @@ func (bi *BaseInstaller) Uninstall(descriptor *BinaryDescriptor, options *Instal
 		return err
 	}
 	if downloadInfo.BinDir != "" {
-		return os.RemoveAll(filepath.Join(bi.defaultInstallDir, downloadInfo.BinDir))
+		return os.RemoveAll(filepath.Join(bi.resolveInstallDir(descriptor), downloadInfo.BinDir))
 	}
 
 	return os.Remove(installPath)
 }
 
 // findMatchingPlatform 查找匹配当前平台的下载信息
+// 优先级:
+//  1. 精确匹配 (例如 platformKey="darwin-amd64" 命中 "darwin-amd64")
+//  2. glob 模式匹配, 按 pattern 字典序降序遍历, 保证结果稳定
+//     字典序降序使前缀已知 + 后缀通配的 pattern (如 "darwin-*") 优先于
+//     前缀通配的 pattern (如 "*-arm64"), 与既有用例期望一致
+//
+// 关键词: 平台匹配优先级, glob pattern 排序, deterministic platform resolve
 func (bi *BaseInstaller) findMatchingPlatform(downloadInfoMap map[string]*DownloadInfo, platformKey string) (*DownloadInfo, string, error) {
 	// 首先尝试精确匹配
 	if downloadInfo, exists := downloadInfoMap[platformKey]; exists {
 		return downloadInfo, platformKey, nil
 	}
 
-	// 然后尝试glob模式匹配
-	for pattern, downloadInfo := range downloadInfoMap {
+	// 然后按 pattern 字典序降序遍历, 保证 glob 匹配结果稳定 (避免 map 遍历无序导致的 flaky)
+	patterns := make([]string, 0, len(downloadInfoMap))
+	for pattern := range downloadInfoMap {
+		patterns = append(patterns, pattern)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(patterns)))
+
+	for _, pattern := range patterns {
+		downloadInfo := downloadInfoMap[pattern]
 		// 编译glob模式
 		g, err := glob.Compile(pattern)
 		if err != nil {
@@ -214,10 +249,13 @@ func (bi *BaseInstaller) Install(descriptor *BinaryDescriptor, options *InstallO
 	var installErr error
 	switch installType {
 	case "archive":
+		// 默认空 password = 无密码，向后兼容；非空时走 ExtractFileWithPassword
+		// 关键词: archive install with password, ExtractFileWithPassword, 加密 zip 安装
+		password := downloadInfo.Password
 		if isDir {
-			installErr = ExtractFile(filePath, installDir, descriptor.ArchiveType, pick, true)
+			installErr = ExtractFileWithPassword(filePath, installDir, descriptor.ArchiveType, pick, true, password)
 		} else {
-			installErr = ExtractFile(filePath, installPath, descriptor.ArchiveType, pick, false)
+			installErr = ExtractFileWithPassword(filePath, installPath, descriptor.ArchiveType, pick, false, password)
 		}
 	case "bin":
 		installErr = os.Rename(filePath, installPath)
@@ -249,7 +287,7 @@ func (bi *BaseInstaller) GetInstallDir(descriptor *BinaryDescriptor, options *In
 		return ""
 	}
 	if downloadInfo.BinDir != "" {
-		return filepath.Join(bi.defaultInstallDir, downloadInfo.BinDir)
+		return filepath.Join(bi.resolveInstallDir(descriptor), downloadInfo.BinDir)
 	}
 	return ""
 }
@@ -271,11 +309,12 @@ func (bi *BaseInstaller) GetTargetPath(descriptor *BinaryDescriptor, options *In
 	if err != nil {
 		return ""
 	}
+	installRoot := bi.resolveInstallDir(descriptor)
 	var targetPath string
 	if downloadInfo.BinPath != "" {
-		targetPath = filepath.Join(bi.defaultInstallDir, downloadInfo.BinPath)
+		targetPath = filepath.Join(installRoot, downloadInfo.BinPath)
 	} else {
-		targetPath = filepath.Join(bi.defaultInstallDir, descriptor.Name)
+		targetPath = filepath.Join(installRoot, descriptor.Name)
 	}
 	return targetPath
 }

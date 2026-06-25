@@ -171,7 +171,7 @@ func (s *SSABuilder) BuildFromAST(raw ssa.FrontAST, b *ssa.FunctionBuilder) erro
 	return nil
 }
 
-func (s *SSABuilder) WrapWithPreprocessedFS(fs fi.FileSystem) fi.FileSystem {
+func (s *SSABuilder) WrapWithPreprocessedFS(fs fi.FileSystem, _ bool) fi.FileSystem {
 	return fs
 }
 
@@ -198,6 +198,9 @@ func Frontend(src string, caches ...*ssa.AntlrCache) (phpparser.IHtmlDocumentCon
 	var cache *ssa.AntlrCache
 	if len(caches) > 0 {
 		cache = caches[0]
+	}
+	if rewritten, ok := rewriteSingleSemicolonNamespaceUseBlock(src); ok {
+		src = rewritten
 	}
 	return antlr4util.ParseASTWithSLLFirst(
 		src,

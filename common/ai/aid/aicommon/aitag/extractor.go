@@ -262,10 +262,30 @@ func (p *Parser) parseStream(reader io.Reader) error {
 					n, err := reader.Read(nextByte)
 					if n > 0 {
 						pendingBytes.WriteByte(nextByte[0])
+						tagPrefix := ""
 						if nextByte[0] == '|' {
+							tagPrefix = "<|"
+						} else if nextByte[0] == '/' {
+							n, err := reader.Read(nextByte)
+							if n > 0 {
+								pendingBytes.WriteByte(nextByte[0])
+								if nextByte[0] == '|' {
+									tagPrefix = "</|"
+								}
+							}
+							if err != nil {
+								if err == io.EOF {
+									contentPipe.Write(pendingBytes.Bytes())
+									pendingBytes.Reset()
+									continue
+								}
+								return fmt.Errorf("failed to read stream: %w", err)
+							}
+						}
+						if tagPrefix != "" {
 							// We have <|, now scan for the full end tag
 							tagBuffer := &bytes.Buffer{}
-							tagBuffer.WriteString("<|")
+							tagBuffer.WriteString(tagPrefix)
 
 							found := false
 							for i := 0; i < 200; i++ {
@@ -344,7 +364,7 @@ func (p *Parser) parseStream(reader io.Reader) error {
 							}
 
 						} else {
-							// Not a tag start, write pending content (includes <ch>)
+							// Not a tag start, write pending content as-is
 							contentPipe.Write(pendingBytes.Bytes())
 							pendingBytes.Reset()
 						}
@@ -413,17 +433,17 @@ func (p *Parser) findTagEnd(content string, start int) int {
 	return -1
 }
 
-// parseStartTag parses a start tag and returns tagName and nonce
+// parseStartTagLiteral parses a start tag literal and returns tagName and nonce
 // Expected format: <|TAGNAME_NONCE|>
-func (p *Parser) parseStartTag(tagStr string) (string, string) {
+// 包级纯函数，无状态依赖，供 Parser 与 splitter 共用
+// 关键词: aitag, parseStartTagLiteral, 起始标签解析
+func parseStartTagLiteral(tagStr string) (string, string) {
 	if len(tagStr) < 5 || tagStr[:2] != "<|" || tagStr[len(tagStr)-2:] != "|>" {
 		return "", ""
 	}
 
-	// Remove <| and |>
 	inner := tagStr[2 : len(tagStr)-2]
 
-	// Find the last underscore (to separate tag name from nonce)
 	underscorePos := -1
 	for i := len(inner) - 1; i >= 0; i-- {
 		if inner[i] == '_' {
@@ -439,7 +459,6 @@ func (p *Parser) parseStartTag(tagStr string) (string, string) {
 	tagName := inner[:underscorePos]
 	nonce := inner[underscorePos+1:]
 
-	// Validate tag name (letters, digits, underscore allowed)
 	for _, ch := range tagName {
 		if !unicode.IsLetter(ch) && !unicode.IsDigit(ch) && ch != '_' {
 			return "", ""
@@ -449,17 +468,20 @@ func (p *Parser) parseStartTag(tagStr string) (string, string) {
 	return tagName, nonce
 }
 
-// parseEndTag parses an end tag and returns tagName and nonce
-// Expected format: <|TAGNAME_END_NONCE|>
-func (p *Parser) parseEndTag(tagStr string) (string, string) {
+// parseEndTagLiteral parses an end tag literal and returns tagName and nonce
+// Expected format: <|TAGNAME_END_NONCE|> or </|TAGNAME_END_NONCE|>
+// 包级纯函数，无状态依赖，供 Parser 与 splitter 共用
+// 关键词: aitag, parseEndTagLiteral, 结束标签解析
+func parseEndTagLiteral(tagStr string) (string, string) {
+	if len(tagStr) >= 3 && tagStr[:3] == "</|" {
+		tagStr = "<|" + tagStr[3:]
+	}
 	if len(tagStr) < 9 || tagStr[:2] != "<|" || tagStr[len(tagStr)-2:] != "|>" {
 		return "", ""
 	}
 
-	// Remove <| and |>
 	inner := tagStr[2 : len(tagStr)-2]
 
-	// Must contain "_END_"
 	endPos := -1
 	for i := 0; i <= len(inner)-4; i++ {
 		if inner[i:i+4] == "_END" && i+4 < len(inner) && inner[i+4] == '_' {
@@ -473,9 +495,8 @@ func (p *Parser) parseEndTag(tagStr string) (string, string) {
 	}
 
 	tagName := inner[:endPos]
-	nonce := inner[endPos+5:] // Skip "_END_"
+	nonce := inner[endPos+5:]
 
-	// Validate tag name (letters, digits, underscore allowed)
 	for _, ch := range tagName {
 		if !unicode.IsLetter(ch) && !unicode.IsDigit(ch) && ch != '_' {
 			return "", ""
@@ -483,6 +504,18 @@ func (p *Parser) parseEndTag(tagStr string) (string, string) {
 	}
 
 	return tagName, nonce
+}
+
+// parseStartTag parses a start tag and returns tagName and nonce
+// Expected format: <|TAGNAME_NONCE|>
+func (p *Parser) parseStartTag(tagStr string) (string, string) {
+	return parseStartTagLiteral(tagStr)
+}
+
+// parseEndTag parses an end tag and returns tagName and nonce
+// Expected format: <|TAGNAME_END_NONCE|>
+func (p *Parser) parseEndTag(tagStr string) (string, string) {
+	return parseEndTagLiteral(tagStr)
 }
 
 // ParseWithCallbacks is a convenience function that allows passing multiple callbacks

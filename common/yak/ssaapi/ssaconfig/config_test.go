@@ -2,6 +2,7 @@ package ssaconfig
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -25,6 +26,14 @@ func TestConfigInitializationByMode(t *testing.T) {
 	require.Equal(t, ModeSyntaxFlowScan, cfg.Mode)
 }
 
+func TestCompileConcurrencyFallsBackToDefault(t *testing.T) {
+	cfg, err := New(ModeSSACompile)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	require.Equal(t, defaultCompileConcurrency(), cfg.GetCompileConcurrency())
+}
+
 func TestConfigWithOptions(t *testing.T) {
 	cfg, err := New(
 		ModeAll,
@@ -37,6 +46,7 @@ func TestConfigWithOptions(t *testing.T) {
 		WithCompileReCompile(true),
 		WithCompileMemoryCompile(true),
 		WithCompileConcurrency(17),
+		WithCompileASTSequence(ReverseOrder),
 		WithCodeSourceKind(CodeSourceGit),
 		WithCodeSourceLocalFile("/tmp/yak"),
 		WithCodeSourceURL("https://example.com/yak.git"),
@@ -71,6 +81,7 @@ func TestConfigWithOptions(t *testing.T) {
 	require.True(t, cfg.GetCompileReCompile())
 	require.True(t, cfg.GetCompileMemory())
 	require.Equal(t, int(17), cfg.GetCompileConcurrency())
+	require.Equal(t, ReverseOrder, cfg.GetCompileASTSequence())
 
 	require.Equal(t, CodeSourceGit, cfg.GetCodeSourceKind())
 	require.Equal(t, "/tmp/yak", cfg.GetCodeSourceLocalFile())
@@ -99,6 +110,22 @@ func TestConfigWithOptions(t *testing.T) {
 	require.Equal(t, "sql", cfg.SyntaxFlowRule.RuleFilter.Keyword)
 	require.True(t, cfg.SyntaxFlowRule.RuleFilter.IncludeLibraryRule)
 	require.Equal(t, "/tmp/key", cfg.GetCodeSourceAuth().KeyPath)
+}
+
+func TestCompileASTSequenceJSONRoundTrip(t *testing.T) {
+	cfg, err := New(
+		ModeAll,
+		WithProjectLanguage(JAVA),
+		WithCompileASTSequence(Order),
+	)
+	require.NoError(t, err)
+
+	raw, err := cfg.ToJSONRaw()
+	require.NoError(t, err)
+
+	cloned, err := NewCLIScanConfig(WithJsonRawConfig(raw))
+	require.NoError(t, err)
+	require.Equal(t, Order, cloned.GetCompileASTSequence())
 }
 
 func TestWithScanRaw(t *testing.T) {
@@ -304,7 +331,9 @@ func TestDefaultFactoryFunctions(t *testing.T) {
 		require.Empty(t, config.ExcludeFiles)
 		require.False(t, config.ReCompile)
 		require.False(t, config.MemoryCompile)
-		require.Equal(t, 1, config.Concurrency)
+		require.Equal(t, defaultCompileConcurrency(), config.Concurrency)
+		require.Equal(t, time.Second, config.CompileIrCacheTTL)
+		require.Equal(t, 5000, config.CompileIrCacheMax)
 	})
 
 	t.Run("defaultSyntaxFlowConfig", func(t *testing.T) {

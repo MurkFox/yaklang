@@ -3,6 +3,7 @@ package sfvm
 import (
 	"context"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
@@ -27,6 +28,11 @@ const (
 	RecursiveConfig_Until = "until"
 	// RecursiveConfig_Hook 会对匹配到的每个Value执行配置项的sfRule，但是不会影响最终结果，其数据流会持续流动。
 	RecursiveConfig_Hook = "hook"
+	// RecursiveConfig_OnlyReachable / IncludeReachable / ExcludeReachable: CFG anchor by symbol (e.g. `` `$cfg` `` from <getCfg>),
+	// composable with until / include / exclude / hook. Positive keys keep defs whose SSA site can reach the anchor; exclude_reachable inverts.
+	RecursiveConfig_OnlyReachable     = "only_reachable"
+	RecursiveConfig_IncludeReachable  = "include_reachable"
+	RecursiveConfig_ExcludeReachable  = "exclude_reachable"
 	// un-used now
 	RecursiveConfig_Filter = "filter"
 )
@@ -47,6 +53,12 @@ func FormatRecursiveConfigKey(i string) RecursiveConfigKey {
 		return RecursiveConfig_Hook
 	case "include":
 		return RecursiveConfig_Include
+	case "only_reachable", "onlyreachable", "only-reachable":
+		return RecursiveConfig_OnlyReachable
+	case "include_reachable", "includereachable", "include-reachable":
+		return RecursiveConfig_IncludeReachable
+	case "exclude_reachable", "excludereachable", "exclude-reachable":
+		return RecursiveConfig_ExcludeReachable
 	default:
 		log.Warnf("unknown recursive config key: %s", i)
 	}
@@ -57,6 +69,37 @@ type RecursiveConfigItem struct {
 	Key            string `json:"key"`
 	Value          string `json:"value"`
 	SyntaxFlowRule bool   `json:"syntax_flow_rule"`
+}
+
+// FormatRecursiveConfigSummary renders recursive #-> / #-< config for UI progress logs
+// (avoids Go's default slice-of-pointers formatting like [0xc0…]).
+func FormatRecursiveConfigSummary(cfg []*RecursiveConfigItem) string {
+	if len(cfg) == 0 {
+		return ""
+	}
+	const maxValRunes = 120
+	var b strings.Builder
+	for i, item := range cfg {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if item == nil {
+			b.WriteString("<nil>")
+			continue
+		}
+		b.WriteString(item.Key)
+		b.WriteString("=")
+		val := item.Value
+		if utf8.RuneCountInString(val) > maxValRunes {
+			rs := []rune(val)
+			val = string(rs[:maxValRunes]) + "..."
+		}
+		b.WriteString(val)
+		if item.SyntaxFlowRule {
+			b.WriteString(" [sf]")
+		}
+	}
+	return b.String()
 }
 
 type AnalysisContext struct {

@@ -80,6 +80,7 @@ func (r *ReAct) _invokeToolCall_IntervalReviewWithContext(
 
 	transErr := aicommon.CallAITransaction(r.config, prompt, r.config.CallSpeedPriorityAI,
 		func(rsp *aicommon.AIResponse) error {
+			boundEmitter := rsp.BindEmitter(r.Emitter)
 			action, err := aicommon.ExtractActionFromStream(
 				ctx,
 				rsp.GetOutputStreamReader("interval-review", true, r.Emitter),
@@ -93,13 +94,13 @@ func (r *ReAct) _invokeToolCall_IntervalReviewWithContext(
 					}
 					switch key {
 					case "estimated_remaining_time":
-						r.Emitter.EmitDefaultStreamEvent(
+						boundEmitter.EmitDefaultStreamEvent(
 							"interval-review",
 							strings.NewReader("预估时间："+content),
 							rsp.GetTaskIndex(),
 						)
 					default:
-						r.Emitter.EmitDefaultStreamEvent(
+						boundEmitter.EmitDefaultStreamEvent(
 							"interval-review",
 							strings.NewReader(content),
 							rsp.GetTaskIndex(),
@@ -141,6 +142,7 @@ func (r *ReAct) _invokeToolCall_IntervalReviewWithContext(
 			}
 			return nil
 		},
+		aicommon.WithAIRequest_CallerLabel("toolcall-interval-review"),
 	)
 
 	if transErr != nil {

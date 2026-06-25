@@ -88,6 +88,11 @@ func (r *ReAct) reviewAIForge(
 				"determite aiforge[%v]'s params is proper? why?",
 				ins.ForgeName,
 			), reviewParams)
+			// 价值评估 (review_decision): 监控 aiforge 执行审批通路.
+			r.config.SubmitReviewValueFeedbackFromEndpoint(ep, aicommon.ReviewFocusModeAIForge, fmt.Sprintf(
+				"determite aiforge[%v]'s params is proper? why?",
+				ins.ForgeName,
+			))
 		})
 	}
 	defer func() {
@@ -134,6 +139,12 @@ func (r *ReAct) invokeBlueprint(forgeName string) (*schema.AIForge, aitool.Invok
 		r.Emitter.EmitError(fmt.Sprintf("AI Blueprint '%s' configuration error", forgeName))
 		return nil, nil, utils.Errorf("AI Blueprint '%s' instance is nil", forgeName)
 	}
+	if !schema.IsRunnableForgeType(ins.ForgeType) {
+		err := utils.Errorf("AI Blueprint '%s' is not runnable, forge_type=%s", forgeName, ins.ForgeType)
+		r.AddToTimeline("[BLUEPRINT_NON_RUNNABLE]", err.Error())
+		r.Emitter.EmitError(fmt.Sprintf("AI Blueprint '%s' is not runnable", forgeName))
+		return nil, nil, err
+	}
 
 	// 记录成功找到 Forge
 	r.AddToTimeline("[BLUEPRINT_FOUND]", fmt.Sprintf("AI Blueprint: %s (%s)", ins.ForgeName, ins.ForgeVerboseName))
@@ -156,7 +167,7 @@ func (r *ReAct) invokeBlueprint(forgeName string) (*schema.AIForge, aitool.Invok
 	err = aicommon.CallAITransaction(
 		r.config, prompt, r.config.CallAI,
 		func(rsp *aicommon.AIResponse) error {
-			emitter := r.config.GetEmitter()
+			emitter := rsp.BindEmitter(r.config.GetEmitter())
 			stream := rsp.GetOutputStreamReader("call-forge", true, emitter)
 
 			var response bytes.Buffer
@@ -217,6 +228,7 @@ func (r *ReAct) invokeBlueprint(forgeName string) (*schema.AIForge, aitool.Invok
 				fmt.Sprintf("Parameters for '%s': %v", forgeName, utils.ShrinkString(utils.InterfaceToString(forgeParams), 200)))
 			return nil
 		},
+		aicommon.WithAIRequest_CallerLabel("blueprint"),
 	)
 	if err != nil {
 		r.Emitter.EmitError(fmt.Sprintf("Failed to prepare AI Blueprint '%s': %v", forgeName, err))

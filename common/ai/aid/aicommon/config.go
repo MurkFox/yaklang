@@ -20,6 +20,7 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools/fstools"
 	"github.com/yaklang/yaklang/common/ai/aispec"
+	"github.com/yaklang/yaklang/common/ai/ytoken"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
@@ -30,9 +31,19 @@ import (
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
+// DefaultPeriodicVerificationInterval 是 verification iter 门的基础节拍.
+// 调整自 5 -> 6, 与 verification_gate.go 中 token 门冷静期 (3 iter) +
+// 首次提前门 (iter=3) 配合, 形成 "6 iter 1 次基础 verify, 中间不超过 1 次
+// 加速器 verify, 首次反馈在 iter=3 提前到位" 的整体节流模型. 详见
+// reactloops/docs/16-verification-frequency-experiment.md.
+// 关键词: DefaultPeriodicVerificationInterval 6, iter 门基础节拍, verification 节流
+const DefaultPeriodicVerificationInterval = 6
+
 type ConfigOption func(*Config) error
 
 var configOptionIDRegistry sync.Map
+
+const ConfigKeyToolCallIntervalReviewExtraPrompt = "tool_call_interval_review_extra_prompt"
 
 type configIDOptionMeta struct {
 	id  string
@@ -140,10 +151,11 @@ type Config struct {
 	SeqIdProvider *utils.AtomicInt64IDProvider
 
 	// session id
-	PersistentSessionId  string
-	SessionTitle         string
-	PrevSessionUserInput string // last FreeInput restored from the previous persistent session round
-	UserInputHistory     []schema.AIAgentUserInputRecord
+	PersistentSessionId string
+	// SessionSource is persisted to ai_sessions_v1.source (e.g. ide, cli).
+	SessionSource      string
+	SessionTitle       string
+	SessionPromptState *SessionPromptState
 
 	// memory triage id
 	MemoryTriageId string
@@ -154,6 +166,8 @@ type Config struct {
 	// Input Event Loop
 	StartInputEventOnce sync.Once
 	EventInputChan      *chanx.UnlimitedChan[*ypb.AIInputEvent]
+	EventLoopStartHook  func()
+	EventLoopDoneHook   func()
 
 	InputEventManager *AIInputEventProcessor
 
@@ -173,10 +187,16 @@ type Config struct {
 	/*
 		AI Call
 	*/
-	// call back
-	OriginalAICallback        AICallbackType // 原始 ai 回调, 用于 异步任务，不占用id
-	QualityPriorityAICallback AICallbackType // 质量优先 ai 回调
-	SpeedPriorityAICallback   AICallbackType // 速度优先 ai 回调
+	AICallbacks *AICallbacks
+
+	// userUsageCallback 由用户脚本通过 ai.usageCallback(...) 注册并经
+	// aiengine.WithAIConfig 透传. Tiered AI 路径
+	// (GetXxxAIModelCallback -> CreateCallbackFromConfig) 重新构造 callback 时
+	// 不会读取 aispec.AIConfig.UsageCallback, 因此独立保存在这里,
+	// 各 tier callback 在调用 LoadAIService 之前再注入到 opts,
+	// 从而让上游 LLM 末帧的 token usage (cached_tokens 等) 触达用户脚本.
+	// 关键词: usageCallback Tiered 透传, cached_tokens 客户端可见
+	userUsageCallback func(*aispec.ChatUsage)
 
 	//aiServiceName
 	AiServerName string
@@ -191,11 +211,17 @@ type Config struct {
 	/*
 		Prompt Manager
 	*/
-	TopToolsCount          int  // Number of top tools to display in prompt
+	// TopToolsCount 是 Tool Inventory 段的候选池上限 (按 getPrioritizedTools
+	// 排序后取前 N 个), 真正展示给 LLM 的工具数量再由 aicommon.SelectToolsByTokenBudget
+	// 按 token 预算从候选池里二次裁剪, 同时保底 ToolInventoryMinCount 个.
+	// 这个字段不是"实际展示数量", 而是"候选数量上限", 用 WithTopToolsCount(N)
+	// 可以缩窄候选池 (例如限制只看排序最前的 30 个), 但展示上限仍以 token 预算为准.
+	// 关键词: TopToolsCount 候选池上限, token 预算二次裁剪, 保底 20
+	TopToolsCount          int
 	ShowForgeListInPrompt  bool // Whether to show forge list in base prompt (default false, forges discoverable via search_capabilities)
 	AiForgeManager         AIForgeFactory
 	ContextProviderManager *ContextProviderManager
-	UserPresetPrompt       string // max 4000 chars, appended to every AI request via AITAG, affects preferences only
+	UserPresetPrompt       string // max 4000 chars, retained for request-scoped compatibility; global guidance comes from AIGlobalConfig.AIPresetPrompt
 
 	/*
 		AI Tool
@@ -203,12 +229,23 @@ type Config struct {
 	// tool manager
 	AiToolManager *buildinaitools.AiToolManager
 
+	// browserSessionTracker records browser ids opened by yak tools for session cleanup.
+	browserSessionTracker BrowserSessionTracker
+
 	// tool config
 	DisableToolUse      bool
 	AiToolManagerOption []buildinaitools.ToolManagerOption
 	EnableAISearch      bool
 	DisableWebSearch    bool // disable enhanced web search tool, default false (enabled)
 	DisallowMCPServers  bool // 禁用 MCP Servers，默认为 false（即默认启用）
+
+	// ExtraMCPServers 会话级显式挂载的 MCP server（不读 profile DB、不进全局列表）。
+	// 仅在本字段非空时激活，默认 nil，对现有流程零影响。
+	ExtraMCPServers []*ExtraMCPServer
+
+	// RestrictToolsToExtraMCPServers 为 true 时，会话的工具集被钳制为仅 ExtraMCPServers
+	// 暴露的工具：禁用工具搜索/forge/内置工具，使 agent 无法触达本地 yak 工具（如 ssa-risk）。
+	RestrictToolsToExtraMCPServers bool
 
 	// Interactive(review/require_user/sync) features
 	// endpoint manager
@@ -239,11 +276,13 @@ type Config struct {
 	// timeline
 	Timeline                  *Timeline
 	TimelineDiffer            *TimelineDiffer
-	TimelineContentSizeLimit  int
-	TimelineTotalContentLimit int
+	TimelineContentSizeLimit  int // in tokens
+	TimelineTotalContentLimit int // in tokens
 
 	// triage
-	MemoryTriage         MemoryTriage
+	MemoryTriage MemoryTriage
+
+	TimelineArchiveStore TimelineArchiveStore
 	MemoryPoolSize       int64
 	MemoryPool           *omap.OrderedMap[string, *MemoryEntity]
 	EnableSelfReflection bool
@@ -256,15 +295,20 @@ type Config struct {
 	*/
 	// Plan manager
 	AllowPlanUserInteract    bool
+	ForceManualPlanReview    bool
 	PlanUserInteractMaxCount int64
 
 	// PlanPrompt: Additional context that will be injected into the Plan phase only.
 	// This content appears once during plan initialization and does not affect subsequent task execution.
 	PlanPrompt string
 
+	// FrozenBlockPartitionProducer holds explicit prompt frozen-block partitions.
+	FrozenBlockPartitionProducer *FrozenBlockPartitionProducer
+
 	// result processer
-	GenerateReport  bool
-	MaxTaskContinue int64
+	GenerateReport               bool
+	MaxTaskContinue              int64
+	PeriodicVerificationInterval int64
 
 	// other
 	ExtendedActionCallback map[string]func(config *Config, action *Action)
@@ -274,8 +318,9 @@ type Config struct {
 		Re-Act Mode special config
 	*/
 	// Call PE
-	EnablePlanAndExec bool // Enable plan and execution action
-	HijackPERequest   func(ctx context.Context, planPayload string) error
+	EnablePlanAndExec  bool // Enable plan and execution action
+	EnableDetachedPlan bool // Use detached plan review instead of legacy async plan-and-execute
+	HijackPERequest    func(ctx context.Context, planPayload string) error
 
 	// default Task for call tool directly
 	DefaultTask AIStatefulTask
@@ -283,9 +328,17 @@ type Config struct {
 	// Interval review config for long-running tool execution
 	// By default, AI will periodically review tool execution progress
 	// Set DisableIntervalReview to true to disable this feature
-	DisableIntervalReview  bool          // Disable interval review during tool execution (default: false, meaning enabled)
-	IntervalReviewDuration time.Duration // Duration between reviews (default 20s)
-	ToolComposeConcurrency int           // Max concurrent tool calls in tool_compose DAG (default 2)
+	DisableIntervalReview             bool          // Disable interval review during tool execution (default: false, meaning enabled)
+	IntervalReviewDuration            time.Duration // Duration between reviews (default 20s)
+	ToolCallIntervalReviewExtraPrompt string        // Extra prompt injected into tool-call interval review
+	ToolComposeConcurrency            int           // Max concurrent tool calls in tool_compose DAG (default 2)
+	PlanExecTaskConcurrency           int           // Max concurrent executable tasks per PE DAG stage (default 1)
+
+	// verificationWatchdogToolBlockingStart/End are registered by reactloops.ReActLoop
+	// around synchronous invoker tool execution (aireact.executeToolCallInternal) so the
+	// verification watchdog timer does not fire while the ReAct thread is blocked in a tool.
+	verificationWatchdogToolBlockingStart func()
+	verificationWatchdogToolBlockingEnd   func()
 
 	// iteration limit
 	MaxIterationCount int64
@@ -294,6 +347,8 @@ type Config struct {
 	EnhanceKnowledgeManager            *EnhanceKnowledgeManager
 	DisableEnhanceDirectlyAnswer       bool
 	DisableIntentRecognition           bool // 禁用意图识别（用于测试环境，避免子循环消耗 mock 响应）
+	SyncPerceptionTrigger              bool // 感知调度处同步调用 TriggerPerception（否则 goroutine 异步）
+	DisablePerception                  bool // 禁用感知层（用于测试环境，避免异步 AI 调用干扰 mock 回调）
 	PerTaskUserInteractiveLimitedTimes int64
 
 	/*
@@ -345,16 +400,137 @@ type Config struct {
 	// These are loaded back into SkillsContextManager when a new ReActLoop starts.
 	restoredSkillNames []string
 
+	// enabledCapabilities holds startup/hotpatch pre-enabled capabilities.
+	enabledCapabilities            []EnabledCapability
+	skillHotloadHandler            skillHotloadHandler
+	forgeHotloadHandler            forgeHotloadHandler
+	skillUnloadHandler             skillUnloadHandler
+	forgeUnloadHandler             forgeUnloadHandler
+	capabilityInventoryEmitHandler   capabilityInventoryEmitHandler
+	sessionSnapshot                  *sessionSnapshotState
+	hotpatchCurrentTaskIdResolver    func() string
+	capabilityHotpatchHandler        func(enable bool, caps []EnabledCapability)
+
 	/*
 		Lazy WorkDir for semantic artifact directory naming
 	*/
 	// DatabaseRecordID is the gorm primary key ID from AIAgentRuntime
-	DatabaseRecordID uint
+	DisableCreateDBRuntime bool // some liteforge or async lite agent , not save runtime to database, keep persistSession data clean
+	DatabaseRecordID       uint
 	// workDir is the lazily-created working directory path (set once, never changes)
 	workDir         string
 	workDirOnce     sync.Once
 	workDirMu       sync.RWMutex
 	artifactsPinned bool
+}
+
+type AICallbacks struct {
+	Original           AICallbackType
+	QualityPriorityRaw AICallbackType
+	SpeedPriorityRaw   AICallbackType
+	QualityPriority    AICallbackType
+	SpeedPriority      AICallbackType
+}
+
+func (callbacks *AICallbacks) RawClone() *AICallbacks {
+	if callbacks == nil {
+		return &AICallbacks{}
+	}
+	return &AICallbacks{
+		Original:           callbacks.Original,
+		QualityPriorityRaw: callbacks.QualityPriorityRaw,
+		SpeedPriorityRaw:   callbacks.SpeedPriorityRaw,
+	}
+}
+
+func (c *Config) ensureAICallbacks() *AICallbacks {
+	if c.AICallbacks == nil {
+		c.AICallbacks = &AICallbacks{}
+	}
+	return c.AICallbacks
+}
+
+func (c *Config) setOriginalAICallbackLocked(cb AICallbackType) {
+	callbacks := c.ensureAICallbacks()
+	callbacks.Original = cb
+}
+
+func (c *Config) setQualityPriorityAICallbackLocked(cb AICallbackType) {
+	callbacks := c.ensureAICallbacks()
+	callbacks.QualityPriorityRaw = cb
+	callbacks.QualityPriority = c.wrapper(cb, consts.TierIntelligent)
+}
+
+func (c *Config) setSpeedPriorityAICallbackLocked(cb AICallbackType) {
+	callbacks := c.ensureAICallbacks()
+	callbacks.SpeedPriorityRaw = cb
+	callbacks.SpeedPriority = c.wrapper(cb, consts.TierLightweight)
+}
+
+func (c *Config) setFastAICallbackLocked(cb AICallbackType) {
+	callbacks := c.ensureAICallbacks()
+	callbacks.Original = cb
+	callbacks.QualityPriorityRaw = nil
+	callbacks.SpeedPriorityRaw = nil
+	callbacks.QualityPriority = nil
+	callbacks.SpeedPriority = nil
+}
+
+func (c *Config) setAICallbacksLocked(callbacks *AICallbacks) {
+	c.AICallbacks = &AICallbacks{}
+	if callbacks == nil {
+		return
+	}
+	c.setOriginalAICallbackLocked(callbacks.Original)
+	c.setQualityPriorityAICallbackLocked(callbacks.QualityPriorityRaw)
+	c.setSpeedPriorityAICallbackLocked(callbacks.SpeedPriorityRaw)
+}
+
+func (c *Config) GetRawAICallbacks() *AICallbacks {
+	if c == nil {
+		return &AICallbacks{}
+	}
+	return c.ensureAICallbacks().RawClone()
+}
+
+func (c *Config) GetOriginalAICallback() AICallbackType {
+	if c == nil {
+		return nil
+	}
+	callbacks := c.ensureAICallbacks()
+	return callbacks.Original
+}
+
+func (c *Config) GetQualityPriorityAICallback() AICallbackType {
+	if c == nil {
+		return nil
+	}
+	callbacks := c.ensureAICallbacks()
+	return callbacks.QualityPriority
+}
+
+func (c *Config) GetSpeedPriorityAICallback() AICallbackType {
+	if c == nil {
+		return nil
+	}
+	callbacks := c.ensureAICallbacks()
+	return callbacks.SpeedPriority
+}
+
+func (c *Config) GetQualityPriorityRawAICallback() AICallbackType {
+	if c == nil {
+		return nil
+	}
+	callbacks := c.ensureAICallbacks()
+	return callbacks.QualityPriorityRaw
+}
+
+func (c *Config) GetSpeedPriorityRawAICallback() AICallbackType {
+	if c == nil {
+		return nil
+	}
+	callbacks := c.ensureAICallbacks()
+	return callbacks.SpeedPriorityRaw
 }
 
 // NewConfig creates a new Config with options
@@ -373,14 +549,9 @@ func NewConfig(ctx context.Context, opts ...ConfigOption) *Config {
 	// Initialize endpoint manager
 	config.Epm = NewEndpointManagerContext(ctx)
 	config.Epm.SetConfig(config)
-	if config.QualityPriorityAICallback == nil && config.SpeedPriorityAICallback == nil && config.OriginalAICallback == nil {
-		if config.AiServerName != "" {
-			err := config.LoadAIServiceByName(config.AiServerName, config.AiModelName)
-			if err != nil {
-				log.Errorf("load ai service failed: %v", err)
-			}
-		} else {
-			config.SetAICallback(AIChatToAICallbackType(ai.Chat)) // add default ai call back
+	if !config.AICallbackAvailable() {
+		if err := WithTieredAICallback()(config); err != nil || !config.AICallbackAvailable() {
+			log.Errorf("Failed to set AI callback: %v", err)
 		}
 	}
 	// Only create new Timeline if not already set via options (e.g., WithTimeline)
@@ -407,6 +578,9 @@ func NewConfig(ctx context.Context, opts ...ConfigOption) *Config {
 	if config.AiToolManager == nil {
 		config.AiToolManager = buildinaitools.NewToolManager(config.AiToolManagerOption...)
 	}
+	if config.AiToolManager != nil {
+		config.AiToolManager.SetDisallowMCPServers(config.DisallowMCPServers)
+	}
 
 	// Restore persistent session if configured
 	if !config.InitStatus.IsPersistentSessionRestored() {
@@ -423,6 +597,14 @@ func NewConfig(ctx context.Context, opts ...ConfigOption) *Config {
 		}
 	}
 	config.loadSkillMDForgesIntoSkillLoader()
+
+	if len(config.enabledCapabilities) > 0 {
+		if err := config.applyEnabledImmediateCapabilities(); err != nil {
+			log.Warnf("apply enabled capabilities failed: %v", err)
+		}
+	}
+
+	ensureCapabilityManagers(config)
 
 	return config
 }
@@ -461,37 +643,41 @@ func newConfig(ctx context.Context) *Config {
 		AiTaskReviewControl:                DefaultAITaskReviewControl,
 		MaxIterationCount:                  100,
 		Language:                           "zh", // Default to Chinese
-		TopToolsCount:                      15,
+		TopToolsCount:                      100,
 		ContextProviderManager:             NewContextProviderManager(),
 		AiAutoRetry:                        5,
 		AiTransactionAutoRetry:             5,
-		TimelineContentSizeLimit:           50 * 1024, // Default limit for 50k
+		TimelineContentSizeLimit:           50 * 1024, // Default limit for 50k tokens
 		Guardian:                           NewAsyncGuardian(ctx, id),
-		PerTaskUserInteractiveLimitedTimes: 3, // Default to 3 times
+		PerTaskUserInteractiveLimitedTimes: 1, // Default to 3 times
 		EnablePlanAndExec:                  true,
 		AllowRequireForUserInteract:        true,
 		ToolComposeConcurrency:             2,
+		PlanExecTaskConcurrency:            1,
 		Workdir:                            "",
-		MemoryPoolSize:                     10 * 1024,
+		MemoryPoolSize:                     10 * 1024, // 10k tokens
 		MemoryPool:                         omap.NewOrderedMap(make(map[string]*MemoryEntity)),
 		MaxTaskContinue:                    3,
+		PeriodicVerificationInterval:       DefaultPeriodicVerificationInterval,
 		GenerateReport:                     true,
 		DisallowMCPServers:                 false, // 默认启用 MCP Servers
 		MemoryTriageId:                     "default",
 		m:                                  new(sync.Mutex),
 		InitStatus:                         initStatus,
 		AiCallTokenLimit:                   40 * 1024, // Default to 40 k
+		SessionPromptState:                 NewSessionPromptState(),
 	}
 	config.AiToolManagerOption = append(config.AiToolManagerOption,
 		buildinaitools.WithNoToolsCache(),
 		buildinaitools.WithEnableAllTools(),
 	)
 
-	// Register the session artifacts context provider.
-	// This provider scans the session's working directory on every prompt build
-	// and injects a file listing (paths, sizes, modification times) into DynamicContext,
-	// so that all subsequent AI turns can see artifacts produced by async plan/forge tasks.
-	config.ContextProviderManager.Register("session_artifacts", ArtifactsContextProvider)
+	// NOTE: session_artifacts provider is intentionally NOT registered into
+	// ContextProviderManager. Routing the artifacts listing through Pure
+	// Dynamic / AutoContext flooded the dynamic segment with file metadata
+	// every turn. Prompt materials now render artifacts through first-class
+	// frozen/open blocks via RenderSessionArtifactsFrozenOpen.
+	// 关键词: session_artifacts 反注册, 一级 frozen/open, Pure Dynamic 反污染
 
 	// Initialize emitter
 	config.Emitter = NewEmitter(id, func(e *schema.AiOutputEvent) (*schema.AiOutputEvent, error) {
@@ -502,9 +688,9 @@ func newConfig(ctx context.Context) *Config {
 		return e, nil
 	})
 
-	if config.SpeedPriorityAICallback != nil {
+	if config.GetSpeedPriorityAICallback() != nil {
 		config.Emitter.SetStreamNodeIdI18nProvider(
-			buildStreamNodeIdI18nProvider(config.SpeedPriorityAICallback),
+			config.buildStreamNodeIdI18nProvider(),
 		)
 	}
 
@@ -558,7 +744,66 @@ func WithPersistentSessionId(sid string) ConfigOption {
 	}
 }
 
-// Callback setters
+// WithSessionSource sets the client/source label stored on ai_sessions_v1.
+func WithSessionSource(src string) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.SessionSource = strings.TrimSpace(src)
+		c.m.Unlock()
+		return nil
+	}
+}
+
+func WithDisableCreateDBRuntime(disable bool) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.DisableCreateDBRuntime = disable
+		c.m.Unlock()
+		return nil
+	}
+}
+
+func WithSessionPromptState(state *SessionPromptState) ConfigOption {
+	return func(c *Config) error {
+		if state != nil {
+			c.SessionPromptState = state
+		}
+		return nil
+	}
+}
+
+func WithSessionTitle(title string) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.SessionTitle = title
+		c.m.Unlock()
+		return nil
+	}
+}
+
+// WithAICallback 设置统一的 AI 回调（导出名为 aiagent.aiCallback）
+// WARNING 粗粒度的ai callback 设置，只可在测试或者功能固定单一的ai模块（如知识库蒸馏）使用，其他位置应该用 WithAutoTieredAICallback
+// 参数:
+//   - cb: AI 回调函数
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// // cb 由 aicommon 构造（示意性示例）
+// opt = aiagent.aiCallback(cb)
+// println(opt)
+// ```
 func WithAICallback(cb AICallbackType) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -571,48 +816,59 @@ func WithAICallback(cb AICallbackType) ConfigOption {
 		}
 
 		oCb := cb
-		qualityCb := c.wrapper(cb, consts.TierIntelligent)
-		speedCb := c.wrapper(cb, consts.TierLightweight)
 		c.m.Lock()
-		c.OriginalAICallback = oCb
-		c.QualityPriorityAICallback = qualityCb
-		c.SpeedPriorityAICallback = speedCb
+		c.setOriginalAICallbackLocked(oCb)
+		c.setQualityPriorityAICallbackLocked(cb)
+		c.setSpeedPriorityAICallbackLocked(cb)
 		c.m.Unlock()
 		return nil
 	}
 }
 
-func WithWrapperedAICallback(cb AICallbackType) ConfigOption {
+// WithFastAICallback 快速 ai callback 设置, 只做设置，不做任何其他的处理 包括 wrapper：主要使用场景：调用主线无关的liteforge时
+func WithFastAICallback(cb AICallbackType) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
 			c.m = &sync.Mutex{}
 		}
 
-		var qualityCb AICallbackType
-		var speedCb AICallbackType
-		if cb == nil {
-			qualityCb, err := GetIntelligentAIModelCallback()
-			if err != nil {
-				log.Errorf("failed to get intelligent AI model callback: %v, using default chat callback", err)
-			} else {
-				qualityCb = c.wrapper(qualityCb, consts.TierIntelligent)
-			}
-
-			speedCb, err = GetLightweightAIModelCallback()
-			if err != nil {
-				log.Errorf("failed to get lightweight AI model callback: %v, using default chat callback", err)
-			} else {
-				speedCb = c.wrapper(speedCb, consts.TierLightweight)
-			}
-		} else {
-			qualityCb = cb
-			speedCb = cb
-		}
-
 		c.m.Lock()
 		defer c.m.Unlock()
-		c.QualityPriorityAICallback = qualityCb
-		c.SpeedPriorityAICallback = speedCb
+		c.setFastAICallbackLocked(cb)
+		return nil
+	}
+}
+
+func WithAICallbacks(callbacks *AICallbacks) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.setAICallbacksLocked(callbacks)
+		c.m.Unlock()
+		return nil
+	}
+}
+
+func WithInheritTieredAICallback(parent *Config, force bool) ConfigOption {
+	return func(c *Config) error {
+		if parent == nil {
+			return nil
+		}
+		raw := parent.GetRawAICallbacks()
+		if raw == nil {
+			return nil
+		}
+		if raw.QualityPriorityRaw == nil && raw.SpeedPriorityRaw == nil && !force {
+			return nil
+		}
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.setAICallbacksLocked(raw)
+		c.m.Unlock()
 		return nil
 	}
 }
@@ -629,27 +885,51 @@ func WithToolManager(tm *buildinaitools.AiToolManager) ConfigOption {
 	}
 }
 
+// WithQualityPriorityAICallback 设置质量优先档的 AI 回调（导出名为 aiagent.planAICallback / coordinatorAICallback）
+// 参数:
+//   - cb: AI 回调函数
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// // cb 由 aicommon 构造（示意性示例）
+// opt = aiagent.planAICallback(cb)
+// println(opt)
+// ```
 func WithQualityPriorityAICallback(cb AICallbackType) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
 			c.m = &sync.Mutex{}
 		}
-		cb = c.wrapper(cb, consts.TierIntelligent)
 		c.m.Lock()
-		c.QualityPriorityAICallback = cb
+		c.setQualityPriorityAICallbackLocked(cb)
 		c.m.Unlock()
 		return nil
 	}
 }
 
+// WithSpeedPriorityAICallback 设置速度优先档的 AI 回调（导出名为 aiagent.taskAICallback）
+// 参数:
+//   - cb: AI 回调函数
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// // cb 由 aicommon 构造（示意性示例）
+// opt = aiagent.taskAICallback(cb)
+// println(opt)
+// ```
 func WithSpeedPriorityAICallback(cb AICallbackType) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
 			c.m = &sync.Mutex{}
 		}
-		cb = c.wrapper(cb, consts.TierLightweight)
 		c.m.Lock()
-		c.SpeedPriorityAICallback = cb
+		c.setSpeedPriorityAICallbackLocked(cb)
 		c.m.Unlock()
 		return nil
 	}
@@ -681,9 +961,8 @@ func WithTieredAICallback() ConfigOption {
 		// Configure quality priority callback (uses intelligent model)
 		intelligentCB, err := GetIntelligentAIModelCallback()
 		if err == nil {
-			intelligentCB = c.wrapper(intelligentCB, consts.TierIntelligent)
 			c.m.Lock()
-			c.QualityPriorityAICallback = intelligentCB
+			c.setQualityPriorityAICallbackLocked(intelligentCB)
 			c.m.Unlock()
 			log.Debugf("Configured quality priority callback from intelligent model")
 		} else {
@@ -692,15 +971,99 @@ func WithTieredAICallback() ConfigOption {
 
 		lightweightCB, err := GetLightweightAIModelCallback()
 		if err == nil {
-			lightweightCB = c.wrapper(lightweightCB, consts.TierLightweight)
 			c.m.Lock()
-			c.SpeedPriorityAICallback = lightweightCB
+			c.setSpeedPriorityAICallbackLocked(lightweightCB)
 			c.m.Unlock()
 			log.Debugf("Configured speed priority callback from lightweight model")
 		} else {
 			log.Warnf("Failed to load lightweight model callback: %v", err)
 		}
 
+		return nil
+	}
+}
+
+// GetUserUsageCallback 返回用户脚本通过 ai.usageCallback(...) 注册的 callback,
+// 由 Tiered AI 路径 (GetXxxAIModelCallback) 在创建 LoadAIService 时再次注入到 opts
+// 中, 修复 React loop 内 chat 不触发用户 callback 的 bug.
+// 关键词: GetUserUsageCallback, Tiered AI usage 透传
+func (c *Config) GetUserUsageCallback() func(*aispec.ChatUsage) {
+	if c == nil {
+		return nil
+	}
+	return c.userUsageCallback
+}
+
+// SetUserUsageCallback 设置 user 端的 UsageCallback. 一般由 aiengine.WithAIConfig
+// 在解析 ai.usageCallback(cb) 时调用. nil 表示禁用.
+// 关键词: SetUserUsageCallback
+func (c *Config) SetUserUsageCallback(cb func(*aispec.ChatUsage)) {
+	if c == nil {
+		return
+	}
+	if c.m == nil {
+		c.m = &sync.Mutex{}
+	}
+	c.m.Lock()
+	defer c.m.Unlock()
+	c.userUsageCallback = cb
+}
+
+// SetVerificationWatchdogToolBlockingHooks registers callbacks invoked immediately
+// before and after synchronous blocking tool execution in the ReAct invoker.
+// Pass nil for both to clear. Used by reactloops to pause the verification watchdog
+// while a tool holds the ReAct thread.
+func (c *Config) SetVerificationWatchdogToolBlockingHooks(start, end func()) {
+	if c == nil {
+		return
+	}
+	if c.m == nil {
+		c.m = &sync.Mutex{}
+	}
+	c.m.Lock()
+	defer c.m.Unlock()
+	c.verificationWatchdogToolBlockingStart = start
+	c.verificationWatchdogToolBlockingEnd = end
+}
+
+// RunVerificationWatchdogToolBlockingStart runs the registered start hook if any.
+func (c *Config) RunVerificationWatchdogToolBlockingStart() {
+	if c == nil {
+		return
+	}
+	if c.m == nil {
+		return
+	}
+	c.m.Lock()
+	fn := c.verificationWatchdogToolBlockingStart
+	c.m.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// RunVerificationWatchdogToolBlockingEnd runs the registered end hook if any.
+func (c *Config) RunVerificationWatchdogToolBlockingEnd() {
+	if c == nil {
+		return
+	}
+	if c.m == nil {
+		return
+	}
+	c.m.Lock()
+	fn := c.verificationWatchdogToolBlockingEnd
+	c.m.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// WithUserUsageCallback 把 user 端 UsageCallback 写入 Config, 供 Tiered AI 路径
+// 在重新构造 chat opts 时注入 aispec.WithUsageCallback.
+// 关键词: WithUserUsageCallback, ai.usageCallback 透传
+func WithUserUsageCallback(cb func(*aispec.ChatUsage)) ConfigOption {
+	return func(c *Config) error {
+		c.SetUserUsageCallback(cb)
 		return nil
 	}
 }
@@ -720,7 +1083,7 @@ func WithAutoTieredAICallback(defaultCallback AICallbackType) ConfigOption {
 				// Also set the original callback if not already set
 				if defaultCallback != nil { // force set original callback to default if tiered config is enabled, to ensure async tasks have a valid callback
 					c.m.Lock()
-					c.OriginalAICallback = defaultCallback
+					c.setOriginalAICallbackLocked(defaultCallback)
 					c.m.Unlock()
 				}
 				return nil
@@ -729,13 +1092,10 @@ func WithAutoTieredAICallback(defaultCallback AICallbackType) ConfigOption {
 
 		// Fall back to default callback for all priorities
 		if defaultCallback != nil {
-			originalCb := defaultCallback
-			qualityCb := c.wrapper(defaultCallback, consts.TierIntelligent)
-			speedCb := c.wrapper(defaultCallback, consts.TierLightweight)
 			c.m.Lock()
-			c.OriginalAICallback = originalCb
-			c.QualityPriorityAICallback = qualityCb
-			c.SpeedPriorityAICallback = speedCb
+			c.setOriginalAICallbackLocked(defaultCallback)
+			c.setQualityPriorityAICallbackLocked(defaultCallback)
+			c.setSpeedPriorityAICallbackLocked(defaultCallback)
 			c.m.Unlock()
 		}
 		return nil
@@ -785,12 +1145,13 @@ func WithPromptHook(hook func(string) string) ConfigOption {
 	}
 }
 
+// UserPresetPromptMaxLength is the maximum size of user preset prompt in tokens.
 const UserPresetPromptMaxLength = 4000
 
 func WithUserPresetPrompt(prompt string) ConfigOption {
 	return func(c *Config) error {
-		if len(prompt) > UserPresetPromptMaxLength {
-			prompt = prompt[:UserPresetPromptMaxLength]
+		if MeasureTokens(prompt) > UserPresetPromptMaxLength {
+			prompt = ShrinkByTokens(prompt, UserPresetPromptMaxLength)
 		}
 		c.UserPresetPrompt = prompt
 		return nil
@@ -841,26 +1202,33 @@ func WithSkillsLocalDir(dirPath string) ConfigOption {
 	}
 }
 
-// WithSkillsZipFile adds a zip file as a skill source.
+// WithSkillsArchiveFile adds an archive file as a skill source.
 // Useful for distributing skills as a single file.
-// The zip file should contain subdirectories, each with a SKILL.md file.
-// Can be called multiple times to add multiple zip files.
+// Supported archive formats are zip, tar, tar.gz and tgz.
+// The archive should contain subdirectories, each with a SKILL.md file.
+// Can be called multiple times to add multiple archive files.
 //
 // Example:
 //
-//	aicommon.WithSkillsZipFile("/path/to/skills.zip")
-func WithSkillsZipFile(zipPath string) ConfigOption {
+//	aicommon.WithSkillsArchiveFile("/path/to/skills.tar.gz")
+func WithSkillsArchiveFile(archivePath string) ConfigOption {
 	return func(c *Config) error {
 		loader := c.ensureSkillLoader()
 		if loader == nil {
 			return utils.Error("failed to ensure skill loader")
 		}
-		_, err := loader.AddZipFile(zipPath)
+		_, err := loader.AddArchiveFile(archivePath)
 		if err != nil {
-			return utils.Wrapf(err, "failed to add skills from zip: %s", zipPath)
+			return utils.Wrapf(err, "failed to add skills from archive: %s", archivePath)
 		}
 		return nil
 	}
+}
+
+// WithSkillsZipFile adds an archive file as a skill source.
+// Deprecated: use WithSkillsArchiveFile instead.
+func WithSkillsZipFile(zipPath string) ConfigOption {
+	return WithSkillsArchiveFile(zipPath)
 }
 
 // WithSkillsFS adds a filesystem as a skill source.
@@ -962,6 +1330,19 @@ func (c *Config) SaveRecentToolCache() {
 	}
 }
 
+func (c *Config) AppendRelatedRuntimeID(runtimeID string) {
+	if c == nil || c.PersistentSessionId == "" {
+		return
+	}
+	db := c.GetDB()
+	if db == nil {
+		return
+	}
+	if err := yakit.AppendAISessionMetaRelatedRuntimeID(db, c.PersistentSessionId, runtimeID); err != nil {
+		log.Warnf("failed to append related runtime id for session [%s]: %v", c.PersistentSessionId, err)
+	}
+}
+
 // WithDisableAutoSkills controls automatic loading of skills from the default directory
 // and built-in embedded skills.
 // By default (false), NewConfig will automatically load skills from ~/.yakit-projects/ai-skills
@@ -1041,6 +1422,18 @@ func WithHotPatchOptionChan(ch *chanx.UnlimitedChan[ConfigOption]) ConfigOption 
 	}
 }
 
+// WithEmitter reuses an existing emitter instead of creating a fresh one in NewConfig.
+// PE task execution passes the task-scoped emitter so child invokers inherit TaskIndex
+// processors and other stacked event metadata from the parent coordinator.
+func WithEmitter(emitter *Emitter) ConfigOption {
+	return func(c *Config) error {
+		if emitter != nil {
+			c.Emitter = emitter
+		}
+		return nil
+	}
+}
+
 // Event / output
 func WithEventHandler(handler func(e *schema.AiOutputEvent)) ConfigOption {
 	return func(c *Config) error {
@@ -1049,6 +1442,32 @@ func WithEventHandler(handler func(e *schema.AiOutputEvent)) ConfigOption {
 		}
 		c.m.Lock()
 		c.EventHandler = handler
+		c.m.Unlock()
+		return nil
+	}
+}
+
+// WithEventLoopStartHook registers a callback invoked when the ReAct input event loop starts.
+func WithEventLoopStartHook(hook func()) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.EventLoopStartHook = hook
+		c.m.Unlock()
+		return nil
+	}
+}
+
+// WithEventLoopDoneHook registers a callback invoked when the ReAct input event loop exits.
+func WithEventLoopDoneHook(hook func()) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.EventLoopDoneHook = hook
 		c.m.Unlock()
 		return nil
 	}
@@ -1203,6 +1622,18 @@ func WithAiToolManager(manager *buildinaitools.AiToolManager) ConfigOption {
 	}
 }
 
+// WithDisableToolUse 禁用工具调用（导出名为 aiagent.disableToolUse）
+// 参数:
+//   - disable: 是否禁用工具调用
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.disableToolUse(true)
+// println(opt)
+// ```
 func WithDisableToolUse(disable bool) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -1235,6 +1666,52 @@ func WithDisallowMCPServers(disallow bool) ConfigOption {
 		c.m.Lock()
 		defer c.m.Unlock()
 		c.DisallowMCPServers = disallow
+		if c.AiToolManager != nil {
+			c.AiToolManager.SetDisallowMCPServers(disallow)
+		}
+		if c.AiToolManagerOption == nil {
+			c.AiToolManagerOption = make([]buildinaitools.ToolManagerOption, 0)
+		}
+		c.AiToolManagerOption = append(c.AiToolManagerOption, buildinaitools.WithDisallowMCPServers(disallow))
+		return nil
+	}
+}
+
+// ExtraMCPServer 描述一个会话级显式挂载的 MCP server。
+// AllowedTools 非空时，client 侧只保留名字在白名单内的工具，server 多暴露的一律丢弃。
+type ExtraMCPServer struct {
+	Server       *schema.MCPServer
+	AllowedTools []string
+}
+
+// WithExtraMCPServers 为本会话挂载额外的 MCP server（内存态，不落 profile DB、不进全局列表）。
+func WithExtraMCPServers(servers ...*ExtraMCPServer) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		defer c.m.Unlock()
+		for _, s := range servers {
+			if s == nil || s.Server == nil {
+				continue
+			}
+			c.ExtraMCPServers = append(c.ExtraMCPServers, s)
+		}
+		return nil
+	}
+}
+
+// WithRestrictToolsToExtraMCPServers 钳制会话工具集为仅 ExtraMCPServers 暴露的工具，
+// 禁用工具搜索/forge/内置工具，确保 agent 只能调用注入的 session MCP 工具。
+func WithRestrictToolsToExtraMCPServers(restrict bool) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		defer c.m.Unlock()
+		c.RestrictToolsToExtraMCPServers = restrict
 		return nil
 	}
 }
@@ -1261,6 +1738,18 @@ func WithJarOperator() ConfigOption {
 	}
 }
 
+// WithOmniSearchTool 启用全网搜索工具（导出名为 aiagent.omniSearchTool）
+// 参数:
+//   - 无
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.omniSearchTool()
+// println(opt)
+// ```
 func WithOmniSearchTool() ConfigOption {
 	return func(c *Config) error {
 		return nil
@@ -1273,7 +1762,18 @@ func WithQwenNoThink() ConfigOption {
 	})
 }
 
-// Interactive / review / require_user
+// WithAllowRequireForUserInteract 设置是否允许向用户发起交互请求（导出名为 aiagent.allowRequireForUserInteract）
+// 参数:
+//   - v: 是否允许用户交互
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.allowRequireForUserInteract(true)
+// println(opt)
+// ```
 func WithAllowRequireForUserInteract(v bool) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -1286,6 +1786,19 @@ func WithAllowRequireForUserInteract(v bool) ConfigOption {
 	}
 }
 
+// WithAgreePolicy 设置操作审批策略（导出名为 aiagent.agreePolicy）
+// 参数:
+//   - p: 审批策略，如自动、AI、手动等
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// // p 由 aicommon 提供（示意性示例）
+// opt = aiagent.agreePolicy(p)
+// println(opt)
+// ```
 func WithAgreePolicy(p AgreePolicyType) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -1298,6 +1811,18 @@ func WithAgreePolicy(p AgreePolicyType) ConfigOption {
 	}
 }
 
+// WithAIAgree 设置由 AI 自动审批操作（导出名为 aiagent.agreePolicyAI）
+// 参数:
+//   - 无
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.agreePolicyAI()
+// println(opt)
+// ```
 func WithAIAgree() ConfigOption {
 	return func(c *Config) error {
 		c.m.Lock()
@@ -1307,6 +1832,18 @@ func WithAIAgree() ConfigOption {
 	}
 }
 
+// WithAgreeManual 设置由人工手动审批操作（导出名为 aiagent.agreeManual）
+// 参数:
+//   - 无
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.agreeManual()
+// println(opt)
+// ```
 func WithAgreeManual() ConfigOption {
 	return func(c *Config) error {
 		c.m.Lock()
@@ -1316,6 +1853,18 @@ func WithAgreeManual() ConfigOption {
 	}
 }
 
+// WithAgreeAuto 设置自动审批通过所有操作（导出名为 aiagent.agreeAuto）
+// 参数:
+//   - 无
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.agreeAuto()
+// println(opt)
+// ```
 func WithAgreeAuto() ConfigOption {
 	return func(c *Config) error {
 		c.m.Lock()
@@ -1451,6 +2000,22 @@ func WithAllowPlanUserInteract(v bool) ConfigOption {
 	}
 }
 
+func WithForceManualPlanReview(b ...bool) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		if len(b) > 0 {
+			c.ForceManualPlanReview = b[0]
+		} else {
+			c.ForceManualPlanReview = true
+		}
+		c.m.Unlock()
+		return nil
+	}
+}
+
 // WithPlanPrompt sets additional context that will be injected into the Plan phase only.
 // This content appears once during plan initialization and does not affect subsequent task execution.
 // It is useful for providing planning-specific instructions or constraints.
@@ -1494,6 +2059,18 @@ func WithPlanUserInteractMaxCount(i int64) ConfigOption {
 	}
 }
 
+// WithSystemFileOperator 为 AI 启用系统文件操作工具集（导出名为 aiagent.systemFileOperator）
+// 参数:
+//   - 无
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.systemFileOperator()
+// println(opt)
+// ```
 func WithSystemFileOperator() ConfigOption {
 	return func(config *Config) error {
 		tools, err := fstools.CreateSystemFSTools()
@@ -1504,6 +2081,19 @@ func WithSystemFileOperator() ConfigOption {
 	}
 }
 
+// WithTools 为 AI 批量添加可用工具（导出名为 aiagent.tools）
+// 参数:
+//   - tool: 一个或多个 AI 工具对象
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// // tool 由 aitool 构造（示意性示例）
+// opt = aiagent.tools(tool)
+// println(opt)
+// ```
 func WithTools(tool ...*aitool.Tool) ConfigOption {
 	return func(c *Config) error {
 		return WithAiToolManagerOptions(buildinaitools.WithExtendTools(tool, true))(c)
@@ -1565,6 +2155,18 @@ func WithEnablePlanAndExec(enable bool) ConfigOption {
 	}
 }
 
+func WithEnableDetachedPlan(enable bool) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.EnableDetachedPlan = enable
+		c.m.Unlock()
+		return nil
+	}
+}
+
 // WithDisableToolCallerIntervalReview disables interval review during tool execution.
 // By default, interval review is ENABLED for long-running tool calls.
 // AI will periodically review tool execution progress and decide whether to continue.
@@ -1598,6 +2200,22 @@ func WithToolCallerIntervalReviewDuration(duration time.Duration) ConfigOption {
 	}
 }
 
+// WithToolCallIntervalReviewExtraPrompt injects extra instructions into the interval review prompt
+// that runs while long-running tools are executing.
+func WithToolCallIntervalReviewExtraPrompt(prompt string) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		prompt = strings.TrimSpace(prompt)
+		c.m.Lock()
+		c.ToolCallIntervalReviewExtraPrompt = prompt
+		c.m.Unlock()
+		c.SetConfig(ConfigKeyToolCallIntervalReviewExtraPrompt, prompt)
+		return nil
+	}
+}
+
 func WithToolComposeConcurrency(n int) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -1608,6 +2226,21 @@ func WithToolComposeConcurrency(n int) ConfigOption {
 		}
 		c.m.Lock()
 		c.ToolComposeConcurrency = n
+		c.m.Unlock()
+		return nil
+	}
+}
+
+func WithPlanExecTaskConcurrency(n int) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		if n <= 0 {
+			n = 1
+		}
+		c.m.Lock()
+		c.PlanExecTaskConcurrency = n
 		c.m.Unlock()
 		return nil
 	}
@@ -1721,6 +2354,39 @@ func WithDisableIntentRecognition(disable bool) ConfigOption {
 	}
 }
 
+// WithSyncPerceptionTrigger when true, MaybeTriggerPerceptionAfterAction,
+// MaybeTriggerPerceptionAfterVerification, and TriggerPerceptionOnSpin invoke
+// TriggerPerception on the caller goroutine; when false (default), they spawn a goroutine.
+func WithSyncPerceptionTrigger(enable bool) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.SyncPerceptionTrigger = enable
+		c.m.Unlock()
+		c.SetConfig("SyncPerceptionTrigger", enable)
+		return nil
+	}
+}
+
+// WithDisablePerception disables the perception layer in all loops created from this config.
+// When disabled, no perception AI evaluations are triggered and the perception ContextProvider
+// is not registered. This is primarily used in test environments where async perception calls
+// would interfere with mocked AI callbacks.
+func WithDisablePerception(disable bool) ConfigOption {
+	return func(c *Config) error {
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.DisablePerception = disable
+		c.m.Unlock()
+		c.SetConfig("DisablePerception", disable)
+		return nil
+	}
+}
+
 // WithDisableSessionTitleGeneration disables the automatic session title generation in ReAct
 func WithDisableSessionTitleGeneration(disable bool) ConfigOption {
 	return func(c *Config) error {
@@ -1804,7 +2470,18 @@ func WithLanguage(lang string) ConfigOption {
 	}
 }
 
-// Debug flags
+// WithDebugPrompt 开启 prompt 调试输出（导出名为 aiagent.debugPrompt）
+// 参数:
+//   - v: 可选，是否开启（默认 true）
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.debugPrompt(true)
+// println(opt)
+// ```
 func WithDebugPrompt(v ...bool) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -1833,6 +2510,18 @@ func WithDebugEvent(v bool) ConfigOption {
 	}
 }
 
+// WithAgreeYOLO 设置 YOLO 模式，自动通过所有审批（导出名为 aiagent.agreeYOLO）
+// 参数:
+//   - b: 可选，是否开启 YOLO（默认 true）
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.agreeYOLO()
+// println(opt)
+// ```
 func WithAgreeYOLO(b ...bool) ConfigOption {
 	if len(b) > 0 && !b[0] {
 		return func(c *Config) error {
@@ -1844,7 +2533,19 @@ func WithAgreeYOLO(b ...bool) ConfigOption {
 
 // Add new config option helpers to match aid options used elsewhere.
 
+// WithSequence 设置起始序列号并安装自增 id 生成器（导出名为 aiagent.offsetSeq）
 // WithSequence sets the starting sequence/id and installs a simple id generator that increments it.
+// 参数:
+//   - seq: 起始序列号
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.offsetSeq(1000)
+// println(opt)
+// ```
 func WithSequence(seq int64) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -1914,7 +2615,20 @@ func WithAIKBResultMaxSize(maxSize int64) ConfigOption {
 	}
 }
 
+// WithTool 添加单个 AI 工具（导出名为 aiagent.tool）
 // WithTool is a convenience wrapper to add a single tool (delegates to WithTools).
+// 参数:
+//   - tool: AI 工具对象
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// // tool 由 aitool 构造（示意性示例）
+// opt = aiagent.tool(tool)
+// println(opt)
+// ```
 func WithTool(tool *aitool.Tool) ConfigOption {
 	return func(c *Config) error {
 		return WithTools(tool)(c)
@@ -1938,7 +2652,20 @@ func WithConsumption(input, output *int64, logUUID string, tierStats ...*omap.Or
 	}
 }
 
+// WithExtendedActionCallback 注册扩展 action 回调（导出名为 aiagent.extendedActionCallback）
 // WithExtendedActionCallback sets the ExtendedActionCallback map.
+// 参数:
+//   - name: action 名称
+//   - callback: 回调函数，参数为 (config, action)
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.extendedActionCallback("custom", func(config, action) { dump(action) })
+// println(opt)
+// ```
 func WithExtendedActionCallback(name string, callback func(config *Config, action *Action)) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -1954,12 +2681,36 @@ func WithExtendedActionCallback(name string, callback func(config *Config, actio
 	}
 }
 
+// WithDisallowRequireForUserPrompt 禁止向用户发起交互请求（导出名为 aiagent.disallowRequireForUserPrompt）
 // WithDisallowRequireForUserPrompt disables require-for-user-interact.
+// 参数:
+//   - 无
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.disallowRequireForUserPrompt()
+// println(opt)
+// ```
 func WithDisallowRequireForUserPrompt() ConfigOption {
 	return WithAllowRequireForUserInteract(false)
 }
 
+// WithManualAssistantCallback 设置人工审批回调（导出名为 aiagent.manualAssistantCallback）
 // WithManualAssistantCallback is an alias to the agree/manual callback setter.
+// 参数:
+//   - cb: 回调函数，参数为 (ctx, config)，返回审批参数与错误
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.manualAssistantCallback(func(ctx, config) { return {"suggestion": "continue"}, nil })
+// println(opt)
+// ```
 func WithManualAssistantCallback(cb func(context.Context, *Config) (aitool.InvokeParams, error)) ConfigOption {
 	return WithAgreeManualCallback(cb)
 }
@@ -1980,7 +2731,19 @@ func WithEventInputChanx(ch *chanx.UnlimitedChan[*ypb.AIInputEvent]) ConfigOptio
 	}
 }
 
+// WithDebug 同时开启 prompt 与 event 调试输出（导出名为 aiagent.debug）
 // WithDebug toggles both prompt and event debug flags.
+// 参数:
+//   - v: 是否开启调试
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.debug(true)
+// println(opt)
+// ```
 func WithDebug(v bool) ConfigOption {
 	return func(c *Config) error {
 		if c.m == nil {
@@ -2034,6 +2797,21 @@ func WithMaxTaskContinue(n int64) ConfigOption {
 	}
 }
 
+func WithPeriodicVerificationInterval(n int64) ConfigOption {
+	return func(c *Config) error {
+		if n < 0 {
+			return nil
+		}
+		if c.m == nil {
+			c.m = &sync.Mutex{}
+		}
+		c.m.Lock()
+		c.PeriodicVerificationInterval = n
+		c.m.Unlock()
+		return nil
+	}
+}
+
 func WithAppendOtherOption(opts any) ConfigOption {
 	return func(c *Config) error {
 		if opts == nil {
@@ -2049,7 +2827,19 @@ func WithAppendOtherOption(opts any) ConfigOption {
 	}
 }
 
+// WithAppendPersistentContext 追加持久化记忆的键（导出名为 aiagent.appendPersistentMemory）
 // WithAppendPersistentContext appends keys to PersistentMemory.
+// 参数:
+//   - keys: 一个或多个记忆键
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.appendPersistentMemory("target", "scope")
+// println(opt)
+// ```
 func WithAppendPersistentContext(keys ...string) ConfigOption {
 	return func(c *Config) error {
 		if len(keys) == 0 {
@@ -2065,7 +2855,19 @@ func WithAppendPersistentContext(keys ...string) ConfigOption {
 	}
 }
 
+// WithAIAutoRetry 设置 AI 调用失败时的自动重试次数（导出名为 aiagent.aiAutoRetry）
 // WithAIAutoRetry sets AiAutoRetry count.
+// 参数:
+//   - n: 重试次数（>= 0）
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.aiAutoRetry(3)
+// println(opt)
+// ```
 func WithAIAutoRetry(n int64) ConfigOption {
 	return func(c *Config) error {
 		if n < 0 {
@@ -2081,12 +2883,36 @@ func WithAIAutoRetry(n int64) ConfigOption {
 	}
 }
 
+// WithAITransactionRetry 设置 AI 事务（单次交互）的自动重试次数（导出名为 aiagent.aiTransactionRetry）
 // WithAITransactionRetry alias to existing WithAITransactionAutoRetry for naming compatibility.
+// 参数:
+//   - n: 重试次数
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.aiTransactionRetry(3)
+// println(opt)
+// ```
 func WithAITransactionRetry(n int64) ConfigOption {
 	return WithAITransactionAutoRetry(n)
 }
 
+// WithDisableOutputEvent 禁用指定类型的输出事件（导出名为 aiagent.disableOutputType）
 // WithDisableOutputEvent is a name-compatible wrapper for disabling output event types.
+// 参数:
+//   - types: 一个或多个事件类型
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.disableOutputType("stream")
+// println(opt)
+// ```
 func WithDisableOutputEvent(types ...string) ConfigOption {
 	return WithDisableOutputEventType(types...)
 }
@@ -2116,7 +2942,19 @@ func WithTimeline(t *Timeline) ConfigOption {
 	}
 }
 
+// WithTimelineContentLimit 设置 timeline 内容大小上限（导出名为 aiagent.timelineContentLimit）
 // WithTimelineContentLimit sets timeline content size limit (keeps naming parity).
+// 参数:
+//   - limit: 内容大小上限
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.timelineContentLimit(4096)
+// println(opt)
+// ```
 func WithTimelineContentLimit(limit int) ConfigOption {
 	return WithTimelineLimit(limit)
 }
@@ -2185,6 +3023,29 @@ func WithMemoryTriageId(id string) ConfigOption {
 	}
 }
 
+func WithTimelineArchiveStore(store TimelineArchiveStore) ConfigOption {
+	return func(c *Config) error {
+		c.m.Lock()
+		c.TimelineArchiveStore = store
+		c.m.Unlock()
+		return nil
+	}
+}
+
+func (c *Config) GetTimelineArchiveStore() TimelineArchiveStore {
+	if c == nil {
+		return nil
+	}
+	return c.TimelineArchiveStore
+}
+
+func (c *Config) GetPersistentSessionID() string {
+	if c == nil {
+		return ""
+	}
+	return c.PersistentSessionId
+}
+
 func WithForges(forge ...*schema.AIForge) ConfigOption {
 	return func(c *Config) error {
 		c.m.Lock()
@@ -2200,9 +3061,9 @@ func WithForges(forge ...*schema.AIForge) ConfigOption {
 
 func (c *Config) CallAI(request *AIRequest) (*AIResponse, error) {
 	for _, cb := range []AICallbackType{
-		c.QualityPriorityAICallback,
-		c.SpeedPriorityAICallback,
-		c.OriginalAICallback,
+		c.GetQualityPriorityAICallback(),
+		c.GetSpeedPriorityAICallback(),
+		c.GetOriginalAICallback(),
 	} {
 		if cb == nil {
 			continue
@@ -2214,7 +3075,7 @@ func (c *Config) CallAI(request *AIRequest) (*AIResponse, error) {
 
 func (c *Config) CallOriginalAI(request *AIRequest) (*AIResponse, error) {
 	for _, cb := range []AICallbackType{
-		c.OriginalAICallback,
+		c.GetOriginalAICallback(),
 	} {
 		if cb == nil {
 			continue
@@ -2226,8 +3087,8 @@ func (c *Config) CallOriginalAI(request *AIRequest) (*AIResponse, error) {
 
 func (c *Config) CallQualityPriorityAI(request *AIRequest) (*AIResponse, error) {
 	for _, cb := range []AICallbackType{
-		c.QualityPriorityAICallback,
-		c.OriginalAICallback,
+		c.GetQualityPriorityAICallback(),
+		c.GetOriginalAICallback(),
 	} {
 		if cb == nil {
 			continue
@@ -2239,8 +3100,8 @@ func (c *Config) CallQualityPriorityAI(request *AIRequest) (*AIResponse, error) 
 
 func (c *Config) CallSpeedPriorityAI(request *AIRequest) (*AIResponse, error) {
 	for _, cb := range []AICallbackType{
-		c.SpeedPriorityAICallback,
-		c.OriginalAICallback,
+		c.GetSpeedPriorityAICallback(),
+		c.GetOriginalAICallback(),
 	} {
 		if cb == nil {
 			continue
@@ -2273,6 +3134,8 @@ func (c *Config) CallAfterReview(seq int64, reviewQuestion string, userInput ait
 	if c.Timeline != nil {
 		c.Timeline.PushUserInteraction(UserInteractionStage_Review, seq, reviewQuestion, string(utils.Jsonify(userInput)))
 	}
+	// 价值评估 (review_decision 触发) 改由工具审批路径调用 SubmitToolReviewValueFeedback,
+	// 以便拿到原始/最终参数与审批运行时来源 (见 toolcall.go).
 }
 
 func (c *Config) AcquireId() int64 {
@@ -2285,36 +3148,140 @@ func (c *Config) AcquireId() int64 {
 	return c.SeqIdProvider.NewID()
 }
 
-func (c *Config) GetUserInputHistory() []schema.AIAgentUserInputRecord {
-	if len(c.UserInputHistory) == 0 {
+func (c *Config) GetSessionPromptState() *SessionPromptState {
+	if c == nil {
 		return nil
 	}
-	history := make([]schema.AIAgentUserInputRecord, len(c.UserInputHistory))
-	copy(history, c.UserInputHistory)
-	return history
+	if c.SessionPromptState == nil {
+		c.SessionPromptState = NewSessionPromptState()
+	}
+	return c.SessionPromptState
+}
+
+func (c *Config) GetSessionTitle() string {
+	if c == nil {
+		return ""
+	}
+	return c.SessionTitle
+}
+
+func (c *Config) SetSessionTitle(title string) {
+	if c == nil {
+		return
+	}
+	if c.m == nil {
+		c.m = &sync.Mutex{}
+	}
+	c.m.Lock()
+	c.SessionTitle = title
+	c.m.Unlock()
+}
+
+func (c *Config) GetPrevSessionUserInput() string {
+	return c.GetSessionPromptState().GetPrevSessionUserInput()
+}
+
+func (c *Config) GetUserInputHistory() []schema.AIAgentUserInputRecord {
+	return c.GetSessionPromptState().GetUserInputHistory()
 }
 
 func (c *Config) SetUserInputHistory(history []schema.AIAgentUserInputRecord) {
-	if len(history) == 0 {
-		c.UserInputHistory = nil
-		c.PrevSessionUserInput = ""
-		return
-	}
-	cloned := make([]schema.AIAgentUserInputRecord, len(history))
-	copy(cloned, history)
-	c.UserInputHistory = cloned
-	c.PrevSessionUserInput = cloned[len(cloned)-1].UserInput
+	c.GetSessionPromptState().SetUserInputHistory(history)
 }
 
 func (c *Config) AppendUserInputHistory(userInput string, timestamp time.Time) (string, error) {
-	history := c.GetUserInputHistory()
-	history = append(history, schema.AIAgentUserInputRecord{
-		Round:     len(history) + 1,
-		Timestamp: timestamp,
-		UserInput: userInput,
-	})
-	c.SetUserInputHistory(history)
-	return schema.QuoteUserInputHistory(history)
+	return c.GetSessionPromptState().AppendUserInputHistory(userInput, timestamp)
+}
+
+func (c *Config) GetSessionEvidenceRendered() string {
+	return c.GetSessionPromptState().GetSessionEvidenceRendered()
+}
+
+func (c *Config) ApplySessionEvidenceOps(ops []EvidenceOperation) {
+	if len(ops) == 0 {
+		return
+	}
+	quotedEvidence := c.GetSessionPromptState().ApplySessionEvidenceOps(ops)
+	if c.PersistentSessionId != "" && c.GetDB() != nil {
+		if err := yakit.UpdateAIAgentRuntimeEvidence(c.GetDB(), c.PersistentSessionId, quotedEvidence); err != nil {
+			log.Warnf("persist session evidence failed: %v", err)
+		}
+	}
+}
+
+// GetVerificationTodoRendered returns the rendered TODO snapshot for the
+// current session, suitable for prompt injection (loop prompt timeline-open
+// section). Returns empty string when no TODO has been tracked yet.
+//
+// 关键词: GetVerificationTodoRendered, prompt 注入, 全局 TODO
+func (c *Config) GetVerificationTodoRendered(currentScope VerificationTodoScope) string {
+	return c.GetSessionPromptState().GetVerificationTodoRendered(currentScope)
+}
+
+// ApplyVerificationTodoOps applies one verification round's next_movements to
+// the persisted TODO store. When the persistent session id is configured, the
+// resulting JSON is also flushed to DB (TODO persistence hooks may be added
+// later — for now this only updates the in-memory SessionPromptState).
+//
+// 关键词: ApplyVerificationTodoOps, Verify 写入, SessionPromptState 同步
+func (c *Config) ApplyVerificationTodoOps(scope VerificationTodoScope, satisfied bool, movements []VerifyNextMovement) []VerificationTodoApplyError {
+	if c == nil {
+		return nil
+	}
+	// 即便没有 movements, satisfied=true 也可能触发 SKIPPED 状态转换；故不 early-return.
+	return c.GetSessionPromptState().ApplyVerificationTodoOps(scope, satisfied, movements)
+}
+
+// GetVerificationTodoMarkdownDelta returns the markdown snapshot computed
+// against the current state without mutating it. Use this when you need the
+// delta markers (new / done / deleted / skipped) for a markdown stream emitted
+// BEFORE you commit the ops via ApplyVerificationTodoOps.
+func (c *Config) GetVerificationTodoMarkdownDelta(scope VerificationTodoScope, satisfied bool, movements []VerifyNextMovement) string {
+	return c.GetSessionPromptState().GetVerificationTodoMarkdownDelta(scope, satisfied, movements)
+}
+
+// SnapshotVerificationTodoItems returns a deep-copied slice of the current
+// TODO items, intended for structured event payloads.
+func (c *Config) SnapshotVerificationTodoItems() []VerificationTodoItem {
+	return c.GetSessionPromptState().SnapshotVerificationTodoItems()
+}
+
+func (c *Config) SnapshotVerificationTodoItemsByScope(scope VerificationTodoScope) []VerificationTodoItem {
+	return c.GetSessionPromptState().SnapshotVerificationTodoItemsByScope(scope)
+}
+
+// GetVerificationTodoStats returns aggregated TODO stats.
+func (c *Config) GetVerificationTodoStats() VerificationTodoStats {
+	return c.GetSessionPromptState().GetVerificationTodoStats()
+}
+
+func (c *Config) GetVerificationTodoStatsByScope(scope VerificationTodoScope) VerificationTodoStats {
+	return c.GetSessionPromptState().GetVerificationTodoStatsByScope(scope)
+}
+
+func (c *Config) HasActiveVerificationTodosByScope(scope VerificationTodoScope) bool {
+	return c.GetSessionPromptState().HasActiveVerificationTodosByScope(scope)
+}
+
+func (c *Config) ActiveVerificationTodoItemsByScope(scope VerificationTodoScope) []VerificationTodoItem {
+	return c.GetSessionPromptState().ActiveVerificationTodoItemsByScope(scope)
+}
+
+// FlushRestoredSessionEvidence persists the in-memory session evidence (restored from
+// a previous runtime) to the current runtime's DB row. This must be called after
+// the runtime DB row is created, because restorePersistentSession runs before row creation.
+func (c *Config) FlushRestoredSessionEvidence() {
+	if c.PersistentSessionId == "" || c.GetDB() == nil {
+		return
+	}
+	raw := c.GetSessionPromptState().GetSessionEvidence()
+	if raw == "" {
+		return
+	}
+	quoted := c.GetSessionPromptState().quoteEvidence(raw)
+	if err := yakit.UpdateAIAgentRuntimeEvidence(c.GetDB(), c.PersistentSessionId, quoted); err != nil {
+		log.Warnf("flush restored session evidence failed: %v", err)
+	}
 }
 
 func (c *Config) FormatUserInputHistory() string {
@@ -2331,8 +3298,8 @@ func (c *Config) FormatUserInputHistory() string {
 	return builder.String()
 }
 
-func (c *Config) FormatUserInputHistoryAITag(nonce string, maxBytes int) string {
-	body := c.formatUserInputHistoryForPrompt(maxBytes)
+func (c *Config) FormatUserInputHistoryAITag(nonce string, maxTokens int) string {
+	body := c.formatUserInputHistoryForPrompt(maxTokens)
 	if body == "" || strings.TrimSpace(nonce) == "" {
 		return body
 	}
@@ -2355,42 +3322,48 @@ func (c *Config) formatUserInputHistoryEntries() []string {
 	return entries
 }
 
-func (c *Config) formatUserInputHistoryForPrompt(maxBytes int) string {
+func (c *Config) formatUserInputHistoryForPrompt(maxTokens int) string {
 	entries := c.formatUserInputHistoryEntries()
 	if len(entries) == 0 {
 		return ""
 	}
 	header := "# Session User Input History\n"
-	if maxBytes <= 0 {
+	if maxTokens <= 0 {
 		return header + strings.Join(entries, "")
 	}
 
 	marker := "[TRUNCATED_HEAD]\n"
-	remaining := maxBytes - len(header)
+	remaining := maxTokens - MeasureTokens(header)
 	if remaining <= 0 {
 		return header
 	}
 
+	markerTokens := MeasureTokens(marker)
 	selected := make([]string, 0, len(entries))
 	truncated := false
 	for i := len(entries) - 1; i >= 0; i-- {
 		entry := entries[i]
-		needed := len(entry)
+		needed := MeasureTokens(entry)
 		if truncated {
-			needed += len(marker)
+			needed += markerTokens
 		}
 		if needed <= remaining {
 			selected = append([]string{entry}, selected...)
-			remaining -= len(entry)
+			remaining -= MeasureTokens(entry)
 			continue
 		}
 
 		keep := remaining
 		if !truncated {
-			keep -= len(marker)
+			keep -= markerTokens
 		}
 		if keep > 0 {
-			entry = marker + entry[len(entry)-keep:]
+			// Keep the tail of the entry (most recent content is more relevant)
+			tokens := ytoken.Encode(entry)
+			if len(tokens) > keep {
+				tokens = tokens[len(tokens)-keep:]
+			}
+			entry = marker + ytoken.Decode(tokens)
 			selected = append([]string{entry}, selected...)
 		}
 		truncated = true
@@ -2402,6 +3375,25 @@ func (c *Config) formatUserInputHistoryForPrompt(maxBytes int) string {
 
 func (c *Config) GetRuntimeId() string {
 	return c.Id
+}
+
+// CreateOrUpdateRuntimeRecord persists a runtime record unless DB runtime creation is disabled.
+func (c *Config) CreateOrUpdateRuntimeRecord(runtime *schema.AIAgentRuntime) error {
+	if c == nil || runtime == nil {
+		return nil
+	}
+	if c.DisableCreateDBRuntime || c.GetDB() == nil {
+		return nil
+	}
+	c.AppendRelatedRuntimeID(c.GetRuntimeId()) // just append self ID to related runtimes for long chain runtime
+
+	dbID, err := yakit.CreateOrUpdateAIAgentRuntime(c.GetDB(), runtime)
+	if err != nil {
+		return err
+	}
+	c.DatabaseRecordID = dbID
+	runtime.ID = dbID
+	return nil
 }
 
 // IsWorkDirReady checks if the working directory has been created
@@ -2497,7 +3489,35 @@ func (c *Config) IsCtxDone() bool {
 }
 
 func (c *Config) GetContext() context.Context {
-	return c.Ctx
+	if c == nil {
+		return context.Background()
+	}
+	ctx := c.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// 把 c.userUsageCallback 注入 ctx, 让子调用 (aicommon.InvokeLiteForge / enhancesearch
+	// HyDE 等走 MustGetSpeedPriorityAIModelCallback 路径的链路) 能从 ctx 拿到
+	// user 端 ai.usageCallback, 修复 LLM 末帧 token usage 在子 LiteForge 调用上漏接的 BUG.
+	// 关键词: GetContext, ctx 透传 user usage callback, P3-T5
+	if cb := c.GetUserUsageCallback(); cb != nil {
+		ctx = WithUserUsageCallbackContext(ctx, cb)
+	}
+	return ctx
+}
+
+func (c *Config) GetBrowserSessionTracker() BrowserSessionTracker {
+	if c == nil {
+		return nil
+	}
+	return c.browserSessionTracker
+}
+
+func (c *Config) SetBrowserSessionTracker(tracker BrowserSessionTracker) {
+	if c == nil {
+		return
+	}
+	c.browserSessionTracker = tracker
 }
 
 func (c *Config) CallAIResponseConsumptionCallback(i int) {
@@ -2523,6 +3543,13 @@ func (c *Config) GetToolComposeConcurrency() int {
 	return c.ToolComposeConcurrency
 }
 
+func (c *Config) GetPlanExecTaskConcurrency() int {
+	if c.PlanExecTaskConcurrency <= 0 {
+		return 1
+	}
+	return c.PlanExecTaskConcurrency
+}
+
 func (c *Config) GetTimelineContentSizeLimit() int64 {
 	return int64(c.TimelineContentSizeLimit)
 }
@@ -2546,7 +3573,26 @@ func (c *Config) RetryPromptBuilder(s string, err error) string {
 	if err == nil {
 		return s
 	}
-	return s + "\n\n[Retry due to error: " + err.Error() + "]"
+	errText := strings.TrimSpace(err.Error())
+	if errText == "" {
+		errText = "(empty error)"
+	}
+
+	var b strings.Builder
+	b.WriteString(s)
+	if !strings.HasSuffix(s, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("\n# RETRY CORRECTION - PREVIOUS RESPONSE WAS REJECTED\n")
+	b.WriteString("[Retry due to error: see validation error block below]\n\n")
+	b.WriteString("The previous response failed validation. Treat this retry correction as mandatory and higher priority than the failed response.\n")
+	b.WriteString("You MUST correct the exact validation error below in the next response.\n")
+	b.WriteString("Do NOT repeat the same invalid output. Do NOT explain the retry. Return a fresh valid response only.\n")
+	b.WriteString("If the error mentions a required tag, nonce, JSON field, schema, action name, or output format, follow that requirement exactly.\n\n")
+	b.WriteString("Validation error:\n---\n")
+	b.WriteString(errText)
+	b.WriteString("\n---\n# END RETRY CORRECTION")
+	return b.String()
 }
 
 func (c *Config) GetEmitter() *Emitter {
@@ -2571,14 +3617,16 @@ func (c *Config) UpdateAIModelInfo(provider, model string) {
 
 // EventFormat fills in common fields for AI output events
 func (c *Config) EventFormat(e *schema.AiOutputEvent) *schema.AiOutputEvent {
-	if c.AiServerName != "" {
-		e.AIService = c.AiServerName
-		e.AIModelName = c.AiModelName
-		e.AIModelVerboseName = aispec.ModelVerboseName(c.AiModelName)
-	}
-
 	if c.PersistentSessionId != "" {
 		e.SessionId = c.PersistentSessionId
+	}
+	// Fill TaskId from the current-task resolver when not explicitly set.
+	// This is critical for plan-tree events (Type=plan, NodeId=system) that are
+	// emitted from config/coordinator-level code paths.
+	if strings.TrimSpace(e.TaskId) == "" {
+		if taskId := c.resolveHotpatchCurrentTaskId(); taskId != "" {
+			e.TaskId = taskId
+		}
 	}
 	return e
 }
@@ -2606,9 +3654,17 @@ func (c *Config) emitBaseHandler(e *schema.AiOutputEvent) {
 	if c.EventHandler == nil {
 		if e.IsStream {
 			if c.DebugEvent {
-				fmt.Print(string(e.StreamDelta))
+				// 走统一的 DebugStreamPrinter, 合并同流 delta 到单行、
+				// 串行化并发流、转义内嵌换行, 避免每个 token 一行刷屏。
+				// 关键词: DEBUG 流式输出 fallback, AI emit stream coalesce
+				GetDefaultDebugStreamPrinter().PrintStreamDelta(e)
 			}
 			return
+		}
+
+		// 非流事件来了, 先把可能存在的"活动流行"收尾, 避免日志夹心。
+		if c.DebugEvent {
+			GetDefaultDebugStreamPrinter().FlushIfActive()
 		}
 
 		if e.Type == schema.EVENT_TYPE_CONSUMPTION {
@@ -2697,7 +3753,13 @@ func (c *Config) restorePersistentSession() {
 	if history := runtime.GetUserInputHistory(); len(history) > 0 {
 		c.SetUserInputHistory(history)
 		log.Infof("restored %d user input history entries from session [%s], latest: %.80s",
-			len(history), c.PersistentSessionId, c.PrevSessionUserInput)
+			len(history), c.PersistentSessionId, c.GetPrevSessionUserInput())
+	}
+
+	if evidence := runtime.GetEvidence(); evidence != "" {
+		c.GetSessionPromptState().SetSessionEvidence(evidence)
+		log.Infof("restored session evidence from session [%s], length: %d runes",
+			c.PersistentSessionId, len([]rune(evidence)))
 	}
 
 	// Restore recent-tool cache from previous session
@@ -2723,25 +3785,6 @@ func (c *Config) Done() {
 
 func (c *Config) Wait() {
 	c.wg.Wait()
-}
-
-func (c *Config) SetAICallback(callback AICallbackType) {
-	if c.m == nil {
-		c.m = &sync.Mutex{}
-	}
-
-	// if callback is nil, use default ai.Chat
-	if callback == nil {
-		callback = AIChatToAICallbackType(ai.Chat)
-	}
-
-	qualityCb := c.wrapper(callback, consts.TierIntelligent)
-	speedCb := c.wrapper(callback, consts.TierLightweight)
-	c.m.Lock()
-	defer c.m.Unlock()
-	c.OriginalAICallback = callback
-	c.QualityPriorityAICallback = qualityCb
-	c.SpeedPriorityAICallback = speedCb
 }
 
 func (c *Config) SetContext(ctx context.Context) {
@@ -2811,12 +3854,21 @@ func ConvertConfigToOptions(i *Config) []ConfigOption {
 	// Disable tool use flag
 	opts = append(opts, WithDisableToolUse(i.DisableToolUse))
 
-	// Tool manager options
+	// Capability managers: child configs reuse parent instances when present.
 	if i.AiToolManager != nil {
 		opts = append(opts, WithAiToolManager(i.AiToolManager))
 	}
 	if len(i.AiToolManagerOption) > 0 {
 		opts = append(opts, WithAiToolManagerOptions(i.AiToolManagerOption...))
+	}
+	if i.AiForgeManager != nil {
+		opts = append(opts, WithAIBlueprintManager(i.AiForgeManager))
+	}
+	if i.skillLoader != nil {
+		opts = append(opts, WithSkillLoader(i.skillLoader))
+	}
+	if i.disableAutoSkills {
+		opts = append(opts, WithDisableAutoSkills(true))
 	}
 
 	// Agree policy mapping
@@ -2829,9 +3881,8 @@ func ConvertConfigToOptions(i *Config) []ConfigOption {
 	opts = append(opts, WithAllowRequireForUserInteract(i.AllowRequireForUserInteract))
 	opts = append(opts, WithAllowPlanUserInteract(i.AllowPlanUserInteract))
 	opts = append(opts, WithEnablePlanAndExec(i.EnablePlanAndExec))
-	if i.GenerateReport {
-		opts = append(opts, WithGenerateReport(true))
-	}
+	opts = append(opts, WithEnableDetachedPlan(i.EnableDetachedPlan))
+	opts = append(opts, WithGenerateReport(i.GenerateReport))
 
 	// Retry / limits
 	if i.AiTransactionAutoRetry > 0 {
@@ -2846,12 +3897,25 @@ func ConvertConfigToOptions(i *Config) []ConfigOption {
 	if i.MaxIterationCount > 0 {
 		opts = append(opts, WithMaxIterationCount(i.MaxIterationCount))
 	}
+	opts = append(opts, WithDisableToolCallerIntervalReview(i.DisableIntervalReview))
+	if i.IntervalReviewDuration > 0 {
+		opts = append(opts, WithToolCallerIntervalReviewDuration(i.IntervalReviewDuration))
+	}
+	if i.ToolCallIntervalReviewExtraPrompt != "" {
+		opts = append(opts, WithToolCallIntervalReviewExtraPrompt(i.ToolCallIntervalReviewExtraPrompt))
+	}
 	if i.ToolComposeConcurrency > 0 {
 		opts = append(opts, WithToolComposeConcurrency(i.ToolComposeConcurrency))
+	}
+	if i.PlanExecTaskConcurrency > 0 {
+		opts = append(opts, WithPlanExecTaskConcurrency(i.PlanExecTaskConcurrency))
 	}
 	if i.MaxTaskContinue > 0 {
 		opts = append(opts, WithMaxTaskContinue(i.MaxTaskContinue))
 	}
+
+	opts = append(opts, WithPeriodicVerificationInterval(i.PeriodicVerificationInterval))
+
 	if i.PerTaskUserInteractiveLimitedTimes > 0 {
 		opts = append(opts, WithPerTaskUserInteractiveLimitedTimes(i.PerTaskUserInteractiveLimitedTimes))
 	}
@@ -2869,6 +3933,9 @@ func ConvertConfigToOptions(i *Config) []ConfigOption {
 	}
 	if i.MemoryTriage != nil {
 		opts = append(opts, WithMemoryTriage(i.MemoryTriage))
+	}
+	if i.TimelineArchiveStore != nil {
+		opts = append(opts, WithTimelineArchiveStore(i.TimelineArchiveStore))
 	}
 
 	// Misc
@@ -2908,6 +3975,10 @@ func ConvertConfigToOptions(i *Config) []ConfigOption {
 		opts = append(opts, WithEventHandler(i.EventHandler))
 	}
 
+	if i.GetUserUsageCallback() != nil {
+		opts = append(opts, WithUserUsageCallback(i.GetUserUsageCallback()))
+	}
+
 	if i.HotPatchBroadcaster != nil {
 		hotPatchChan := i.HotPatchBroadcaster.Subscribe()
 		opts = append(opts, WithHotPatchOptionChan(hotPatchChan))
@@ -2942,6 +4013,18 @@ func ConvertConfigToOptions(i *Config) []ConfigOption {
 	if i.PersistentSessionId != "" {
 		opts = append(opts, WithPersistentSessionId(i.PersistentSessionId))
 	}
+	if strings.TrimSpace(i.SessionSource) != "" {
+		opts = append(opts, WithSessionSource(i.SessionSource))
+	}
+	if i.SessionTitle != "" {
+		opts = append(opts, WithSessionTitle(i.SessionTitle))
+	}
+	if i.SessionPromptState != nil {
+		opts = append(opts, WithSessionPromptState(i.SessionPromptState))
+	}
+	if i.FrozenBlockPartitionProducer != nil {
+		opts = append(opts, WithFrozenBlockPartitionProducer(i.FrozenBlockPartitionProducer))
+	}
 
 	if i.Seq > 0 {
 		opts = append(opts, WithSequence(i.Seq))
@@ -2956,6 +4039,14 @@ func ConvertConfigToOptions(i *Config) []ConfigOption {
 	if i.DisableIntentRecognition {
 		opts = append(opts, WithDisableIntentRecognition(true))
 	}
+	if i.SyncPerceptionTrigger {
+		opts = append(opts, WithSyncPerceptionTrigger(true))
+	}
+
+	// Propagate perception disable flag so sub-loops inherit the setting.
+	if i.DisablePerception {
+		opts = append(opts, WithDisablePerception(true))
+	}
 
 	// once init config flag
 	opts = append(opts, WithInitConfigStatus(i.InitStatus))
@@ -2963,29 +4054,6 @@ func ConvertConfigToOptions(i *Config) []ConfigOption {
 	opts = append(opts, WithContext(i.Ctx))
 
 	return opts
-}
-
-func (c *Config) LoadAIServiceByName(name string, modelName string) error {
-	aiConfig, err := ai.LoadAiGatewayConfig(name)
-	if err != nil {
-		return fmt.Errorf("%s not found", name)
-	}
-	chat, err := ai.LoadChater(name)
-	if err != nil {
-		return err
-	}
-
-	cb := AIChatToAICallbackType(chat)
-	wCb := c.wrapper(cb, consts.TierIntelligent)
-	if modelName == "" {
-		modelName = aiConfig.Model
-	}
-	c.m.Lock()
-	c.OriginalAICallback = cb
-	c.SetQualityPriorityAICallbackInLock(wCb, name, modelName)
-	c.m.Unlock()
-	c.HotPatchBroadcaster.Submit(WithQualityPriorityAICallback(cb))
-	return nil
 }
 
 func (c *Config) GetConsumptionConfig() (*int64, *int64, string) {
@@ -3001,13 +4069,23 @@ func (c *Config) OriginOptions() []ConfigOption {
 	return c.originOptions
 }
 
-func (c *Config) SetQualityPriorityAICallbackInLock(callback AICallbackType, service, model string) {
-	c.QualityPriorityAICallback = callback
-	c.AiServerName = service
-	c.AiModelName = model
+func (c *Config) AICallbackAvailable() bool {
+	return !(c.GetQualityPriorityAICallback() == nil && c.GetSpeedPriorityAICallback() == nil && c.GetOriginalAICallback() == nil)
 }
 
-func buildStreamNodeIdI18nProvider(aiCallback AICallbackType) func(nodeId string) *schema.I18n {
+func (c *Config) InvokeLiteForge(prompt string, opts ...any) (*ForgeResult, error) {
+	if cb := c.GetSpeedPriorityAICallback(); cb != nil {
+		opts = append(opts, WithFastAICallback(cb))
+	} else if cb := c.GetQualityPriorityAICallback(); cb != nil {
+		opts = append(opts, WithFastAICallback(cb))
+	} else {
+		opts = append(opts, WithFastAICallback(c.GetOriginalAICallback()))
+	}
+	opts = append(opts, WithDisableCreateDBRuntime(true)) // Avoid creating runtime records for lite forge calls
+	return InvokeLiteForge(prompt, opts...)
+}
+
+func (c *Config) buildStreamNodeIdI18nProvider() func(nodeId string) *schema.I18n {
 	return func(nodeId string) *schema.I18n {
 		prompt := fmt.Sprintf(`You are a UI localization assistant for an AI agent system.
 Translate the following technical stream/node identifier into concise, user-friendly display names.
@@ -3019,14 +4097,11 @@ Requirements:
 - Chinese (zh): A short, natural Chinese phrase (2-6 characters preferred)
 - English (en): A short, capitalized English phrase`, nodeId)
 
-		result, err := InvokeLiteForge(
-			prompt,
+		result, err := c.InvokeLiteForge(prompt,
 			WithLiteForgeOutputSchemaFromAIToolOptions(
 				aitool.WithStringParam("zh", aitool.WithParam_Description("Chinese user-friendly display name")),
 				aitool.WithStringParam("en", aitool.WithParam_Description("English user-friendly display name")),
-			),
-			WithAICallback(aiCallback),
-		)
+			))
 		if err != nil {
 			log.Infof("stream nodeId i18n provider skipped for %q: %v", nodeId, err)
 			return nil

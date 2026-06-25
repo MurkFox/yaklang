@@ -26,6 +26,12 @@ var (
 )
 
 // HTTPPacketForceChunked 将一个HTTP报文的body强制转换为chunked编码
+// 参数:
+//   - raw: 原始 HTTP 报文字节数组
+//
+// 返回值:
+//   - 转换为 chunked 编码后的 HTTP 报文字节数组
+//
 // Example:
 // ```
 // poc.HTTPPacketForceChunked(`POST / HTTP/1.1
@@ -55,6 +61,13 @@ func AppendHeaderToHTTPPacket(raw []byte, line string) []byte {
 var _contentTypeHeaderRegexp = regexp.MustCompile(`(?i)content-type: ?`)
 
 // FixHTTPPacketCRLF 修复一个HTTP报文的CRLF问题（正常的报文每行末尾为\r\n，但是某些报文可能是有\n），如果noFixLength为true，则不会修复Content-Length，否则会尝试修复Content-Length
+// 参数:
+//   - raw: 原始 HTTP 报文字节数组
+//   - noFixLength: 是否不修复 Content-Length，为 true 时不修复
+//
+// 返回值:
+//   - 修复后的 HTTP 报文字节数组
+//
 // Example:
 // ```
 // poc.FixHTTPPacketCRLF(`POST / HTTP/1.1
@@ -254,6 +267,13 @@ func FixHTTPPacketQueryEscape(raw []byte) []byte {
 }
 
 // FixHTTPRequest 尝试对传入的HTTP请求报文进行修复，并返回修复后的请求
+//
+// 参数:
+//   - raw: 原始 HTTP 请求报文字节
+//
+// 返回值:
+//   - 修复后的 HTTP 请求报文字节
+//
 // Example:
 // ```
 // str.FixHTTPRequest(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
@@ -447,6 +467,14 @@ func ToUnquoteFuzzTag(i []byte) string {
 //}
 
 // ParseStringToHTTPRequest 将字符串解析为 HTTP 请求
+//
+// 参数:
+//   - raw: HTTP 请求报文字符串
+//
+// 返回值:
+//   - 解析出的 HTTP 请求结构体
+//   - 错误信息
+//
 // Example:
 // ```
 // req, err = str.ParseStringToHTTPRequest("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
@@ -461,6 +489,15 @@ var (
 )
 
 // ParseUrlToHTTPRequestRaw 将URL解析为原始 HTTP 请求报文，返回是否为 HTTPS，原始请求报文与错误
+// 参数:
+//   - method: 请求方法，如 GET、POST
+//   - i: 目标 URL，可为字符串或可转换为字符串的对象
+//
+// 返回值:
+//   - 是否为 HTTPS
+//   - 原始 HTTP 请求报文字节数组
+//   - 错误信息，解析失败时返回非空
+//
 // Example:
 // ```
 // ishttps, raw, err = poc.ParseUrlToHTTPRequestRaw("GET", "https://yaklang.com")
@@ -495,6 +532,13 @@ func CopyRequest(r *http.Request) *http.Request {
 }
 
 // ParseBytesToHTTPRequest 将字节数组解析为 HTTP 请求
+// 参数:
+//   - raw: 原始 HTTP 请求报文字节数组
+//
+// 返回值:
+//   - 解析得到的 HTTP 请求对象
+//   - 错误信息，解析失败时返回非空
+//
 // Example:
 // ```
 // req, err := str.ParseBytesToHTTPRequest(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")

@@ -25,7 +25,7 @@ import (
 //   1. verify-satisfaction  — "verify-satisfaction" + "user_satisfied" + "reasoning"
 //   2. self-reflection      — "SELF_REFLECTION_TASK"
 //   3. call-tool params     — "Generate appropriate parameters for this tool call based on the context above" + "call-tool"
-//   4. main ReAct prompt    — "directly_answer" + "SCHEMA_" + "USER_QUERY"
+//   4. main ReAct prompt    — "directly_answer" + "SCHEMA" + "USER_QUERY"
 //   5. unknown / fallback
 //
 // The main ReAct prompt is the only one that contains the action schema
@@ -33,9 +33,38 @@ import (
 //
 // Markers were chosen by observing actual prompt content:
 //   - "directly_answer": always in the main prompt action schema
-//   - "SCHEMA_":         nonce-tagged <|SCHEMA_{nonce}|> block, main prompt only
+//   - "SCHEMA":          schema block <|SCHEMA|>, main prompt only
 //   - "USER_QUERY":      nonce-tagged <|USER_QUERY_{nonce}|> block, main prompt only
 //   (Note: verify-satisfaction uses "USER_ORIGINAL_QUERY_" instead of "USER_QUERY")
+
+// extractSchemaBlock 从主 ReAct prompt 中提取 SCHEMA 块的 jsonschema 内容,
+// 用于精确判断某个 action (例如 loading_skills / load_skill_resources) 是否
+// 真正出现在 action enum 中. 这是必要的: high_static_section.txt 已重构为
+// 无条件介绍全部能力 (实际可用性以本轮 SCHEMA enum 为准, 未列出即视为禁用),
+// 因此整 prompt 全文 contains 不再准确反映可用性, 必须看 SCHEMA enum.
+//
+// SCHEMA 块在 semi_dynamic_section.txt 中由前后两个 `<|SCHEMA|>` 标签包裹.
+// 提取逻辑: 找首个 `<|SCHEMA|>`, 跳过该标签后再找下一个 `<|SCHEMA|>`, 中间
+// 即为 schema 字面量. 找不到时返回空串, 调用方应视为 "未启用".
+//
+// 关键词: extractSchemaBlock, SCHEMA enum 精确判断, high-static 反污染对应测试侧调整
+func extractSchemaBlock(prompt string) string {
+	const tag = "<|SCHEMA|>"
+	first := strings.Index(prompt, tag)
+	if first == -1 {
+		return ""
+	}
+	innerStart := first + len(tag)
+	if innerStart >= len(prompt) {
+		return ""
+	}
+	rest := prompt[innerStart:]
+	end := strings.Index(rest, tag)
+	if end == -1 {
+		return ""
+	}
+	return rest[:end]
+}
 
 // promptType enumerates the known prompt types issued by ReActLoop.
 type promptType int
@@ -68,9 +97,9 @@ func classifyPrompt(prompt string) promptType {
 
 	// 4. main ReAct prompt: three markers that uniquely and stably identify it
 	//    - "directly_answer": always present as an action type in the schema
-	//    - "SCHEMA_": nonce-tagged schema block unique to main prompt
+	//    - "SCHEMA": static schema block unique to main prompt
 	//    - "USER_QUERY": nonce-tagged user query block unique to main prompt
-	if utils.MatchAllOfSubString(prompt, "directly_answer", "SCHEMA_", "USER_QUERY") {
+	if utils.MatchAllOfSubString(prompt, "directly_answer", "SCHEMA", "USER_QUERY") {
 		return promptMainReAct
 	}
 
@@ -84,7 +113,7 @@ func classifyPrompt(prompt string) promptType {
 func makeVerifySatisfactionResponse(i aicommon.AICallerConfigIf) (*aicommon.AIResponse, error) {
 	rsp := i.NewAIResponse()
 	rsp.EmitOutputStream(bytes.NewBufferString(
-		`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "OK", "human_readable_result": "done"}`,
+		`{"@action": "verify-satisfaction", "user_satisfied": true, "reasoning": "OK"}`,
 	))
 	rsp.Close()
 	return rsp, nil
@@ -166,9 +195,14 @@ func TestReActLoop_Skills_PromptDifference(t *testing.T) {
 			t.Fatal("main ReAct prompt was not captured (no prompt matched directly_answer+human_readable_thought+cumulative_summary)")
 		}
 
-		// Verify: loading_skills action should NOT be in action schema
-		if strings.Contains(capturedMainPrompt, "loading_skills") {
-			t.Error("loading_skills should NOT appear in prompt when no skills are configured")
+		// Verify: loading_skills action should NOT be in action schema enum.
+		// high_static_section.txt 现在无条件介绍所有能力, 所以全 prompt 一定
+		// 含 loading_skills 字面量; 真正决定可用性的是 SCHEMA enum, 必须只
+		// 在 SCHEMA 块内做 contains 判断.
+		// 关键词: SCHEMA enum 精确判断, high-static 反污染
+		schemaBlock := extractSchemaBlock(capturedMainPrompt)
+		if strings.Contains(schemaBlock, "loading_skills") {
+			t.Error("loading_skills should NOT appear in SCHEMA enum when no skills are configured")
 		}
 		// Verify: SKILLS_CONTEXT tag should NOT be present
 		if strings.Contains(capturedMainPrompt, "SKILLS_CONTEXT") {
@@ -203,9 +237,13 @@ func TestReActLoop_Skills_PromptDifference(t *testing.T) {
 			t.Fatal("main ReAct prompt was not captured")
 		}
 
-		// Verify: loading_skills action SHOULD be in action schema
-		if !strings.Contains(capturedMainPrompt, "loading_skills") {
-			t.Error("loading_skills SHOULD appear in prompt when skills are configured")
+		// Verify: loading_skills action SHOULD be in SCHEMA enum (not just any
+		// where in prompt — high-static 介绍部分会无条件出现该字面量, 真实可用
+		// 性以 SCHEMA enum 为准).
+		// 关键词: SCHEMA enum 精确判断, with skills 启用断言
+		schemaBlock := extractSchemaBlock(capturedMainPrompt)
+		if !strings.Contains(schemaBlock, "loading_skills") {
+			t.Error("loading_skills SHOULD appear in SCHEMA enum when skills are configured")
 		}
 		// Verify: SKILLS_CONTEXT tag SHOULD be present
 		if !strings.Contains(capturedMainPrompt, "SKILLS_CONTEXT") {
@@ -339,8 +377,21 @@ func TestReActLoop_Skills_LoadedContentInPrompt(t *testing.T) {
 func TestReActLoop_Skills_ChangeViewOffset(t *testing.T) {
 	vfs := filesys.NewVirtualFs()
 
+	// SKILL view window 走双模式契约 (见 aiskillloader/view_window.go):
+	//   - offset == 1 且 内容 <= ViewWindowMaxBytes (32KB) -> 全文展示, 仅 File header,
+	//     不带 Total Lines / Current Offset / 行号 / 截断 Note;
+	//   - 否则 (内容 > 32KB 或 offset > 1) -> 部分展示, 带 Total Lines /
+	//     Current Offset / 行号 / 截断 Note, 这才是 change_skill_view_offset
+	//     真正生效的场景.
+	//
+	// 这里测试名是 "ChangeViewOffset", 必须让 skill 体量超过 32KB 才能触发部分
+	// 展示路径, 否则原来 100 行 / 4KB 会落到全文展示路径, 自然不会出现 Total
+	// Lines / Current Offset.
+	//
+	// 关键词: ChangeViewOffset 测试体量调整, ViewWindowMaxBytes 32KB,
+	//        部分展示路径, Total Lines / Current Offset 元数据, 双模式契约
 	var bodyContent string
-	for i := 1; i <= 100; i++ {
+	for i := 1; i <= 1000; i++ {
 		bodyContent += "Line of content for truncation testing.\n"
 	}
 
@@ -532,9 +583,11 @@ func TestReActLoop_Skills_NoSkillsAvailable(t *testing.T) {
 		t.Fatal("main ReAct prompt was not captured")
 	}
 
-	// When no skills discovered, loading_skills should NOT be in prompt
-	if strings.Contains(capturedMainPrompt, "loading_skills") {
-		t.Error("loading_skills should NOT appear when no skills are discovered")
+	// When no skills discovered, loading_skills should NOT be in SCHEMA enum.
+	// 关键词: SCHEMA enum 精确判断, 无 skills 启用时 enum 不含 loading_skills
+	schemaBlock := extractSchemaBlock(capturedMainPrompt)
+	if strings.Contains(schemaBlock, "loading_skills") {
+		t.Error("loading_skills should NOT appear in SCHEMA enum when no skills are discovered")
 	}
 
 	// SkillsContextManager should exist but have no skills

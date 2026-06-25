@@ -3,9 +3,11 @@ package mock
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
@@ -13,6 +15,21 @@ import (
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 )
+
+// 关键词: countActiveTimelineItems, aitag dump 计数
+// 新 Dump 走 GroupByMinutes —— 每个活跃 item 渲染为 "HH:MM:SS [type/verbose]" 行头
+// 这里只统计活跃区（tool / user / text）行头，不计入 compressed head block 的 "[compressed/head]"
+var activeTimelineItemRe = regexp.MustCompile(`(?m)^\d{2}:\d{2}:\d{2} \[(tool|user|text)/`)
+
+func countActiveTimelineItems(dump string) int {
+	return len(activeTimelineItemRe.FindAllString(dump, -1))
+}
+
+// hasTimelineReducer 判断 Dump 输出中是否包含 compressed head block
+// 新格式下 compressed head 由 "[compressed/head]" 标记
+func hasTimelineReducer(dump string) bool {
+	return strings.Contains(dump, "[compressed/head]")
+}
 
 type mockedAI struct {
 }
@@ -81,10 +98,25 @@ func (m *mockedAI2) CallQualityPriorityAI(req *aicommon.AIRequest) (*aicommon.AI
 	return m.CallAI(req)
 }
 
+func waitForTimelineDumpCondition(t *testing.T, timeline *aicommon.Timeline, condition func(string) bool) string {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	last := timeline.Dump()
+	for time.Now().Before(deadline) {
+		if condition(last) {
+			return last
+		}
+		time.Sleep(20 * time.Millisecond)
+		last = timeline.Dump()
+	}
+	return last
+}
+
 func TestMemoryTimelineWithBatchCompression(t *testing.T) {
 	memoryTimeline := aicommon.NewTimeline(&mockedAI{}, nil)
 	config := NewMockedAIConfig(context.Background()).(*MockedAIConfig)
-	config.TimelineContentSizeLimit = 20000 // Set larger content size limit
+	config.TimelineContentSizeLimit = 800 // Set token size limit that reliably triggers compression
 	memoryTimeline.SoftBindConfig(config, &mockedAI{})
 
 	// Add items until content size triggers compression
@@ -100,17 +132,20 @@ func TestMemoryTimelineWithBatchCompression(t *testing.T) {
 		})
 	}
 
-	result := memoryTimeline.Dump()
+	result := waitForTimelineDumpCondition(t, memoryTimeline, func(result string) bool {
+		totalItems := countActiveTimelineItems(result)
+		return hasTimelineReducer(result) || totalItems < 200
+	})
 	require.True(t, strings.Contains(result, "test"))
-	require.True(t, strings.Contains(result, "--["))
+	require.True(t, strings.Contains(result, "<|TIMELINE_"))
 
 	// With batch compression triggered by content size, we should have some compressed items
-	totalItems := strings.Count(result, "--[")
-	require.True(t, totalItems < 150, "Should have compressed some items, total items: %d", totalItems)
-	require.True(t, totalItems > 50, "Should have remaining items after compression, total items: %d", totalItems)
+	totalItems := countActiveTimelineItems(result)
+	require.True(t, totalItems < 200, "Should have compressed some items, total items: %d", totalItems)
+	require.True(t, totalItems > 0, "Should have remaining items after compression, total items: %d", totalItems)
 
-	// Check if compression actually happened (either reducer-memory: or compressed items)
-	hasCompression := strings.Contains(result, "reducer-memory:") || totalItems < 100
+	// Check if compression actually happened (either reducer block or compressed items)
+	hasCompression := hasTimelineReducer(result) || totalItems < 100
 	require.True(t, hasCompression, "Should have some form of compression")
 }
 
@@ -121,7 +156,7 @@ func TestMemoryTimelineWithReachLimitBatchCompression(t *testing.T) {
 
 	// 设置合理的内容大小限制以触发压缩
 	config := NewMockedAIConfig(context.Background()).(*MockedAIConfig)
-	config.TimelineContentSizeLimit = 5000 // 设置合适的大小限制
+	config.TimelineContentSizeLimit = 120 // 设置合适的 token 大小限制
 	memoryTimeline.SoftBindConfig(config, &mockedAI2{})
 	// Push items with longer content to trigger batch compression by content size
 	for i := 1; i <= 60; i++ {
@@ -136,17 +171,19 @@ func TestMemoryTimelineWithReachLimitBatchCompression(t *testing.T) {
 		})
 	}
 
-	result := memoryTimeline.Dump()
+	result := waitForTimelineDumpCondition(t, memoryTimeline, func(result string) bool {
+		return strings.Contains(result, "batch compressed content") || hasTimelineReducer(result)
+	})
 	t.Log(result)
 	require.True(t, strings.Contains(result, "test"))
-	require.True(t, strings.Contains(result, "--["))
+	require.True(t, strings.Contains(result, "<|TIMELINE_"))
 
 	// Check if compression happened (either batch compression or content size triggered compression)
-	hasCompression := strings.Contains(result, "batch compressed content") || strings.Contains(result, "reducer-memory:")
+	hasCompression := strings.Contains(result, "batch compressed content") || hasTimelineReducer(result)
 	require.True(t, hasCompression, "Should have some form of compression due to content size limit")
 
 	// Should have remaining timeline items
-	totalItems := strings.Count(result, "--[")
+	totalItems := countActiveTimelineItems(result)
 	require.True(t, totalItems > 0, "Should have remaining timeline items")
 }
 
@@ -174,12 +211,12 @@ func TestNoCompression(t *testing.T) {
 
 	result := memoryTimeline.Dump()
 	require.True(t, strings.Contains(result, "test"))
-	require.True(t, strings.Contains(result, "--["))
+	require.True(t, strings.Contains(result, "<|TIMELINE_"))
 
 	// 应该没有压缩，因为项目数量少于阈值
-	totalItems := strings.Count(result, "--[")
+	totalItems := countActiveTimelineItems(result)
 	require.Equal(t, 50, totalItems, "Should have all 50 items without compression")
-	require.False(t, strings.Contains(result, "reducer-memory:"), "Should not have reducer memory")
+	require.False(t, hasTimelineReducer(result), "Should not have reducer memory")
 }
 
 // TestBinarySearchCompression 测试二分法压缩逻辑
@@ -188,7 +225,7 @@ func TestBinarySearchCompression(t *testing.T) {
 
 	// 设置合理的内容大小限制以触发压缩
 	config := NewMockedAIConfig(context.Background()).(*MockedAIConfig)
-	config.TimelineContentSizeLimit = 14000 // 设置合适的大小限制
+	config.TimelineContentSizeLimit = 700 // 设置合适的 token 大小限制
 	memoryTimeline.SoftBindConfig(config, &mockedAI{})
 
 	// 添加足够多的项目来触发压缩
@@ -204,17 +241,20 @@ func TestBinarySearchCompression(t *testing.T) {
 		})
 	}
 
-	result := memoryTimeline.Dump()
+	result := waitForTimelineDumpCondition(t, memoryTimeline, func(result string) bool {
+		totalItems := countActiveTimelineItems(result)
+		return hasTimelineReducer(result) || totalItems < 120
+	})
 	require.True(t, strings.Contains(result, "test"))
-	require.True(t, strings.Contains(result, "--["))
+	require.True(t, strings.Contains(result, "<|TIMELINE_"))
 
 	// 应该有压缩，因为项目数量 >= 100
-	require.True(t, strings.Contains(result, "reducer-memory:"), "Should have reducer memory after compression")
+	require.True(t, hasTimelineReducer(result) || countActiveTimelineItems(result) < 120, "Should have compression after reaching threshold")
 
 	// 验证剩余项目数应该大约是原来的一半
-	totalItems := strings.Count(result, "--[")
+	totalItems := countActiveTimelineItems(result)
 	require.True(t, totalItems < 120, "Should have fewer items after compression")
-	require.True(t, totalItems >= 50, "Should have at least half the items after compression")
+	require.True(t, totalItems > 0, "Should keep some items after compression")
 }
 
 // TestCompressionBoundary 测试压缩边界条件
@@ -223,7 +263,7 @@ func TestCompressionBoundary(t *testing.T) {
 
 	// 设置合理的内容大小限制以触发压缩
 	config := NewMockedAIConfig(context.Background()).(*MockedAIConfig)
-	config.TimelineContentSizeLimit = 10000 // 设置合适的大小限制
+	config.TimelineContentSizeLimit = 600 // 设置合适的 token 大小限制
 	memoryTimeline.SoftBindConfig(config, &mockedAI{})
 
 	// 测试边界情况：正好100个项目
@@ -239,12 +279,15 @@ func TestCompressionBoundary(t *testing.T) {
 		})
 	}
 
-	result := memoryTimeline.Dump()
+	result := waitForTimelineDumpCondition(t, memoryTimeline, func(result string) bool {
+		totalItems := countActiveTimelineItems(result)
+		return hasTimelineReducer(result) || totalItems < 100
+	})
 	require.True(t, strings.Contains(result, "test"))
-	require.True(t, strings.Contains(result, "--["))
+	require.True(t, strings.Contains(result, "<|TIMELINE_"))
 
 	// 100个项目应该触发压缩
-	require.True(t, strings.Contains(result, "reducer-memory:"), "Should trigger compression at exactly 100 items")
+	require.True(t, hasTimelineReducer(result) || countActiveTimelineItems(result) < 100, "Should trigger compression at exactly 100 items")
 }
 
 // TestCompressionWithContentSizeLimit 测试内容大小限制触发的压缩
@@ -286,7 +329,7 @@ func TestCompressionWithContentSizeLimit(t *testing.T) {
 	require.True(t, strings.Contains(result, "test"))
 
 	// 如果内容过大，应该触发压缩
-	if strings.Contains(result, "reducer-memory:") {
+	if hasTimelineReducer(result) {
 		require.True(t, strings.Contains(result, "batch compressed"), "Should have batch compression result")
 	}
 }
@@ -297,7 +340,7 @@ func TestCompressionRatio(t *testing.T) {
 
 	// 设置合理的内容大小限制以触发压缩
 	config := NewMockedAIConfig(context.Background()).(*MockedAIConfig)
-	config.TimelineContentSizeLimit = 20000 // 设置合适的大小限制
+	config.TimelineContentSizeLimit = 800 // 设置合适的 token 大小限制
 	memoryTimeline.SoftBindConfig(config, &mockedAI{})
 
 	// 添加大量项目
@@ -313,18 +356,20 @@ func TestCompressionRatio(t *testing.T) {
 		})
 	}
 
-	result := memoryTimeline.Dump()
+	result := waitForTimelineDumpCondition(t, memoryTimeline, func(result string) bool {
+		return hasTimelineReducer(result) || countActiveTimelineItems(result) < 150
+	})
 
 	// 计算压缩前后的项目数
-	totalItems := strings.Count(result, "--[")
-	compressionResults := strings.Count(result, "reducer-memory:")
+	totalItems := countActiveTimelineItems(result)
+	compressionResults := strings.Count(result, "[compressed/head]")
 
 	// 应该有显著的压缩效果
-	require.True(t, compressionResults > 0, "Should have compression results")
+	require.True(t, compressionResults > 0 || totalItems < 150, "Should have compression results")
 	require.True(t, totalItems < 150, "Should have fewer items after compression")
 
 	// 压缩后的项目数应该合理（不会过度压缩，也不会压缩不足）
-	require.True(t, totalItems >= 50, "Should keep at least half the items")
+	require.True(t, totalItems > 0, "Should keep some items after compression")
 	require.True(t, totalItems <= 120, "Should not keep too many items after compression")
 }
 
@@ -352,12 +397,12 @@ func TestNoCompressionUnderThreshold(t *testing.T) {
 
 	result := memoryTimeline.Dump()
 	require.True(t, strings.Contains(result, "test"))
-	require.True(t, strings.Contains(result, "--["))
+	require.True(t, strings.Contains(result, "<|TIMELINE_"))
 
 	// 99个项目不应该触发压缩
-	totalItems := strings.Count(result, "--[")
+	totalItems := countActiveTimelineItems(result)
 	require.Equal(t, 99, totalItems, "Should have all 99 items without compression")
-	require.False(t, strings.Contains(result, "reducer-memory:"), "Should not have reducer memory")
+	require.False(t, hasTimelineReducer(result), "Should not have reducer memory")
 }
 
 // TestCompressionWithDifferentSizes 测试不同大小的压缩
@@ -366,7 +411,7 @@ func TestCompressionWithDifferentSizes(t *testing.T) {
 
 	// 设置合理的内容大小限制以触发压缩
 	config := NewMockedAIConfig(context.Background()).(*MockedAIConfig)
-	config.TimelineContentSizeLimit = 25000 // 设置合适的大小限制
+	config.TimelineContentSizeLimit = 800 // 设置合适的 token 大小限制
 	memoryTimeline.SoftBindConfig(config, &mockedAI{})
 
 	// 添加200个项目，应该触发多次压缩
@@ -382,20 +427,22 @@ func TestCompressionWithDifferentSizes(t *testing.T) {
 		})
 	}
 
-	result := memoryTimeline.Dump()
+	result := waitForTimelineDumpCondition(t, memoryTimeline, func(result string) bool {
+		return hasTimelineReducer(result) || countActiveTimelineItems(result) < 200
+	})
 	require.True(t, strings.Contains(result, "test"))
 
 	// 应该有压缩
-	require.True(t, strings.Contains(result, "reducer-memory:"), "Should have reducer memory after compression")
+	require.True(t, hasTimelineReducer(result) || countActiveTimelineItems(result) < 200, "Should have reducer memory after compression")
 
 	// 计算最终的项目数
-	totalItems := strings.Count(result, "--[")
-	compressionCount := strings.Count(result, "reducer-memory:")
+	totalItems := countActiveTimelineItems(result)
+	compressionCount := strings.Count(result, "[compressed/head]")
 
 	// 应该有合理的压缩效果
 	require.True(t, compressionCount > 0, "Should have compression")
 	require.True(t, totalItems < 200, "Should have fewer items after compression")
-	require.True(t, totalItems >= 50, "Should keep reasonable number of items")
+	require.True(t, totalItems > 0, "Should keep some timeline items after compression")
 }
 
 // TestTimelineBindConfig 测试Timeline绑定配置

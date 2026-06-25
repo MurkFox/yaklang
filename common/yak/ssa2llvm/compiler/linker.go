@@ -16,7 +16,8 @@ var runtimeLinkArgsCache sync.Map
 
 // CompileLLVMToBinary compiles an LLVM IR file to a native executable.
 // When linkRuntime is true, it links against the default yak runtime archive.
-func CompileLLVMToBinary(llFile, binFile string, linkRuntime bool, runtimeArchiveOverride string, extraArgs ...string) error {
+// obfArchives, when non-empty, are additional static archives to link (obf runtime deps).
+func CompileLLVMToBinary(llFile, binFile string, linkRuntime bool, runtimeArchiveOverride string, obfArchives []string, extraArgs ...string) error {
 	clangPath, err := findLLVMTool("clang")
 	if err != nil {
 		return err
@@ -42,6 +43,10 @@ func CompileLLVMToBinary(llFile, binFile string, linkRuntime bool, runtimeArchiv
 		args = append(args,
 			runtimeArchive,
 		)
+		// Append extra obf runtime archives (e.g. libyakobf_virtualize.a).
+		for _, obfArchive := range obfArchives {
+			args = append(args, obfArchive)
+		}
 		args = appendUniqueLinkArgs(args, runtimeLinkArgs...)
 		args = appendUniqueLinkArgs(args,
 			"-lgc",
@@ -50,7 +55,7 @@ func CompileLLVMToBinary(llFile, binFile string, linkRuntime bool, runtimeArchiv
 			"-ldl",
 		)
 	}
-	args = append(args, "-o", binFile)
+	args = append(args, "-s", "-o", binFile)
 
 	cmd := exec.Command(clangPath, args...)
 	trace.PrintCmd(cmd)
@@ -101,6 +106,15 @@ func resolveRuntimeLinkArgs(runtimeArchive string) ([]string, error) {
 
 	sourceDir, ok := runtimeSourceDirForArchive(runtimeArchive)
 	if !ok {
+		if root, okMod := goModuleRootDir(); okMod {
+			fallback := filepath.Join(root, "common", "yak", "ssa2llvm", "runtime", "runtime_go")
+			if st, err := os.Stat(fallback); err == nil && st.IsDir() {
+				sourceDir = fallback
+				ok = true
+			}
+		}
+	}
+	if !ok {
 		return nil, nil
 	}
 
@@ -110,6 +124,22 @@ func resolveRuntimeLinkArgs(runtimeArchive string) ([]string, error) {
 	}
 	runtimeLinkArgsCache.Store(runtimeArchive, append([]string{}, flags...))
 	return flags, nil
+}
+
+func goModuleRootDir() (string, bool) {
+	goPath, err := exec.LookPath("go")
+	if err != nil {
+		return "", false
+	}
+	out, err := exec.Command(goPath, "env", "GOMOD").Output()
+	if err != nil {
+		return "", false
+	}
+	mod := strings.TrimSpace(string(out))
+	if mod == "" || mod == os.DevNull {
+		return "", false
+	}
+	return filepath.Dir(mod), true
 }
 
 func readRuntimeLinkArgsFile(runtimeArchive string) ([]string, bool, error) {

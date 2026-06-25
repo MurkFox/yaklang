@@ -3,9 +3,9 @@ package aicommon
 import (
 	"bytes"
 	"cmp"
+	"context"
 	_ "embed"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,10 +18,10 @@ import (
 	"github.com/yaklang/yaklang/common/log"
 
 	"github.com/yaklang/yaklang/common/utils"
-	"github.com/yaklang/yaklang/common/utils/linktable"
 	"github.com/yaklang/yaklang/common/utils/omap"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
+	"github.com/yaklang/yaklang/common/ai/ytoken"
 )
 
 type Timeline struct {
@@ -32,14 +32,45 @@ type Timeline struct {
 	idToTs           *omap.OrderedMap[int64, int64]
 	tsToTimelineItem *omap.OrderedMap[int64, *TimelineItem]
 	idToTimelineItem *omap.OrderedMap[int64, *TimelineItem]
-	summary          *omap.OrderedMap[int64, *linktable.LinkTable[*TimelineItem]]
-	reducers         *omap.OrderedMap[int64, *linktable.LinkTable[string]]
+	// compressedHead 是运行态唯一有效压缩段（single source of truth）
+	compressedHead *TimelineCompressedHead
+	// compressedHistory 仅用于追溯，不参与当前并列渲染
+	compressedHistory []*TimelineCompressedHistoryNode
+	archiveRefs       *omap.OrderedMap[int64, *TimelineArchiveRef]
 
-	// this limit is used to limit the timeline dump string size.
+	// this limit is used to limit the timeline dump content size (in tokens).
 	perDumpContentLimit   int64
 	totalDumpContentLimit int64
 
+	// bucketByteSize 为 GroupByMinutes 子桶的字节预算（渲染后的紧凑 Render 字节）。
+	// 0 表示使用 TimelineDumpDefaultBucketByteSize；负数表示禁用字节切分（仅按时间桶）。
+	// 关键词: bucketByteSize, 字节子桶, prefix cache
+	bucketByteSize int64
+
+	// bucketSizer 为动态桶大小决策器。非 nil 时优先于 bucketByteSize, 在
+	// 同一时间桶内按 sizer 提供的 budget 做切分; 为 nil 时退回固定 budget 路径,
+	// 与原行为字节完全等价。该字段仅影响 GroupByMinutes(public 别名) 路径,
+	// 显式调用 GroupByMinutesAndBytes(N, X) 时仍走传统固定值 (向后兼容)。
+	// 关键词: bucketSizer, 动态桶大小, 主动缓存调优
+	bucketSizer BucketSizer
+
 	compressing *utils.Once
+}
+
+type TimelineCompressedHead struct {
+	Text             string `json:"text"`
+	CoveredEndItemID int64  `json:"covered_end_item_id"`
+	CoveredEndAtMs   int64  `json:"covered_end_at_ms"`
+	Version          int64  `json:"version"`
+}
+
+type TimelineCompressedHistoryNode struct {
+	Version          int64  `json:"version"`
+	PrevVersion      int64  `json:"prev_version"`
+	Text             string `json:"text"`
+	CoveredEndItemID int64  `json:"covered_end_item_id"`
+	CoveredEndAtMs   int64  `json:"covered_end_at_ms"`
+	CreatedAtMs      int64  `json:"created_at_ms"`
 }
 
 func (m *Timeline) OrderInsertId(id int64, item *TimelineItem) {
@@ -50,8 +81,34 @@ func (m *Timeline) OrderInsertTs(ts int64, item *TimelineItem) {
 	m.tsToTimelineItem.OrderInsert(ts, item, cmp.Less[int64])
 }
 
-// MaxTimelineSaveSize is the maximum size (100KB) for timeline data when saving to database
-const MaxTimelineSaveSize = 100 * 1024
+// MaxTimelineSaveSize is the maximum size (1.5MB storage limit) for timeline data when saving to database
+const MaxTimelineSaveSize = 1536 * 1024
+
+// TimelineDumpDefaultBucketByteSize 是 Dump / GroupByMinutes 默认的字节子桶上限（64KB）。
+// 用于在同一绝对时间桶内进一步切块，避免短时巨量 tool 输出拖垮单个 open 桶的前缀缓存。
+//
+// **调优历史 (2026-05)**: 默认值从 16KB 调整为 64KB。
+// 原因: dashscope/qwen 实测 "不存在部分命中 + 增量建块" (见 TONGYI_CACHE_REPORT.md
+// §4.12), frozen 段每变化一次, 整段 user1 需按 125% cache_creation 计费重建。
+// 桶切得越小, 同一时间桶内触发 flush 越多, cache_create 次数越多。
+// 离线重放实验 (见 TIMELINE_BUCKET_TUNING.md) 在真实 session (90 events) 上显示:
+//   - 16K 默认: net_cost = -1.99M (基线)
+//   - 64K 默认: net_cost = -3.12M (省 1.13M, 提升 56%)
+//
+// 在密集工具场景 (dense_tools, 20 events / 3 min):
+//   - 16K 默认: net_cost = +127K (亏损)
+//   - 64K 默认: net_cost = -215K (转亏为盈)
+//
+// 64K 在所有测过的场景里都 ≥ 16K, 不存在劣化。
+//
+// 关键词: TimelineDumpDefaultBucketByteSize, 字节子桶默认, 主动缓存调优, 64K
+const TimelineDumpDefaultBucketByteSize = 64 * 1024
+
+// TimelineDumpLegacyBucketByteSize 是 2026-05 调优前的旧默认值 (16KB)。
+// 仅作历史标记保留: 老 fixture 测试 / 显式回滚场景可以引用该常量明示语义,
+// 避免与新默认 (64KB) 混淆。生产代码不应直接使用。
+// 关键词: TimelineDumpLegacyBucketByteSize, 16K 旧默认
+const TimelineDumpLegacyBucketByteSize = 16 * 1024
 
 func (m *Timeline) Save(db *gorm.DB, persistentId string) {
 	if utils.IsNil(m) {
@@ -161,10 +218,13 @@ func (m *Timeline) CopyReducibleTimelineWithMemory() *Timeline {
 		idToTs:                m.idToTs.Copy(),
 		tsToTimelineItem:      m.tsToTimelineItem.Copy(),
 		idToTimelineItem:      m.idToTimelineItem.Copy(),
-		summary:               m.summary.Copy(),
-		reducers:              m.reducers.Copy(),
+		compressedHead:        cloneTimelineCompressedHead(m.compressedHead),
+		compressedHistory:     cloneTimelineCompressedHistory(m.compressedHistory),
+		archiveRefs:           m.archiveRefs.Copy(),
 		perDumpContentLimit:   m.perDumpContentLimit,
 		totalDumpContentLimit: m.totalDumpContentLimit,
+		bucketByteSize:        m.bucketByteSize,
+		bucketSizer:           m.bucketSizer,
 		compressing:           utils.NewOnce(),
 	}
 	return tl
@@ -175,25 +235,24 @@ func (m *Timeline) SoftDelete(id ...int64) {
 		if v, ok := m.idToTimelineItem.Get(i); ok {
 			v.deleted = true
 		}
-		if v, ok := m.summary.Get(i); ok {
-			v.Push(&TimelineItem{
-				createdAt: v.Value().createdAt,
-				deleted:   true,
-				value:     v.Value().value,
-			})
-		}
 	}
 }
 
+// CreateSubTimeline 用入参 ids 限定活跃 item 集合，构造一个新的 sub-timeline
+// 关键词: CreateSubTimeline, 子 timeline 构造, compressedHead 继承
+//
+// compressedHead 继承语义：sub-timeline 始终继承主 timeline 的 compressedHead 与 compressedHistory，
+// 保证任何派生的 sub.Dump() 都包含完整的压缩记忆，与 ids 解耦。
 func (m *Timeline) CreateSubTimeline(ids ...int64) *Timeline {
 	tl := NewTimeline(m.ai, m.extraMetaInfo)
 	if m.config != nil {
 		tl.config = m.config
 	}
-	if len(ids) == 0 {
-		return nil
-	}
 	tl.ai = m.ai
+	tl.bucketByteSize = m.bucketByteSize
+	tl.bucketSizer = m.bucketSizer
+	tl.compressedHead = cloneTimelineCompressedHead(m.compressedHead)
+	tl.compressedHistory = cloneTimelineCompressedHistory(m.compressedHistory)
 	for _, id := range ids {
 		ts, ok := m.idToTs.Get(id)
 		if !ok {
@@ -206,22 +265,17 @@ func (m *Timeline) CreateSubTimeline(ids ...int64) *Timeline {
 		if ret, ok := m.tsToTimelineItem.Get(ts); ok {
 			tl.OrderInsertTs(ts, ret)
 		}
-		if ret, ok := m.summary.Get(id); ok {
-			tl.summary.Set(id, ret)
-		}
-		if ret, ok := m.reducers.Get(id); ok {
-			tl.reducers.Set(id, ret)
-		}
 	}
+
 	return tl
 }
 
 func (m *Timeline) SoftBindConfig(config AICallerConfigIf, aiCaller AICaller) {
-	if m.config == nil {
+	if config != nil {
 		m.config = config
 		m.SetTimelineContentLimit(config.GetTimelineContentSizeLimit())
 	}
-	if utils.IsNil(m.ai) {
+	if utils.IsNil(m.ai) && !utils.IsNil(aiCaller) {
 		m.setAICaller(aiCaller)
 	}
 }
@@ -233,10 +287,65 @@ func NewTimeline(ai AICaller, extraMetaInfo func() string) *Timeline {
 		tsToTimelineItem: omap.NewOrderedMap(map[int64]*TimelineItem{}),
 		idToTimelineItem: omap.NewOrderedMap(map[int64]*TimelineItem{}),
 		idToTs:           omap.NewOrderedMap(map[int64]int64{}),
-		summary:          omap.NewOrderedMap(map[int64]*linktable.LinkTable[*TimelineItem]{}),
-		reducers:         omap.NewOrderedMap(map[int64]*linktable.LinkTable[string]{}),
+		archiveRefs:      omap.NewOrderedMap(map[int64]*TimelineArchiveRef{}),
 		compressing:      utils.NewOnce(),
 	}
+}
+
+func cloneTimelineCompressedHead(head *TimelineCompressedHead) *TimelineCompressedHead {
+	if head == nil {
+		return nil
+	}
+	cp := *head
+	return &cp
+}
+
+func cloneTimelineCompressedHistory(history []*TimelineCompressedHistoryNode) []*TimelineCompressedHistoryNode {
+	if len(history) == 0 {
+		return nil
+	}
+	out := make([]*TimelineCompressedHistoryNode, 0, len(history))
+	for _, h := range history {
+		if h == nil {
+			continue
+		}
+		cp := *h
+		out = append(out, &cp)
+	}
+	return out
+}
+
+func (m *Timeline) updateCompressedHead(newHead *TimelineCompressedHead) {
+	if m == nil || newHead == nil {
+		return
+	}
+	newHead.Text = strings.TrimSpace(newHead.Text)
+	if newHead.Text == "" {
+		return
+	}
+	if m.compressedHead != nil {
+		prev := m.compressedHead
+		prevVersion := prev.Version - 1
+		if prevVersion < 0 {
+			prevVersion = 0
+		}
+		m.compressedHistory = append(m.compressedHistory, &TimelineCompressedHistoryNode{
+			Version:          prev.Version,
+			PrevVersion:      prevVersion,
+			Text:             prev.Text,
+			CoveredEndItemID: prev.CoveredEndItemID,
+			CoveredEndAtMs:   prev.CoveredEndAtMs,
+			CreatedAtMs:      time.Now().UnixMilli(),
+		})
+	}
+	if newHead.Version <= 0 {
+		if m.compressedHead == nil {
+			newHead.Version = 1
+		} else {
+			newHead.Version = m.compressedHead.Version + 1
+		}
+	}
+	m.compressedHead = cloneTimelineCompressedHead(newHead)
 }
 
 func (m *Timeline) ExtraMetaInfo() string {
@@ -248,6 +357,54 @@ func (m *Timeline) ExtraMetaInfo() string {
 
 func (m *Timeline) SetTimelineContentLimit(contentSize int64) {
 	m.totalDumpContentLimit = contentSize
+}
+
+// SetTimelineBucketByteSize 设置 GroupByMinutes 在同一时间桶内的字节子桶预算。
+// n > 0 时使用该值；n == 0 时恢复默认（TimelineDumpDefaultBucketByteSize）；
+// n < 0 时禁用字节切分，仅按分钟时间桶分组（与旧行为一致）。
+// 关键词: SetTimelineBucketByteSize, 字节子桶配置
+func (m *Timeline) SetTimelineBucketByteSize(n int64) {
+	if m == nil {
+		return
+	}
+	m.bucketByteSize = n
+}
+
+func (m *Timeline) getEffectiveBucketByteSize() int64 {
+	if m == nil {
+		return TimelineDumpDefaultBucketByteSize
+	}
+	if m.bucketByteSize < 0 {
+		return -1
+	}
+	if m.bucketByteSize == 0 {
+		return TimelineDumpDefaultBucketByteSize
+	}
+	return m.bucketByteSize
+}
+
+// SetTimelineBucketSizer 设置动态桶大小决策器, 影响 GroupByMinutes 默认路径。
+// 传入 nil 等价于禁用动态算法, 退回 SetTimelineBucketByteSize / 默认常量。
+//
+// 与 SetTimelineBucketByteSize 的关系: 二者并存, sizer 优先级更高 (非 nil 时
+// 覆盖固定 byteSize)。显式调用 GroupByMinutesAndBytes(N, X) 仍走固定值,
+// 不被 sizer 影响, 用于老路径与单测兼容。
+//
+// 关键词: SetTimelineBucketSizer, 动态桶大小配置, 主动缓存
+func (m *Timeline) SetTimelineBucketSizer(sizer BucketSizer) {
+	if m == nil {
+		return
+	}
+	m.bucketSizer = sizer
+}
+
+// GetTimelineBucketSizer 返回当前已设置的 sizer (可能为 nil)。
+// 关键词: GetTimelineBucketSizer
+func (m *Timeline) GetTimelineBucketSizer() BucketSizer {
+	if m == nil {
+		return nil
+	}
+	return m.bucketSizer
 }
 
 func (m *Timeline) setAICaller(ai AICaller) {
@@ -287,8 +444,22 @@ func (m *Timeline) pushTimelineItem(ts int64, id int64, item *TimelineItem) {
 
 	// Emit timeline item asynchronously to avoid blocking when EventHandler
 	// writes to an unbuffered channel that hasn't been consumed yet
+	//
+	// 关键词: 异步 emit panic 兜底, send on closed channel 兜底, defer recover
+	// 这个匿名 goroutine 是测试 cleanup 后产生 send on closed channel panic
+	// 的高发路径之一: pushTimelineItem 在主流程已结束、outputChan 已被测试关
+	// 闭后仍可能被触发. 即便 Emitter.emit 自身已 defer recover, 这里再加一
+	// 层 recover 形成 belt-and-suspenders, 杜绝因 channel 关闭引起的进程退出.
 	if m.config != nil && m.config.GetEmitter() != nil {
-		go m.config.GetEmitter().EmitTimelineItem(item)
+		emitter := m.config.GetEmitter()
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warnf("Timeline async emit panic recovered: %v", r)
+				}
+			}()
+			emitter.EmitTimelineItem(item)
+		}()
 	}
 }
 
@@ -315,196 +486,20 @@ func (m *Timeline) PushUserInteraction(stage UserInteractionStage, id int64, sys
 	m.pushTimelineItem(ts, id, item)
 }
 
-// findCompressCountForTargetSize 使用二分法找到需要压缩的项目数量，使得剩余项目数约为 targetSize
-func (m *Timeline) findCompressCountForTargetSize(targetSize int) int {
-	total := int64(m.idToTimelineItem.Len())
-	if total <= int64(targetSize) {
-		return 0 // 已经达到或小于目标大小，不需要压缩
-	}
-
-	// 使用二分法找到合适的压缩数量
-	left, right := 0, int(total-1)
-
-	for left < right {
-		mid := (left + right) / 2
-		remainingSize := int(total) - mid
-
-		if remainingSize <= targetSize {
-			// 剩余大小小于等于目标大小，压缩太多了，需要减少压缩数量
-			right = mid
-		} else {
-			// 剩余大小大于目标大小，需要增加压缩数量
-			left = mid + 1
-		}
-	}
-
-	compressCount := left
-	if compressCount < 0 {
-		compressCount = 0
-	}
-	if compressCount > int(total)-1 {
-		compressCount = int(total) - 1
-	}
-
-	return compressCount
-}
-
-func (m *Timeline) batchCompressByTargetSize(targetSize int) {
-	if targetSize <= 0 {
-		return
-	}
-
-	// If AI is nil, use emergency compress instead
-	if m.ai == nil {
-		log.Warnf("batch compress: AI is nil, using emergency compress")
-		m.emergencyCompress(MaxTimelineSaveSize)
-		return
-	}
-
-	total := int64(m.idToTimelineItem.Len())
-	if total <= 1 {
-		return
-	}
-
-	// Check if current timeline is already too large for AI processing
-	// If so, do emergency compress first to bring it to a manageable size
-	tlstr, err := MarshalTimeline(m)
-	if err == nil && len(tlstr) > MaxTimelineSaveSize*2 {
-		log.Warnf("batch compress: timeline too large (%d), performing emergency compress first", len(tlstr))
-		m.emergencyCompress(MaxTimelineSaveSize)
-		// Recalculate total after emergency compress
-		total = int64(m.idToTimelineItem.Len())
-		if total <= 1 {
-			return
-		}
-	}
-
-	// 使用二分法找到需要压缩的项目数量，使得压缩后大小约为 targetSize
-	compressCount := m.findCompressCountForTargetSize(targetSize)
-	if compressCount <= 0 {
-		return
-	}
-
-	log.Infof("batch compress: found compress count %d for target size %d", compressCount, targetSize)
-
-	// 获取前 compressCount 个 items 进行压缩
-	var itemsToCompress []*TimelineItem
-	var idsToRemove []int64
-
-	count := 0
-	m.idToTimelineItem.ForEach(func(id int64, item *TimelineItem) bool {
-		if count >= compressCount {
-			return false
-		}
-		itemsToCompress = append(itemsToCompress, item)
-		idsToRemove = append(idsToRemove, id)
-		count++
-		return true
-	})
-
-	if len(itemsToCompress) == 0 {
-		return
-	}
-
-	// 生成压缩提示
-	nonceStr := utils.RandStringBytes(4)
-	prompt := m.renderBatchCompressPrompt(itemsToCompress, nonceStr)
-	if prompt == "" {
-		// If prompt is empty, fall back to emergency compress
-		log.Warnf("batch compress: prompt is empty, falling back to emergency compress")
-		m.emergencyCompress(MaxTimelineSaveSize)
-		return
-	}
-
-	// 调用 AI 进行批量压缩
-	var action *Action
-	var cumulativeSummary string
-	err = CallAITransaction(m.config, prompt, m.ai.CallSpeedPriorityAI, func(response *AIResponse) error {
-		var r io.Reader
-		if m.config == nil {
-			r = response.GetUnboundStreamReader(false)
-		} else {
-			r = response.GetOutputStreamReader("batch-compress", true, m.config.GetEmitter())
-		}
-
-		var extractErr error
-		action, extractErr = ExtractActionFromStream(
-			m.config.GetContext(),
-			r, "timeline-reducer",
-			WithActionTagToKey("REDUCER_MEMORY", "reducer_memory"),
-			WithActionNonce(nonceStr),
-			WithActionFieldStreamHandler(
-				[]string{"reducer_memory"},
-				func(key string, reader io.Reader) {
-					var out bytes.Buffer
-					reducerMem := io.TeeReader(utils.JSONStringReader(reader), &out)
-					m.config.GetEmitter().EmitSystemStreamEvent(
-						"memory-timeline",
-						time.Now(),
-						reducerMem,
-						response.GetTaskIndex(),
-						func() {
-							log.Infof("memory-timeline shrink result: %v", out.String())
-						},
-					)
-				}),
-		)
-		if extractErr != nil {
-			log.Errorf("extract timeline batch compress action failed: %v", extractErr)
-			return utils.Errorf("extract timeline reducer_memory action failed: %v", extractErr)
-		}
-		result := action.GetString("reducer_memory")
-		if result == "" && cumulativeSummary == "" {
-			log.Warn("batch compress got empty reducer memory in json field")
-		}
-		return nil
-	})
-	if err != nil {
-		log.Warnf("batch compress call ai failed: %v", err)
-		return
-	}
-
-	compressedMemory := action.GetString("reducer_memory")
-	if compressedMemory == "" {
-		compressedMemory = cumulativeSummary
-	} else {
-		compressedMemory += "\n" + cumulativeSummary
-	}
-	if compressedMemory == "" {
-		log.Warn("================================================================")
-		log.Warn("================================================================")
-		log.Warn("batch compress got empty compressed memory, action dumpped: ")
-		fmt.Println(action.GetParams())
-		log.Warn("================================================================")
-		log.Warn("================================================================")
-		return
-	}
-
-	// 存储压缩结果
-	lastCompressedId := idsToRemove[len(idsToRemove)-1]
-	if lt, ok := m.reducers.Get(lastCompressedId); ok {
-		lt.Push(compressedMemory)
-	} else {
-		m.reducers.Set(lastCompressedId, linktable.NewUnlimitedStringLinkTable(compressedMemory))
-	}
-	log.Infof("batch compressed %d items into reducer at id: %v", len(itemsToCompress), lastCompressedId)
-
-	// 删除被压缩的 items
-	for _, id := range idsToRemove {
-		m.idToTimelineItem.Delete(id)
-		if ts, ok := m.idToTs.Get(id); ok {
-			m.tsToTimelineItem.Delete(ts)
-			m.idToTs.Delete(id)
-		}
-	}
-}
+// 关键词: timeline_batch_compress 已迁出
+// 以下批量压缩相关代码已迁移至 timeline_batch_compress.go：
+//   - estimateItemContentTokens
+//   - findCompressSplitByRecentKeepTokens
+//   - compressForSizeLimit
+//   - batchCompressOldestWithRecent
+//   - renderBatchCompressPrompt / buildRecentKeptString / buildItemsToCompressString
+//   - MaxBatchCompressPromptSize / MaxBatchCompressRecentSize / timelineBatchCompress (embed)
+// timeline.go 仅保留: calculateActualContentSize / dumpSizeCheck / emergencyCompress / createEmergencySummary
 
 func (m *Timeline) calculateActualContentSize() int64 {
 	buf := bytes.NewBuffer(nil)
 	initOnce := sync.Once{}
 	count := 0
-
-	shrinkStartId, _, _ := m.summary.Last()
 
 	m.idToTimelineItem.ForEach(func(id int64, item *TimelineItem) bool {
 		initOnce.Do(func() {
@@ -517,14 +512,6 @@ func (m *Timeline) calculateActualContentSize() int64 {
 		}
 		t := time.Unix(0, ts*int64(time.Millisecond))
 		timeStr := t.Format(utils.DefaultTimeFormat3)
-
-		if shrinkStartId > 0 && item.GetID() <= shrinkStartId {
-			val, ok := m.summary.Get(shrinkStartId)
-			if ok && !val.Value().deleted {
-				buf.WriteString(fmt.Sprintf("--[%s] id: %v memory: %v\n", timeStr, item.GetID(), val.Value().GetShrinkResult()))
-			}
-			return true
-		}
 
 		if item.deleted {
 			return true
@@ -539,7 +526,7 @@ func (m *Timeline) calculateActualContentSize() int64 {
 		return true
 	})
 	if count > 0 {
-		return int64(len(buf.String()))
+		return int64(ytoken.CalcTokenCount(buf.String()))
 	}
 	return 0
 }
@@ -560,13 +547,6 @@ func (m *Timeline) dumpSizeCheck() {
 
 	// 压缩到合适的大小
 	m.compressForSizeLimit()
-}
-
-// EmergencyCompress performs non-AI compression by removing oldest items
-// This is the public API that can be called from outside
-// Use this when timeline is too large and needs to be compressed without AI assistance
-func (m *Timeline) EmergencyCompress() {
-	m.emergencyCompress(MaxTimelineSaveSize)
 }
 
 // emergencyCompress performs non-AI compression by removing oldest items
@@ -592,6 +572,9 @@ func (m *Timeline) emergencyCompress(targetSize int) {
 	// Get all item IDs ordered by timestamp (oldest first)
 	var itemIDs []int64
 	m.idToTimelineItem.ForEach(func(id int64, item *TimelineItem) bool {
+		if item == nil || item.deleted {
+			return true
+		}
 		itemIDs = append(itemIDs, id)
 		return true
 	})
@@ -604,6 +587,10 @@ func (m *Timeline) emergencyCompress(targetSize int) {
 	// Keep removing oldest items until we're under target size
 	// We need to keep at least 1 item
 	removedCount := 0
+	var removedIDs []int64
+	var removedItems []*TimelineItem
+	var emergencySummaries []string
+	var lastRemovedID int64
 	for len(itemIDs) > 1 && currentSize > targetSize {
 		// Remove the oldest item (first in the list)
 		oldestID := itemIDs[0]
@@ -617,22 +604,15 @@ func (m *Timeline) emergencyCompress(targetSize int) {
 
 		// Create a brief summary of what was removed (without AI)
 		briefSummary := m.createEmergencySummary(item, oldestID)
-
-		// Remove from all maps
-		if ts, ok := m.idToTs.Get(oldestID); ok {
-			m.tsToTimelineItem.Delete(ts)
-			m.idToTs.Delete(oldestID)
-		}
-		m.idToTimelineItem.Delete(oldestID)
-		m.summary.Delete(oldestID)
-
-		// Store the emergency summary in reducers
+		removedIDs = append(removedIDs, oldestID)
+		removedItems = append(removedItems, item)
 		if briefSummary != "" {
-			if lt, ok := m.reducers.Get(oldestID); ok {
-				lt.Push(briefSummary)
-			} else {
-				m.reducers.Set(oldestID, linktable.NewUnlimitedStringLinkTable(briefSummary))
-			}
+			emergencySummaries = append(emergencySummaries, briefSummary)
+		}
+		lastRemovedID = oldestID
+
+		if item != nil {
+			item.deleted = true
 		}
 
 		removedCount++
@@ -645,6 +625,35 @@ func (m *Timeline) emergencyCompress(targetSize int) {
 			}
 			currentSize = len(tlstr)
 		}
+	}
+	if len(removedIDs) > 0 {
+		lastRemovedID = removedIDs[len(removedIDs)-1]
+		var coveredEndAtMs int64
+		if ts, ok := m.idToTs.Get(lastRemovedID); ok {
+			coveredEndAtMs = ts
+		}
+		headText := strings.TrimSpace(strings.Join(emergencySummaries, "\n"))
+		if m.compressedHead != nil && strings.TrimSpace(m.compressedHead.Text) != "" {
+			if headText == "" {
+				headText = m.compressedHead.Text
+			} else {
+				headText = m.compressedHead.Text + "\n" + headText
+			}
+		}
+		if headText != "" {
+			m.updateCompressedHead(&TimelineCompressedHead{
+				Text:             headText,
+				CoveredEndItemID: lastRemovedID,
+				CoveredEndAtMs:   coveredEndAtMs,
+			})
+		}
+		m.attachArchiveRef(lastRemovedID, m.archiveForgottenBatch(
+			TimelineArchiveReasonEmergencyCompress,
+			lastRemovedID,
+			removedIDs,
+			removedItems,
+			strings.Join(emergencySummaries, "\n"),
+		))
 	}
 
 	// Final size check
@@ -689,136 +698,6 @@ func (m *Timeline) createEmergencySummary(item *TimelineItem, id int64) string {
 	}
 
 	return summary
-}
-
-func (m *Timeline) compressForSizeLimit() {
-	if m.ai == nil || m.totalDumpContentLimit <= 0 {
-		return
-	}
-
-	total := int64(m.idToTimelineItem.Len())
-	if total <= 1 {
-		return // 不能压缩到少于1个项目
-	}
-
-	// 计算当前内容大小（不包括reducer）
-	currentSize := m.calculateActualContentSize()
-
-	// 如果内容大小没有超过限制，不需要压缩
-	if currentSize <= m.totalDumpContentLimit {
-		return
-	}
-
-	// 当内容大小超过限制时，压缩到原来的一半大小
-	targetSize := int(total / 2)
-	if targetSize < 1 {
-		targetSize = 1
-	}
-
-	log.Infof("content size %d > limit %d, compressing to half size: %d items",
-		currentSize, m.totalDumpContentLimit, targetSize)
-
-	if m.compressing.Done() {
-		m.compressing.Reset()
-	}
-
-	go func() {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Errorf("batch compress panic: %v", err)
-				utils.PrintCurrentGoroutineRuntimeStack()
-			}
-		}()
-		m.compressing.DoOr(func() {
-			defer func() {
-				if err := recover(); err != nil {
-					log.Errorf("batch compress panic: %v", err)
-					utils.PrintCurrentGoroutineRuntimeStack()
-				}
-			}()
-			m.batchCompressByTargetSize(targetSize)
-		}, func() {
-			log.Info("batch compress is already running, skip this compress request")
-		})
-	}()
-}
-
-// MaxBatchCompressPromptSize is the maximum size (80KB) for batch compress prompt
-// This leaves room for the template overhead while keeping under 100KB total
-const MaxBatchCompressPromptSize = 80 * 1024
-
-//go:embed prompts/timeline/batch_compress.txt
-var timelineBatchCompress string
-
-func (m *Timeline) renderBatchCompressPrompt(items []*TimelineItem, nonceStr string) string {
-	if len(items) == 0 {
-		return ""
-	}
-
-	ins, err := template.New("timeline-batch-compress").Parse(timelineBatchCompress)
-	if err != nil {
-		log.Errorf("BUG: batch compress prompt template failed: %v", err)
-		return ""
-	}
-
-	var buf bytes.Buffer
-	var nonce = nonceStr
-	if nonce == "" {
-		nonce = utils.RandStringBytes(6)
-	}
-
-	// 构建要压缩的 items 字符串，限制总大小
-	var itemsStr strings.Builder
-	totalSize := 0
-	actualItemCount := 0
-
-	for i, item := range items {
-		itemContent := fmt.Sprintf("[%d] %s", i+1, item.String())
-
-		// Check if adding this item would exceed the limit
-		if totalSize+len(itemContent)+1 > MaxBatchCompressPromptSize {
-			log.Warnf("batch compress: truncating items at %d/%d due to size limit (%d > %d)",
-				i, len(items), totalSize+len(itemContent), MaxBatchCompressPromptSize)
-
-			// Add a notice that items were truncated
-			truncateNotice := fmt.Sprintf("\n... [%d more items truncated due to size limit] ...", len(items)-i)
-			if totalSize+len(truncateNotice) < MaxBatchCompressPromptSize {
-				itemsStr.WriteString(truncateNotice)
-			}
-			break
-		}
-
-		if i > 0 {
-			itemsStr.WriteString("\n")
-			totalSize++
-		}
-		itemsStr.WriteString(itemContent)
-		totalSize += len(itemContent)
-		actualItemCount++
-	}
-
-	if actualItemCount == 0 {
-		log.Warnf("batch compress: no items could fit within size limit, using truncated first item")
-		// Force include at least a truncated version of the first item
-		firstItem := items[0].String()
-		if len(firstItem) > MaxBatchCompressPromptSize-100 {
-			firstItem = firstItem[:MaxBatchCompressPromptSize-100] + "... [truncated]"
-		}
-		itemsStr.WriteString(fmt.Sprintf("[1] %s", firstItem))
-		actualItemCount = 1
-	}
-
-	err = ins.Execute(&buf, map[string]any{
-		"ExtraMetaInfo":   m.ExtraMetaInfo(),
-		"ItemsToCompress": itemsStr.String(),
-		"ItemCount":       actualItemCount,
-		"NONCE":           nonce,
-	})
-	if err != nil {
-		log.Errorf("BUG: batch compress prompt execution failed: %v", err)
-		return ""
-	}
-	return buf.String()
 }
 
 // MaxSummaryPromptTimelineSize is the maximum size (60KB) for timeline content in summary prompt
@@ -871,85 +750,301 @@ func (m *Timeline) renderSummaryPrompt(result *TimelineItem) string {
 	return buf.String()
 }
 
+// TimelineDumpDefaultIntervalMinutes 是 Dump / String / DumpBefore 默认使用的分桶分钟数
+// 关键词: TimelineDumpDefaultIntervalMinutes, Dump 默认 interval
+const TimelineDumpDefaultIntervalMinutes = 3
+
+// TimelineDumpDefaultAITagName 是 Dump / String / DumpBefore 默认使用的 aitag tag 名
+// 关键词: TimelineDumpDefaultAITagName, Dump aitag tag
+const TimelineDumpDefaultAITagName = "TIMELINE"
+
+// Dump 输出 timeline 的 aitag-wrapped 渲染串。
+//
+// 等价于:
+//
+//	GroupByMinutes(TimelineDumpDefaultIntervalMinutes).
+//	    GetAllRenderable().
+//	    RenderWithFrozenBoundary(
+//	        TimelineDumpDefaultAITagName,
+//	        TimelineFrozenBoundaryTagName,
+//	        TimelineFrozenBoundaryNonce,
+//	    )
+//
+// 仅包含 reducer block + interval block，不包含 archive block（archive 暂时不展示在 Dump 中）。
+// GroupByMinutes 在 3 分钟时间桶之上叠加默认字节子桶（见 TimelineDumpDefaultBucketByteSize /
+// SetTimelineBucketByteSize），短时可切多个 interval 子块以保留前缀缓存。
+//
+// 输出在含混合 frozen+open 的场景下会自动加上
+// <|AI_CACHE_FROZEN_semi-dynamic|>...<|AI_CACHE_FROZEN_END_semi-dynamic|>
+// 边界标签把已冻结前缀包起来, 让下游 aicache hijacker 能用简单字符串
+// IndexOf 精准定位到 frozen 与 open 的边界, 实现 §7.7.7 双 cc 命中所需
+// 的 user1 (frozen prefix) / user2 (open tail) 切分。
+//
+// 全 frozen / 全 open 场景下不加边界, 保持与原 Render 字节一致, 退化路径
+// 让 hijacker 走 2 段拼接 + aibalance 单 cc 兜底。
+//
+// 关键词: Timeline.Dump, GroupByMinutes 别名, aitag 包裹, 前缀缓存,
+//
+//	AI_CACHE_FROZEN 边界, hijacker 切割锚点, §7.7.7
 func (m *Timeline) Dump() string {
-	k, _, ok := m.idToTimelineItem.Last()
-	if ok {
-		return m.DumpBefore(k)
+	if m == nil {
+		return ""
 	}
-	return ""
+	return m.GroupByMinutes(TimelineDumpDefaultIntervalMinutes).
+		GetAllRenderable().
+		RenderWithFrozenBoundary(
+			TimelineDumpDefaultAITagName,
+			TimelineFrozenBoundaryTagName,
+			TimelineFrozenBoundaryNonce,
+		)
 }
 
+// String 是 Dump 的别名，为了兼容 fmt.Stringer 接口
 func (m *Timeline) String() string {
 	return m.Dump()
 }
 
+// DumpFrozenOpen 把 timeline 拆成 frozen 前缀 + open 尾段两段独立返回,
+// 不带任何 frozen 边界标签外壳。调用方 (例如 LiteForge / aireact 模板)
+// 自行决定如何拼接, 通常 frozen 段进 <|AI_CACHE_FROZEN_semi-dynamic|>
+// 块, open 段进 <|PROMPT_SECTION_timeline-open|> 块, 实现 5 段稳定性
+// 分层与 hijacker 双 cc 切片的精确边界。
+//
+// 等价于:
+//
+//	rb := m.GroupByMinutes(TimelineDumpDefaultIntervalMinutes).GetAllRenderable()
+//	frozen = rb.RenderFrozenOnly(TimelineDumpDefaultAITagName)
+//	open   = rb.RenderOpenOnly(TimelineDumpDefaultAITagName)
+//
+// 字节稳定性: frozen 段只受 frozen blocks (reducer + 非末 interval) 影响,
+// open 段独立。两段拼接的字面量与 Dump() 在带 frozen 边界场景下完全等价
+// (除掉 <|AI_CACHE_FROZEN_*|> wrap)。
+//
+// 关键词: Timeline.DumpFrozenOpen, frozen open 拆分, 5 段稳定性分层,
+//
+//	LiteForge timeline 拆分, hijacker 双 cc 切片
+func (m *Timeline) DumpFrozenOpen() (frozen string, open string) {
+	if m == nil {
+		return "", ""
+	}
+	blocks := RenderTimelineFrozenOpen(m)
+	return blocks.Frozen, blocks.Open
+}
+
+// DumpBefore 输出 ID <= beforeId 的部分 timeline，结构与 Dump 一致
+// 通过 CreateSubTimeline 限定上界，再走 Dump 公共路径，避免修改 GroupByMinutes 签名
+// 关键词: Timeline.DumpBefore, 子 timeline 上界, GroupByMinutes 复用, reducer 继承
+//
+// 注意: reducer 由 CreateSubTimeline 在源头全量继承，这里无需重复迁移。
 func (m *Timeline) DumpBefore(beforeId int64) string {
-	buf := bytes.NewBuffer(nil)
-	initOnce := sync.Once{}
-	count := 0
-
-	shrinkStartId, _, _ := m.summary.Last()
-	reduceredStartId, _, _ := m.reducers.Last()
-
-	// If we have reducers, show them first
-	if reduceredStartId > 0 {
-		val, ok := m.reducers.Get(reduceredStartId)
-		if ok {
-			initOnce.Do(func() {
-				buf.WriteString("timeline:\n")
-			})
-			buf.WriteString(fmt.Sprint("  ...\n"))
-			// Use a fixed timestamp for reducer display
-			reducerTimeStr := time.Now().Format(utils.DefaultTimeFormat3)
-			buf.WriteString(fmt.Sprintf("--[%s] id: %v reducer-memory: %v\n", reducerTimeStr, reduceredStartId, val.Value()))
-		}
+	if m == nil {
+		return ""
+	}
+	if m.idToTimelineItem == nil {
+		return ""
 	}
 
-	m.idToTimelineItem.ForEach(func(id int64, item *TimelineItem) bool {
-		initOnce.Do(func() {
-			buf.WriteString("timeline:\n")
-		})
-
-		if item.GetID() > beforeId {
-			return true
+	// 收集 ID <= beforeId 的活跃条目 ID
+	var ids []int64
+	m.idToTimelineItem.ForEach(func(id int64, _ *TimelineItem) bool {
+		if id <= beforeId {
+			ids = append(ids, id)
 		}
-
-		ts, ok := m.idToTs.Get(item.GetID())
-		if !ok {
-			log.Warnf("BUG: timeline id %v not found", item.GetID())
-		}
-		t := time.Unix(0, ts*int64(time.Millisecond))
-		timeStr := t.Format(utils.DefaultTimeFormat3)
-
-		if shrinkStartId > 0 && item.GetID() <= shrinkStartId {
-			val, ok := m.summary.Get(shrinkStartId)
-			if ok && !val.Value().deleted {
-				//buf.WriteString(fmt.Sprintf("├─[%s] id: %v memory: %v\n", timeStr, item.GetID(), val.Value().GetShrinkResult()))
-				buf.WriteString(fmt.Sprintf("--[%s] id: %v memory: %v\n", timeStr, item.GetID(), val.Value().GetShrinkResult()))
-			}
-			return true
-		}
-
-		if item.deleted {
-			return true
-		}
-
-		//buf.WriteString(fmt.Sprintf("├─[%s]\n", timeStr))
-		buf.WriteString(fmt.Sprintf("--[%s]\n", timeStr))
-		raw := item.String()
-		for _, line := range utils.ParseStringToRawLines(raw) {
-			//buf.WriteString(fmt.Sprintf("│    %s\n", line))
-			buf.WriteString(fmt.Sprintf("     %s\n", line))
-		}
-		count++
 		return true
 	})
-	if count > 0 {
-		return buf.String()
+	if len(ids) == 0 {
+		if m.compressedHead == nil || beforeId < m.compressedHead.CoveredEndItemID {
+			return ""
+		}
 	}
 
-	buf.WriteString("no timeline generated in DumpBefore\n")
-	return buf.String()
+	sub := m.CreateSubTimeline(ids...)
+	if sub == nil {
+		return ""
+	}
+	if sub.compressedHead != nil && beforeId < sub.compressedHead.CoveredEndItemID {
+		sub.compressedHead = nil
+	}
+	return sub.Dump()
+}
+
+func (m *Timeline) attachArchiveRef(reducerKeyID int64, ref *TimelineArchiveRef) {
+	if reducerKeyID <= 0 || ref == nil {
+		return
+	}
+	if m.archiveRefs == nil {
+		m.archiveRefs = omap.NewOrderedMap(map[int64]*TimelineArchiveRef{})
+	}
+	m.archiveRefs.Set(reducerKeyID, ref)
+}
+
+func (m *Timeline) archiveForgottenBatch(reason TimelineArchiveReason, reducerKeyID int64, ids []int64, items []*TimelineItem, summary string) *TimelineArchiveRef {
+	store := m.timelineArchiveStore()
+	if store == nil || len(ids) == 0 || len(items) == 0 {
+		return nil
+	}
+
+	startID := ids[0]
+	endID := ids[len(ids)-1]
+	refID := utils.CalcSha256(
+		fmt.Sprintf("%s", reason),
+		strconv.FormatInt(reducerKeyID, 10),
+		strconv.FormatInt(startID, 10),
+		strconv.FormatInt(endID, 10),
+		strings.TrimSpace(summary),
+	)
+
+	batch := &TimelineArchiveBatch{
+		ArchiveID:           "timeline-archive-" + refID[:16],
+		PersistentSessionID: m.timelinePersistentSessionID(),
+		Reason:              reason,
+		Summary:             strings.TrimSpace(summary),
+		MergedContent:       strings.TrimSpace(timelineArchiveMergedContent(items)),
+		SourceChunks:        timelineArchiveSourceChunks(items),
+		ReducerKeyID:        reducerKeyID,
+		SourceStartID:       startID,
+		SourceEndID:         endID,
+		ItemCount:           len(ids),
+		RepresentativeSnips: timelineArchiveRepresentativeSnippets(items, 3),
+		Tags: []string{
+			"timeline_midterm",
+			fmt.Sprintf("timeline_range_%d_%d", startID, endID),
+			fmt.Sprintf("timeline_reason_%s", reason),
+		},
+	}
+
+	if len(items) > 0 {
+		batch.SourceStartAt = items[0].createdAt
+		batch.SourceEndAt = items[len(items)-1].createdAt
+	}
+
+	ref, err := store.ArchiveCompressedBatch(context.Background(), batch)
+	if err != nil {
+		log.Warnf("archive forgotten timeline batch failed: %v", err)
+		return nil
+	}
+	return ref
+}
+
+func timelineArchiveRepresentativeSnippets(items []*TimelineItem, limit int) []string {
+	if limit <= 0 {
+		limit = 3
+	}
+	result := make([]string, 0, limit)
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		snippet := strings.TrimSpace(utils.ShrinkString(item.String(), 240))
+		if snippet == "" {
+			continue
+		}
+		result = append(result, snippet)
+		if len(result) >= limit {
+			break
+		}
+	}
+	return result
+}
+
+func timelineArchiveMergedContent(items []*TimelineItem) string {
+	if len(items) == 0 {
+		return ""
+	}
+
+	var buf strings.Builder
+	for _, item := range items {
+		if item == nil || item.deleted {
+			continue
+		}
+
+		if !item.createdAt.IsZero() {
+			buf.WriteString("[")
+			buf.WriteString(item.createdAt.Format(time.RFC3339))
+			buf.WriteString("] ")
+		}
+		buf.WriteString("id=")
+		buf.WriteString(strconv.FormatInt(item.GetID(), 10))
+		buf.WriteString("\n")
+
+		raw := strings.TrimSpace(item.String())
+		if raw != "" {
+			for _, line := range utils.ParseStringToRawLines(raw) {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				buf.WriteString("- ")
+				buf.WriteString(line)
+				buf.WriteString("\n")
+			}
+		}
+		buf.WriteString("\n")
+	}
+
+	return strings.TrimSpace(buf.String())
+}
+
+func timelineArchiveSourceChunks(items []*TimelineItem) []string {
+	if len(items) == 0 {
+		return nil
+	}
+
+	chunks := make([]string, 0, len(items))
+	for _, item := range items {
+		if item == nil || item.deleted {
+			continue
+		}
+
+		var buf strings.Builder
+		if !item.createdAt.IsZero() {
+			buf.WriteString("[")
+			buf.WriteString(item.createdAt.Format(time.RFC3339))
+			buf.WriteString("] ")
+		}
+		buf.WriteString("id=")
+		buf.WriteString(strconv.FormatInt(item.GetID(), 10))
+		buf.WriteString("\n")
+
+		raw := strings.TrimSpace(item.String())
+		if raw != "" {
+			for _, line := range utils.ParseStringToRawLines(raw) {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				buf.WriteString("- ")
+				buf.WriteString(line)
+				buf.WriteString("\n")
+			}
+		}
+
+		chunk := strings.TrimSpace(buf.String())
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+	}
+	return chunks
+}
+
+func (m *Timeline) timelineArchiveStore() TimelineArchiveStore {
+	if m == nil || m.config == nil {
+		return nil
+	}
+	if provider, ok := m.config.(interface{ GetTimelineArchiveStore() TimelineArchiveStore }); ok {
+		return provider.GetTimelineArchiveStore()
+	}
+	return nil
+}
+
+func (m *Timeline) timelinePersistentSessionID() string {
+	if m == nil || m.config == nil {
+		return ""
+	}
+	if provider, ok := m.config.(interface{ GetPersistentSessionID() string }); ok {
+		return provider.GetPersistentSessionID()
+	}
+	return ""
 }
 
 //go:embed prompts/timeline/tool_result_history.txt
@@ -1057,16 +1152,17 @@ func (m *Timeline) ReassignIDs(idGenerator func() int64) int64 {
 	// Create new mappings
 	newIdToTs := omap.NewOrderedMap(map[int64]int64{})
 	newIdToTimelineItem := omap.NewOrderedMap(map[int64]*TimelineItem{})
-	newSummary := omap.NewOrderedMap(map[int64]*linktable.LinkTable[*TimelineItem]{})
-	newReducers := omap.NewOrderedMap(map[int64]*linktable.LinkTable[string]{})
 
-	// Track old ID to new ID mapping for summary and reducers
+	// Track old ID to new ID mapping for compressedHead remapping
 	oldToNewID := make(map[int64]int64)
 
 	var lastID int64
-	// Reassign IDs in order
+	// Reassign IDs in order, skipping soft-deleted (inactive) items
 	for _, itemWithTs := range orderedItems {
 		item := itemWithTs.item
+		if item.deleted {
+			continue
+		}
 		ts := itemWithTs.ts
 		oldID := item.GetID()
 		newID := idGenerator()
@@ -1090,23 +1186,24 @@ func (m *Timeline) ReassignIDs(idGenerator func() int64) int64 {
 		// Add to new mappings
 		newIdToTs.Set(newID, ts)
 		newIdToTimelineItem.Set(newID, item)
-
-		// Update summary if exists for this old ID
-		if summaryLt, ok := m.summary.Get(oldID); ok {
-			newSummary.Set(newID, summaryLt)
-		}
-
-		// Update reducers if exists for this old ID
-		if reducerLt, ok := m.reducers.Get(oldID); ok {
-			newReducers.Set(newID, reducerLt)
-		}
 	}
 
 	// Replace old mappings with new ones
 	m.idToTs = newIdToTs
 	m.idToTimelineItem = newIdToTimelineItem
-	m.summary = newSummary
-	m.reducers = newReducers
+	if m.compressedHead != nil {
+		if mapped, ok := oldToNewID[m.compressedHead.CoveredEndItemID]; ok {
+			m.compressedHead.CoveredEndItemID = mapped
+		}
+	}
+	for _, h := range m.compressedHistory {
+		if h == nil {
+			continue
+		}
+		if mapped, ok := oldToNewID[h.CoveredEndItemID]; ok {
+			h.CoveredEndItemID = mapped
+		}
+	}
 
 	log.Infof("reassigned IDs for %d timeline items, last ID: %d", len(orderedItems), lastID)
 	return lastID

@@ -2,7 +2,7 @@ desc(
 	title: "Check Java URL Redirect Vulnerability"
 	title_zh: "检测Java URL重定向漏洞"
 	type:vuln
-	risk_type:"url-redirect"
+	risk: "开放重定向"
 	desc: <<<DESC
 ### 漏洞描述
 1. **漏洞原理**
@@ -116,7 +116,7 @@ check $sink;
 $sink #{
     until:`* & $source`,
     exclude:`*?{opcode:call}?{!<self> & $source}?{!<self> & $sink}`,
-    exclude:`*?{opcode:phi}`,
+    exclude:`*?{<cfgGuards(opcode: return)>} `,
 }->as $high;
 
 alert $high for {

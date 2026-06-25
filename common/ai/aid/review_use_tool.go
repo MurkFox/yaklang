@@ -142,7 +142,7 @@ func (t *AiTask) toolReviewPolicy_wrongTool(ctx context.Context, oldTool *aitool
 		return oldTool, true, utils.Error("tool not found via user prompt")
 	}
 
-	prompt, err := t.quickBuildPrompt(__prompt_toolReSelect, map[string]any{
+	prompt, err := t.quickBuildTaskPrompt(__prompt_toolReSelect, map[string]any{
 		"OldTool":  oldTool,
 		"ToolList": tools,
 	})
@@ -183,7 +183,7 @@ func (t *AiTask) toolReviewPolicy_wrongTool(ctx context.Context, oldTool *aitool
 			return utils.Errorf("unknown action type: %s", action.ActionType())
 		}
 		return nil
-	})
+	}, aicommon.WithAIRequest_CallerLabel("tool-select"))
 	if transErr != nil {
 		return oldTool, true, transErr
 	}
@@ -201,7 +201,7 @@ func (t *AiTask) toolReviewPolicy_wrongParam(ctx context.Context, tool *aitool.T
 	default:
 	}
 
-	prompt, err := t.quickBuildPrompt(__prompt_ParamsReGenerate, map[string]any{
+	prompt, err := t.quickBuildTaskPrompt(__prompt_ParamsReGenerate, map[string]any{
 		"Tool":      tool,
 		"OldParam":  oldParam,
 		"UserInput": suggestion,
@@ -231,7 +231,7 @@ func (t *AiTask) toolReviewPolicy_wrongParam(ctx context.Context, tool *aitool.T
 			invokeParams.Set(k, v)
 		}
 		return nil
-	})
+	}, aicommon.WithAIRequest_CallerLabel("tool-params"))
 	if transErr != nil || len(invokeParams) <= 0 {
 		return oldParam, transErr
 	}

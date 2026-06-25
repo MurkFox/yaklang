@@ -78,8 +78,8 @@ func mockedRequestPlanAndExecuting_MultiPlans(i aicommon.AICallerConfigIf, req *
 func TestReAct_PlanAndExecute_MultiPlan(t *testing.T) {
 	flag := ksuid.New().String()
 	_ = flag
-	in := make(chan *ypb.AIInputEvent, 10)
-	out := make(chan *ypb.AIOutputEvent, 10)
+	in := make(chan *ypb.AIInputEvent, 100)
+	out := make(chan *ypb.AIOutputEvent, 10000)
 
 	toolCalled := false
 	sleepTool, err := aitool.New(
@@ -133,9 +133,13 @@ func TestReAct_PlanAndExecute_MultiPlan(t *testing.T) {
 		}
 	}()
 
+	// 关键词: TestReAct_PlanAndExecute_MultiPlan, github_actions_timeout
+	// CI 上 ReAct 主循环 + post-iteration summary mock 至少需要 2 轮 AI 调用 +
+	// 事件投递，1s 太紧导致 EVENT_TYPE_RESULT 还没派发到 out channel 测试就退出。
+	// 这里改为 5s，仍远小于本地 10s 上限，不会显著拉长 CI。
 	du := time.Duration(10)
 	if utils.InGithubActions() {
-		du = time.Duration(1)
+		du = time.Duration(5)
 	}
 	after := time.After(du * time.Second)
 
@@ -145,6 +149,7 @@ func TestReAct_PlanAndExecute_MultiPlan(t *testing.T) {
 	_ = iid
 	var processCount = 0
 	directlyAnswer := false
+	var answerStream bytes.Buffer
 LOOP:
 	for {
 		select {
@@ -173,6 +178,14 @@ LOOP:
 			if e.Type == string(schema.EVENT_TYPE_RESULT) {
 				directlyAnswer = true
 				break LOOP
+			}
+			if e.Type == string(schema.EVENT_TYPE_STREAM) && e.NodeId == "re-act-loop-answer-payload" {
+				answerStream.Write(e.GetContent())
+				if strings.Contains(answerStream.String(), "mocked answer directly after plan") ||
+					strings.Contains(answerStream.String(), "mocked post-iteration summary") {
+					directlyAnswer = true
+					break LOOP
+				}
 			}
 		case <-after:
 			break LOOP

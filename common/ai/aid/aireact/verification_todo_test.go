@@ -1,6 +1,7 @@
 package aireact
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -8,6 +9,11 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 )
 
+// TestRenderVerificationTodoSnapshot_AggregatesStatuses 验证渲染快照能正确
+// 聚合各种状态. 注意: 旧版本依赖 Satisfied=true 自动翻 SKIPPED 来生成
+// [SKIPPED] 行, 已废弃. 现在 [SKIPPED] 必须由显式 skip op 生成.
+//
+// 关键词: 显式 skip 渲染, 聚合各种 TODO 状态
 func TestRenderVerificationTodoSnapshot_AggregatesStatuses(t *testing.T) {
 	history := []*aicommon.VerifySatisfactionResult{
 		{
@@ -15,6 +21,7 @@ func TestRenderVerificationTodoSnapshot_AggregatesStatuses(t *testing.T) {
 			NextMovements: []aicommon.VerifyNextMovement{
 				{Op: "add", ID: "collect_signal", Content: "收集页面响应信号"},
 				{Op: "add", ID: "fix_title", Content: "修正标题"},
+				{Op: "add", ID: "replay_payload", Content: "使用新 payload 复测"},
 			},
 		},
 		{
@@ -22,7 +29,9 @@ func TestRenderVerificationTodoSnapshot_AggregatesStatuses(t *testing.T) {
 			NextMovements: []aicommon.VerifyNextMovement{
 				{Op: "done", ID: "collect_signal"},
 				{Op: "delete", ID: "fix_title"},
-				{Op: "add", ID: "replay_payload", Content: "使用新 payload 复测"},
+				// AI 显式跳过该 TODO, 取代旧的"Satisfied=true 自动翻 SKIPPED"
+				// 语义
+				{Op: "skip", ID: "replay_payload"},
 			},
 		},
 		{
@@ -39,13 +48,13 @@ func TestRenderVerificationTodoSnapshot_AggregatesStatuses(t *testing.T) {
 
 func TestRenderVerificationTodoSnapshot_PrioritizesActiveItemsUnderLimit(t *testing.T) {
 	history := []*aicommon.VerifySatisfactionResult{}
-	for index := 0; index < 80; index++ {
+	for index := 0; index < 400; index++ {
 		history = append(history, &aicommon.VerifySatisfactionResult{
 			Satisfied: false,
 			NextMovements: []aicommon.VerifyNextMovement{
 				{
 					Op:      "add",
-					ID:      strings.Join([]string{"todo", strings.Repeat("x", 20), string(rune('a' + (index % 26))), strings.Repeat("z", 20)}, "-"),
+					ID:      fmt.Sprintf("todo-%03d-%s-%c-%s", index, strings.Repeat("x", 20), rune('a'+(index%26)), strings.Repeat("z", 20)),
 					Content: strings.Repeat("非常长的待办描述", 30),
 				},
 			},
@@ -59,9 +68,9 @@ func TestRenderVerificationTodoSnapshot_PrioritizesActiveItemsUnderLimit(t *test
 	})
 
 	snapshot := renderVerificationTodoSnapshot(history)
-	require.LessOrEqual(t, len(snapshot), verificationTodoSnapshotLimit)
+	require.LessOrEqual(t, aicommon.MeasureTokens(snapshot), verificationTodoSnapshotLimit)
 	require.Contains(t, snapshot, "active_focus")
-	require.Contains(t, snapshot, "TODO history exceeded 10KB")
+	require.Contains(t, snapshot, "TODO history exceeded 10K tokens")
 }
 
 func TestBuildVerificationTodoItems_DoneKeepsLatestContent(t *testing.T) {

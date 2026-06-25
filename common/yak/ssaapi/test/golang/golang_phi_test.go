@@ -10,7 +10,6 @@ import (
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/test/ssatest"
 	"github.com/yaklang/yaklang/common/yak/yaklang"
-	"gotest.tools/v3/assert"
 )
 
 func Test_Phi_WithGoto(t *testing.T) {
@@ -83,234 +82,6 @@ func Test_Phi_WithGoto_inLoop(t *testing.T) {
 				t.Fatal("should be 0 or 1")
 			}
 		}
-		return nil
-	}, ssaapi.WithLanguage(ssaconfig.GO))
-}
-
-func Test_Phi_WithReturn(t *testing.T) {
-	code := `package main
-
-	func main(p int) {
-		a := 1
-		var u int
-		if true {
-			return
-		}
-		b := a
-		c := p
-		d := u
-	}
-`
-	ssatest.CheckWithName("phi-with-return", t, code, func(prog *ssaapi.Program) error {
-		prog.Show()
-		phis := prog.SyntaxFlow("b as $b").GetValues("b")
-		phi := phis[0]
-
-		targetIns, ok := ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds := targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
-		return nil
-	}, ssaapi.WithLanguage(ssaconfig.GO))
-
-	ssatest.CheckWithName("phi-with-return-undefined", t, code, func(prog *ssaapi.Program) error {
-		prog.Show()
-		phis := prog.SyntaxFlow("d as $d").GetValues("d")
-		phi := phis[0]
-
-		targetIns, ok := ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds := targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
-		return nil
-	}, ssaapi.WithLanguage(ssaconfig.GO))
-
-	ssatest.CheckWithName("phi-with-return-with-param", t, code, func(prog *ssaapi.Program) error {
-		prog.Show()
-		ret := prog.SyntaxFlow("c as $c").GetValues("c")[0]
-		_, ok := ssa.ToPhi(ret.GetSSAInst())
-		if !ok {
-			t.Fatal("It shouldn be phi here")
-		}
-		return nil
-	}, ssaapi.WithLanguage(ssaconfig.GO))
-
-	ssatest.CheckWithName("phi-with-return-syntaxflow", t, code, func(prog *ssaapi.Program) error {
-		prog.Show()
-		phis := prog.SyntaxFlow("b #{until: `* ?{opcode: phi}`}-> * as $b; check $b;").GetValues("b")
-		phi := phis[0]
-
-		targetIns, ok := ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds := targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
-		return nil
-	}, ssaapi.WithLanguage(ssaconfig.GO))
-}
-
-func Test_Phi_WithReturn_Extend(t *testing.T) {
-	code := `package main
-
-	func main(p int) {
-		a := 1
-		var u int
-		if a == 1 {
-			return
-		} else if a == 2 {
-			return
-		} else if a == 3 {
-			return
-		}
-		b := a
-		c := p
-		d := u
-	}
-`
-	ssatest.CheckWithName("phi-with-return-else-if", t, code, func(prog *ssaapi.Program) error {
-		prog.Show()
-		phis := prog.SyntaxFlow("b as $b").GetValues("b")
-		phi := phis[0]
-
-		targetIns, ok := ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds := targetIns.GetControlFlowConditions()
-		assert.Equal(t, 2, len(conds))
-
-		phis = prog.SyntaxFlow("c as $c").GetValues("c")
-		phi = phis[0]
-
-		targetIns, ok = ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds = targetIns.GetControlFlowConditions()
-		assert.Equal(t, 2, len(conds))
-
-		phis = prog.SyntaxFlow("d as $d").GetValues("d")
-		phi = phis[0]
-
-		targetIns, ok = ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds = targetIns.GetControlFlowConditions()
-		assert.Equal(t, 2, len(conds))
-
-		return nil
-	}, ssaapi.WithLanguage(ssaconfig.GO))
-
-	code = `package main
-
-	func main(p int) {
-		a := 1
-		var u int
-		if a == 1 {
-			if a == 2 {
-				if a == 3 {
-					return
-				}
-			}
-		} 
-		b := a
-		c := p
-		d := u
-	}
-`
-	ssatest.CheckWithName("phi-with-return-nested-if", t, code, func(prog *ssaapi.Program) error {
-		prog.Show()
-		phis := prog.SyntaxFlow("b as $b").GetValues("b")
-		phi := phis[0]
-
-		targetIns, ok := ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds := targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
-		phis = prog.SyntaxFlow("c as $c").GetValues("c")
-		phi = phis[0]
-
-		targetIns, ok = ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds = targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
-		phis = prog.SyntaxFlow("d as $d").GetValues("d")
-		phi = phis[0]
-
-		targetIns, ok = ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds = targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
-		return nil
-	}, ssaapi.WithLanguage(ssaconfig.GO))
-
-	code = `package main
-
-	func main(p int) {
-		a := 1
-		var u int
-		if a == 1 {
-			if a == 2 {
-				return
-			} else {
-				return
-			}
-		} 
-		b := a
-		c := p
-		d := u
-	}
-`
-	ssatest.CheckWithName("phi-with-return-nested-if-else", t, code, func(prog *ssaapi.Program) error {
-		prog.Show()
-		phis := prog.SyntaxFlow("b as $b").GetValues("b")
-		phi := phis[0]
-
-		targetIns, ok := ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds := targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
-		phis = prog.SyntaxFlow("c as $c").GetValues("c")
-		phi = phis[0]
-
-		targetIns, ok = ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds = targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
-		phis = prog.SyntaxFlow("d as $d").GetValues("d")
-		phi = phis[0]
-
-		targetIns, ok = ssa.ToPhi(phi.GetSSAInst())
-		if !ok {
-			t.Fatal("not phi")
-		}
-		conds = targetIns.GetControlFlowConditions()
-		assert.Equal(t, 1, len(conds))
-
 		return nil
 	}, ssaapi.WithLanguage(ssaconfig.GO))
 }
@@ -487,4 +258,264 @@ func Test_PhiType(t *testing.T) {
 
 		return nil
 	}, opts...)
+}
+
+func TestPhi_in_loop(t *testing.T) {
+	t.Skip()
+	ruleNewJSON := `
+new() as $f
+$f.JSON as $a
+*.JSON as $b
+`
+	ruleGinJSON := `
+gin.Context as $f
+$f.JSON as $a
+*.JSON as $b
+`
+	// want: SyntaxFlow 捕获变量名 -> 预期匹配数量
+	cases := []struct {
+		name string
+		code string
+		rule string
+		want map[string]int
+	}{
+		{
+			name: "If return",
+			code: `package api
+
+		func GetUserEmail() {
+			f := new()
+
+			if err != nil {
+				f.JSON(1)
+				return
+			}
+			for row.Next() {
+				if err != nil {
+					f.JSON(2)
+				}
+			}
+
+			f.JSON(3)
+		}
+		`,
+			rule: ruleNewJSON,
+			// 这里没有 phi，f 只有一个值（return 对 call 类型有特殊处理）
+			want: map[string]int{"f": 1, "a": 2, "b": 2},
+		},
+		{
+			name: "If return inside loop",
+			code: `package api
+
+		func GetUserEmail() {
+			f := new()
+
+			if err != nil {
+				f.JSON(1)
+				return
+			}
+			for row.Next() {
+				if err != nil {
+					f.JSON(2)
+					return
+				}
+			}
+
+			f.JSON(3)
+		}
+		`,
+			rule: ruleNewJSON,
+			want: map[string]int{"f": 1, "a": 1, "b": 3},
+		},
+		{
+			name: "If phi inside loop",
+			code: `package api
+
+		func GetUserEmail() {
+			f := new()
+
+			if err != nil {
+				f.JSON(1)
+				f = new2()
+			}
+
+			f.JSON(2)
+			for row.Next() {
+				if err != nil {
+					f.JSON(3)
+				}
+			}
+
+			f.JSON(4)
+		}
+		`,
+			rule: ruleNewJSON,
+			want: map[string]int{"f": 1, "a": 2, "b": 2},
+		},
+		{
+			name: "If return in param",
+			code: `package api
+
+import (
+	"github.com/gin-gonic/gin"
+)
+
+func GetUserEmail(f *gin.Context) {
+	if err != nil {
+		f.JSON(1)
+		return
+	}
+
+	f.JSON(2)
+	for row.Next() {
+		if err != nil {
+			f.JSON(3)
+		}
+	}
+
+	f.JSON(4)
+}
+`,
+			rule: ruleGinJSON,
+			want: map[string]int{"f": 3, "a": 4, "b": 4},
+		},
+		{
+			name: "If return inside loop in param",
+			code: `package api
+
+import (
+	"github.com/gin-gonic/gin"
+)
+
+func GetUserEmail(f *gin.Context) {
+	if err != nil {
+		f.JSON(1)
+		return
+	}
+
+	f.JSON(2)
+	for row.Next() {
+		if err != nil {
+			f.JSON(3)
+			return
+		}
+	}
+
+	f.JSON(4)
+}
+`,
+			rule: ruleGinJSON,
+			want: map[string]int{"f": 2, "a": 2, "b": 4},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ssatest.CheckResult(t, tc.code, tc.rule, func(res *ssaapi.SyntaxFlowResult) {
+				res.Show()
+				for varName, wantLen := range tc.want {
+					require.Len(t, res.GetValues(varName), wantLen, varName)
+				}
+			}, nil, []ssaconfig.Option{ssaapi.WithLanguage(ssaconfig.GO)})
+		})
+	}
+}
+
+func TestPhi_in_loop_real(t *testing.T) {
+	t.Skip()
+	rule := `
+gin.Context as $input
+$input.JSON as $a
+*.JSON as $b
+`
+	emailAPIPreamble := `package api
+
+import (
+	"database/sql"
+	"fmt"
+
+	"github.com/gin-gonic/gin"
+)
+
+type emailResponse struct {
+	ID    int
+	Email string
+}
+
+func SqliteConn() *sql.DB {
+	db, err := sql.Open("sqlite3", "sql.db")
+	if err != nil {
+		fmt.Println(err)
+	}
+	return db
+}
+
+`
+
+	cases := []struct {
+		name string
+		code string
+		want map[string]int
+	}{
+		{
+			name: "If",
+			code: emailAPIPreamble + `func GetUserEmail(c *gin.Context) {
+	db := SqliteConn()
+	defer db.Close()
+
+	sql := "SELECT id,email FROM user;"
+	row, err := db.Query(sql)
+	if err != nil {
+		fmt.Println(err.Error())
+		c.JSON(400, gin.H{"code": 400, "msg": "query error!"})
+		return
+	}
+	var emailResponseSlice []emailResponse
+
+	c.JSON(200, gin.H{"code": 200, "data": emailResponseSlice})
+}
+`,
+			want: map[string]int{"input": 2, "a": 2, "b": 2},
+		},
+		{
+			name: "If-For",
+			code: emailAPIPreamble + `func GetUserEmail(c *gin.Context) {
+	db := SqliteConn()
+	defer db.Close()
+
+	sql := "SELECT id,email FROM user;"
+	row, err := db.Query(sql)
+	if err != nil {
+		fmt.Println(err.Error())
+		c.JSON(400, gin.H{"code": 400, "msg": "query error!"})
+		return
+	}
+	var emailResponseSlice []emailResponse
+	for row.Next() {
+		var email emailResponse
+		err := row.Scan(&email.ID, &email.Email)
+		if err != nil {
+			fmt.Println(err.Error())
+			c.JSON(400, gin.H{"code": 400, "msg": "scan error!"})
+		}
+		emailResponseSlice = append(emailResponseSlice, email)
+	}
+
+	c.JSON(200, gin.H{"code": 200, "data": emailResponseSlice})
+}
+`,
+			want: map[string]int{"input": 3, "a": 3, "b": 3},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ssatest.CheckResult(t, tc.code, rule, func(res *ssaapi.SyntaxFlowResult) {
+				res.Show()
+				for varName, wantLen := range tc.want {
+					require.Len(t, res.GetValues(varName), wantLen, varName)
+				}
+			}, nil, []ssaconfig.Option{ssaapi.WithLanguage(ssaconfig.GO)})
+		})
+	}
 }

@@ -20,8 +20,61 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 )
 
-func (r *ReActLoop) buildActionTagOption(streamWG *sync.WaitGroup, taskIndex string, nonce string) []aicommon.ActionMakerOption {
-	var emitter = r.GetEmitter()
+// timelineAITagModelThinking 与 prompts/loop/high_static_section.txt 中
+// 「Timeline 每轮记录」约定一致: 仅模型思考流用 AITAG; 其下决策摘要为明文.
+const timelineAITagModelThinking = "TIMELINE_MODEL_THINKING"
+
+// wrapTimelineAITagBlock 将一段正文包成 `<|TAG_nonce|>...<|TAG_END_nonce|>`。
+// body 或 nonce 为空时返回空串 (调用方跳过拼接).
+func wrapTimelineAITagBlock(tagName, nonce, body string) string {
+	body = strings.TrimSpace(body)
+	nonce = strings.TrimSpace(nonce)
+	tagName = strings.TrimSpace(tagName)
+	if body == "" || nonce == "" || tagName == "" {
+		return ""
+	}
+	return fmt.Sprintf("<|%s_%s|>\n%s\n<|%s_END_%s|>", tagName, nonce, body, tagName, nonce)
+}
+
+// isJSONEmbeddedAITagPrefix 判断字段流的首批 peek 字节是否以 `<|TagName_` 开头,
+// 兼容 JSON 字段流推过来的 raw bytes 通常带外层 `"` 与零宽空白. 命中即视为 AI 把
+// AITag 块塞进了 JSON 字符串值, 触发 JSON / AITag 双 emit 重复, 让调用方静默
+// drain 该路径以让 AITag 流单独负责干净 emit.
+//
+// 关键词: JSON-embedded AITag prefix detect, peek 跳过 quote/whitespace, 字段流去重
+func isJSONEmbeddedAITagPrefix(peeked []byte, wrapperToken string) bool {
+	if len(peeked) == 0 || wrapperToken == "" {
+		return false
+	}
+	// 跳过 JSON 字符串外层可能的 leading `"` 与若干空白 (包含全角 BOM 安全裕度).
+	i := 0
+	for i < len(peeked) {
+		switch peeked[i] {
+		case '"', ' ', '\t', '\r', '\n':
+			i++
+			continue
+		}
+		break
+	}
+	return bytes.HasPrefix(peeked[i:], []byte(wrapperToken))
+}
+
+// waitReadableStream blocks until the stream yields at least one byte or closes.
+// It lets callers avoid creating frontend stream cards for empty streams while
+// still preserving the first byte for later emit.
+func waitReadableStream(reader io.Reader) (*utils.BufferedUTF8PeekableReader, bool, error) {
+	peekedReader := utils.NewUTF8PeekableReader(reader)
+	firstByte, err := peekedReader.Peek(1)
+	if err != nil && len(firstByte) == 0 {
+		if errors.Is(err, io.EOF) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return peekedReader, true, nil
+}
+
+func (r *ReActLoop) buildActionTagOption(emitter *aicommon.Emitter, streamWG *sync.WaitGroup, taskIndex string, nonce string) []aicommon.ActionMakerOption {
 	tagFields := r.aiTagFields.Copy()
 	for _, i := range r.GetAllActions() {
 		for _, field := range i.AITagStreamFields {
@@ -43,8 +96,32 @@ func (r *ReActLoop) buildActionTagOption(streamWG *sync.WaitGroup, taskIndex str
 
 		v := _tagInstance
 
+		// 字段级双注册: 默认走 turn nonce; 同时无条件追加
+		// aicommon.LiteralCurrentNoncePlaceholder ("CURRENT_NONCE") 作为兜底
+		// nonce 候选. 如果 LoopAITagField.ExtraNonces 还显式声明了其他候选
+		// (例如 [current-nonce]), 也会一并注册.
+		//
+		// 兜底 CURRENT_NONCE 的原因: 各 loop 的 persistent_instruction /
+		// output_example 等示例 prompt 普遍写成 `<|FACTS_CURRENT_NONCE|>` /
+		// `<|FINAL_ANSWER_CURRENT_NONCE|>` 等占位符形式, 设计本意是让 AI 替换
+		// 为本 turn 实际 nonce. 但实测部分模型会把 CURRENT_NONCE 当作字面量
+		// 直接照抄输出, 此时只用 turn nonce 注册 callback 会匹配失败, 内容
+		// 丢失, 触发 verifier 5 次重试黑洞 (典型: output_facts: facts content
+		// is required). 双注册让两种输出格式都能命中.
+		//
+		// 用例: CACHE_TOOL_CALL 块内 TOOL_PARAM_xxx 在 prompt 中用占位符字面量
+		// nonce "[current-nonce]" 渲染保持字节稳定; LLM 既可能照抄字面量,
+		// 也可能识破替换为 turn nonce. 显式 ExtraNonces 兼容这种行为.
+		//
+		// 关键词: buildActionTagOption, ExtraNonces 双注册, CURRENT_NONCE 兜底,
+		//
+		//	AI 占位符照抄, [current-nonce]
+		extraNonceCandidates := []string{aicommon.LiteralCurrentNoncePlaceholder}
+		extraNonceCandidates = append(extraNonceCandidates, v.ExtraNonces...)
 		actionOptions = append(actionOptions,
-			aicommon.WithActionTagToKey(v.TagName, v.VariableName),
+			aicommon.WithActionTagToKeyAndExtraNonces(v.TagName, v.VariableName, extraNonceCandidates...),
+		)
+		actionOptions = append(actionOptions,
 			aicommon.WithActionFieldStreamHandler([]string{v.VariableName}, func(key string, fieldReader io.Reader) {
 				nodeId := v.AINodeId
 				contentType := v.ContentType
@@ -56,13 +133,58 @@ func (r *ReActLoop) buildActionTagOption(streamWG *sync.WaitGroup, taskIndex str
 					contentType = "text/plain"
 				}
 
+				// check empty tag
+				peekedReader, readable, err := waitReadableStream(fieldReader)
+				if err != nil {
+					log.Warnf("field stream handler[%s]: failed waiting first byte before emit: %v", v.TagName, err)
+					r.Set(v.VariableName, "")
+					return
+				}
+				if !readable {
+					log.Debugf("field stream handler[%s]: stream closed before first byte, skipping empty emit", v.TagName)
+					r.Set(v.VariableName, "")
+					return
+				}
+
+				// JSON-embedded AITag wrapper de-dup:
+				// 同一个字段 (例如 facts) 会被 ActionMaker 同时通过 JSON 字段流和 AITag
+				// 流两条路径推到当前 handler 里, 各 emit 一次, 导致前端"事实"事件重复.
+				//
+				// 实测中, 如果 AI 把 `<|FACTS_<nonce>|>...<|FACTS_END_<nonce>|>` 整段
+				// 塞进 JSON `facts` 字符串值 (不论是把 wrappers 当字面量包进去, 还是
+				// 同时又在 JSON 外再写一遍 AITag 块), JSON 路径会带着 wrappers 推到这
+				// 里, 而 AITag 路径会另起一路推干净的内层. 用户看到一条带 `<|...|>` 字
+				// 面量+反斜杠 n 的丑文本, 一条干净的 markdown, 极差体验.
+				//
+				// 修法: peek 流首批字节, 若 (跳过 JSON token 边界字符如外层 `"` 与
+				// 空白后) 以本 tag 的起始 token `<|TagName_` 开头, 判定这是 JSON 路径
+				// 误报的重复, 静默 drain 不再 emit, 让 AITag 路径专心输出干净版本.
+				// 注意 JSON 字段流推过来的 raw bytes 通常包含外层引号 (例如
+				// `"<|FACTS_...<|FACTS_END_..."`), 这是和 AITag 路径推过来的纯内层
+				// 内容的关键区分点; 不能只匹配 `<|TagName_` 而要兼容前置 `"` /
+				// whitespace.
+				//
+				// 关键词: 字段流去重, JSON-embedded AITag, FACTS 重复 emit 修复,
+				//        peek 检测 <|TagName_ 前缀, 兼容 JSON 外层引号, drain 静默丢弃
+				wrapperToken := "<|" + v.TagName + "_"
+				const peekWindow = 32
+				peeked, _ := peekedReader.Peek(peekWindow)
+				if isJSONEmbeddedAITagPrefix(peeked, wrapperToken) {
+					drained, _ := io.Copy(io.Discard, peekedReader)
+					log.Debugf("field stream handler[%s]: detected JSON-embedded AITag wrapper "+
+						"(token %q in peek %q), dropped duplicate stream (%d bytes drained); "+
+						"AITag stream path will emit the clean inner content",
+						v.TagName, wrapperToken, string(peeked), drained)
+					return
+				}
+
 				callbackStart := time.Now()
 				var result bytes.Buffer
-				fieldReader = io.TeeReader(utils.UTF8Reader(fieldReader), &result)
+				teedReader := io.TeeReader(peekedReader, &result)
 				wg := sync.WaitGroup{}
 				wg.Add(1)
-				emitter.EmitStreamEventWithContentType(
-					nodeId, fieldReader, taskIndex, contentType,
+				_, eventErr := emitter.EmitStreamEventWithContentType(
+					nodeId, teedReader, taskIndex, contentType,
 					func() {
 						defer wg.Done()
 						// Use parseStart instead of callbackStart to measure the whole streaming process
@@ -81,6 +203,12 @@ func (r *ReActLoop) buildActionTagOption(streamWG *sync.WaitGroup, taskIndex str
 						}
 					},
 				)
+				if eventErr != nil {
+					wg.Done()
+					r.Set(v.VariableName, result.String())
+					log.Errorf("tag[%s] EmitStreamEventWithContentType failed: %v", v.TagName, eventErr)
+					return
+				}
 				wg.Wait()
 			}),
 		)
@@ -122,7 +250,6 @@ func (r *ReActLoop) Execute(taskId string, ctx context.Context, userInput string
 
 func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, nonce string) (*aicommon.Action, *LoopAction, error) {
 	var action *aicommon.Action
-	var emitter = r.emitter
 	var actionNames = r.GetAllActionNames()
 
 	getNextActionType := func(a *aicommon.Action) string { //legacy support
@@ -149,6 +276,7 @@ func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, n
 	currentCtxCanceled()
 
 	log.Infof("start to call aicommon.CallAITransaction in ReActLoop[%v]", r.loopName)
+	r.resetModelThinkingBuffer()
 	r.loadingStatus("等待 AI 回应 / Waiting AI Respond...")
 	aiCallback := r.config.CallAI
 	if r.useSpeedPriorityAI {
@@ -163,15 +291,19 @@ func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, n
 			if ctxCanceled.IsSet() {
 				return nil
 			}
+			resp.SetOnReasonChunk(func(b []byte) {
+				r.appendModelThinkingChunk(b)
+			})
+			boundEmitter := resp.BindEmitter(r.GetEmitter())
 			stream := resp.GetOutputStreamReader(
 				r.loopName,
 				true,
-				r.config.GetEmitter(),
+				r.GetEmitter(),
 			)
 
 			buf := bytes.NewBuffer(make([]byte, 0))
 			stream = io.TeeReader(stream, buf)
-			tagOptions := r.buildActionTagOption(streamWg, resp.GetTaskIndex(), nonce)
+			tagOptions := r.buildActionTagOption(boundEmitter, streamWg, resp.GetTaskIndex(), nonce)
 			streamFields := r.streamFields.Copy()
 
 			for _, i := range r.GetAllActions() {
@@ -204,7 +336,18 @@ func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, n
 						log.Debugf("stream handler started for field [%s]", key)
 						r.loadingStatus(fmt.Sprintf("处理流字段 [%s] / Processing Stream Field [%s]", key, key))
 
-						reader = utils.JSONStringReader(reader)
+						preparedReader, readable, readableErr := waitReadableStream(utils.JSONStringReader(reader))
+						if readableErr != nil {
+							log.Warnf("stream handler for field [%s] failed waiting first byte: %v", key, readableErr)
+							done()
+							return
+						}
+						if !readable {
+							log.Debugf("stream handler for field [%s] got empty stream, skipping empty emit", key)
+							done()
+							return
+						}
+
 						fieldIns, ok := streamFields.Get(key)
 						if !ok {
 							log.Warnf("stream field [%s] not found in streamFields, skipping", key)
@@ -220,13 +363,13 @@ func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, n
 								log.Debugf("stream copy goroutine for field [%s] completed, took %v", key, time.Since(copyStartTime))
 							}()
 							if field.StreamHandler != nil {
-								field.StreamHandler(reader, pw)
+								field.StreamHandler(preparedReader, pw)
 								return
 							}
 							if field.Prefix != "" {
 								pw.WriteString(field.Prefix + ": ")
 							}
-							n, copyErr := io.Copy(pw, reader)
+							n, copyErr := io.Copy(pw, preparedReader)
 							if copyErr != nil {
 								log.Warnf("stream copy for field [%s] error: %v (copied %d bytes)", key, copyErr, n)
 							} else {
@@ -239,11 +382,12 @@ func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, n
 							defaultNodeId = fieldIns.AINodeId
 						}
 
-						event, emitErr := emitter.EmitStreamEventWithContentType(
+						event, emitErr := boundEmitter.EmitStreamEventWithContentTypeEx(
 							defaultNodeId,
 							pr,
 							resp.GetTaskIndex(),
 							fieldIns.ContentType,
+							fieldIns.IsSystem,
 							func() {
 								log.Debugf("stream emit callback for field [%s] triggered", key)
 								done()
@@ -260,7 +404,7 @@ func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, n
 							promptRefOnce.Do(func() {
 								streamId := event.GetContentJSONPath(`$.event_writer_id`)
 								if streamId != "" {
-									emitter.EmitTextReferenceMaterial(streamId, prompt)
+									boundEmitter.EmitTextReferenceMaterial(streamId, prompt)
 								}
 							})
 						}
@@ -270,12 +414,12 @@ func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, n
 			r.loadingStatus("解析 AI 响应中 / Parsing AI Response...")
 			extractStart := time.Now()
 			action, actionErr = aicommon.ExtractActionFromStream(
-				r.currentTask.GetContext(),
+				r.GetCurrentTask().GetContext(),
 				stream,
 				"object",
 				options...,
 			)
-			log.Infof("ExtractActionFromStream completed, took %v, error: %v", time.Since(extractStart), actionErr)
+			log.Debugf("ExtractActionFromStream completed, took %v, error: %v", time.Since(extractStart), actionErr)
 			r.Set("last_ai_decision_prompt", prompt)
 			r.Set("last_ai_decision_nonce", nonce)
 			r.Set("last_ai_decision_response", buf.String())
@@ -324,6 +468,7 @@ func (r *ReActLoop) callAITransaction(streamWg *sync.WaitGroup, prompt string, n
 			r.loadingStatus(fmt.Sprintf("验证动作 [%s] / Verifying Action [%s]", actionType, actionType))
 			return verifier.ActionVerifier(r, action)
 		},
+		aicommon.WithAIRequest_CallerLabel(fmt.Sprintf("react-loop:%s", r.loopName)),
 	)
 	if transactionErr != nil {
 		r.loadingStatus(fmt.Sprintf("AI 事务失败 / AI Transaction Failed: %v", transactionErr))
@@ -400,8 +545,9 @@ func (r *ReActLoop) LoadingStatus(i string) {
 func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalError error) {
 	r.loadingStatus("初始化 / initializing...")
 	if !r.noEndLoadingStatus {
-		defer r.loadingStatus("end")
+		defer r.loadingStatus("ReAct 任务结束 / ReAct task finished")
 	}
+	defer r.Release()
 
 	if utils.IsNil(task) {
 		return errors.New("re-act loop task is nil")
@@ -412,6 +558,17 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 	}
 	if r.taskMutex == nil {
 		return errors.New("re-act loop taskMutex is nil")
+	}
+	if taskEmitter := task.GetEmitter(); taskEmitter != nil {
+		loopEmitter := r.emitter
+		if loopEmitter != nil && loopEmitter != taskEmitter {
+			r.emitter = taskEmitter.PushEventProcessersFrom(loopEmitter)
+		} else {
+			r.emitter = taskEmitter
+		}
+		defer func() {
+			r.emitter = loopEmitter
+		}()
 	}
 
 	select {
@@ -434,8 +591,15 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 			fmt.Println("================================================")
 		})
 
+		// Save current task before initHandler, as it may execute sub-loops
+		// (e.g. intent recognition) that will call SetCurrentTask with different tasks
+		savedTask := r.GetCurrentTask()
 		initOperator = newInitTaskOperator()
 		r.initHandler(r, task, initOperator)
+		// Restore the original task after initHandler
+		if savedTask != nil {
+			r.SetCurrentTask(savedTask)
+		}
 
 		// Check operator status
 		if initOperator.IsDone() {
@@ -476,6 +640,28 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 		}
 	}
 
+	if !r.DisablePeriodicVerification {
+		r.startVerificationWatchdog(task)
+		var clearWatchdogToolHooks func()
+		if inv := r.GetInvoker(); inv != nil {
+			if cfg, ok := inv.GetConfig().(*aicommon.Config); ok {
+				cfg.SetVerificationWatchdogToolBlockingHooks(
+					r.beginVerificationWatchdogToolSuppression,
+					r.endVerificationWatchdogToolSuppression,
+				)
+				clearWatchdogToolHooks = func() {
+					cfg.SetVerificationWatchdogToolBlockingHooks(nil, nil)
+				}
+			}
+		}
+		defer func() {
+			if clearWatchdogToolHooks != nil {
+				clearWatchdogToolHooks()
+			}
+			r.stopVerificationWatchdogForTask(task) // 退出循环则停止验证看门狗，因为异步长任务不需要验证
+		}()
+	}
+
 	done := utils.NewOnce()
 	abort := func(err error) {
 		result := task.GetResult()
@@ -495,7 +681,7 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 		}
 		done.Do(func() {
 			if task.GetStatus() == aicommon.AITaskState_Skipped {
-				log.Infof("re-act loop [%v] task[%v] skipped", r.loopName, r.currentTask.GetId())
+				log.Infof("re-act loop [%v] task[%v] skipped", r.loopName, task.GetId())
 			} else {
 				task.SetStatus(aicommon.AITaskState_Completed)
 			}
@@ -566,6 +752,13 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 
 	r.GetInvoker().AddToTimeline(aicommon.TIMELINE_ITEM_TYPE_CURRENT_TASK_USER_INPUT, fmt.Sprintf("%v", task.GetOriginUserInput()))
 
+	// 启动主循环卡死兜底观察 goroutine: 周期性比对 lastIterationTickAt,
+	// 长时间无推进就 emit timeline + dump goroutine stack. 不会主动 abort
+	// 任务, 只是给外部观察者 (人 / 测试 / 监控) 一个明确信号. 关键词:
+	// startStallHeartbeat, post-action 卡死兜底观察
+	stopStallHeartbeat := r.startStallHeartbeat(task.GetContext(), task)
+	defer stopStallHeartbeat()
+
 	if r.GetCurrentMemoriesContent() == "" {
 		r.fastLoadSearchMemoryWithoutAI(task.GetUserInput())
 	}
@@ -585,8 +778,13 @@ func (r *ReActLoop) ExecuteWithExistedTask(task aicommon.AIStatefulTask) (finalE
 LOOP:
 	for {
 		iterationCount++
+		r.currentIterationIndex = iterationCount
+		// 主循环每轮推进一次都给 stall heartbeat 打个 tick, 让心跳协程
+		// 知道 "我还在动"; 心跳逻辑见 startStallHeartbeat / recordIterationTick.
+		// 关键词: 主循环 tick, lastIterationTickAt
+		r.recordIterationTick()
 		if iterationCount > maxIterations {
-			maxIterErr := utils.Errorf("reached max iterations (%d), stopping code generation loop", maxIterations)
+			maxIterErr := utils.Errorf("reached max iterations (%d), stopping %s loop", maxIterations, r.loopName)
 			postOp := r.finishIterationLoopWithError(iterationCount, task, maxIterErr)
 
 			// 检查 Hook 是否要求忽略错误
@@ -596,7 +794,7 @@ LOOP:
 				break LOOP // 正常退出，不返回错误
 			}
 
-			log.Warnf("Reached max iterations (%d), stopping code generation loop", maxIterations)
+			log.Warnf("Reached max iterations (%d), stopping %s loop", maxIterations, r.loopName)
 			needSummary.SetTo(true)
 			break LOOP
 		}
@@ -621,9 +819,21 @@ LOOP:
 
 		r.loadingStatus("执行中... / executing...")
 		var prompt string
+		// PE-TASK 缓存优化: 当 task 实现 CacheableUserInputProvider 接口时,
+		// 把 PARENT_TASK + CURRENT_TASK + INSTRUCTION 整块当作 frozenUserContext
+		// 注入 frozen-block, 让 dynamic 段不再承载 PLAN 阶段的产物。
+		// 普通 ReAct loop 的 task 不实现该接口, fallback 走老路径。
+		// 关键词: CacheableUserInputProvider, frozenUserContext, PLAN_CONTEXT
+		userInputForDynamic := task.GetUserInput()
+		var frozenUserContext string
+		if provider, ok := task.(aicommon.CacheableUserInputProvider); ok {
+			userInputForDynamic, frozenUserContext = provider.GetUserInputSplitForCache()
+		}
 		prompt, finalError = r.generateLoopPrompt(
 			nonce,
-			task.GetUserInput(),
+			userInputForDynamic,
+			frozenUserContext,
+			nil,
 			r.GetCurrentMemoriesContent(),
 			operator,
 		)
@@ -633,18 +843,20 @@ LOOP:
 			needSummary.SetTo(true)
 			return finalError
 		}
-
 		// Save prompt to file in debug mode
 		if r.isDebugModeEnabled() {
 			r.savePromptToFile(task, iterationCount, prompt)
 		}
-		r.savePromptObservationToFile(task, iterationCount, r.GetLastPromptObservation())
+		// observation 已通过 emitter.EmitPromptProfile 走 prompt_profile 结构化事件
+		// 推送给前端 "上下文成分" 面板, 不再落盘 ASCII 副本以避免污染 task 目录.
+		// 关键词: prompt observation 不再落盘, EmitPromptProfile 现役路径
 
 		streamWg := new(sync.WaitGroup)
 		/* Generate AI Action */
 		actionParams, handler, transactionErr := r.callAITransaction(streamWg, prompt, nonce)
 
 		streamWg.Wait()
+		iterationModelThinking := strings.TrimSpace(r.takeModelThinkingForTimeline())
 
 		if transactionErr != nil {
 			r.finishIterationLoopWithError(iterationCount, task, transactionErr)
@@ -670,13 +882,14 @@ LOOP:
 		r.loadingStatus(fmt.Sprintf("[%v]执行中 / [%v] executing action...", actionName, actionName))
 
 		// 记录当前迭代索引和 Action 信息
+		// 关键词: action history append, SPIN 检测数据源, tool_name 抽取
 		r.actionHistoryMutex.Lock()
-		r.currentIterationIndex = iterationCount
 		actionRecord := &ActionRecord{
 			ActionType:     actionParams.ActionType(),
 			ActionName:     actionName,
-			ActionParams:   make(map[string]interface{}),
+			ActionParams:   actionParams.GetParams(),
 			IterationIndex: iterationCount,
+			ToolName:       extractToolNameFromAction(actionParams),
 		}
 		// 复制 Action 参数（避免并发修改）
 		params := actionParams.GetParams()
@@ -694,11 +907,23 @@ LOOP:
 			loopName = "general-purpose"
 		}
 		reason := actionParams.GetString("human_readable_thought")
-		msg := fmt.Sprintf("[%v]======== ReAct iteration %d ========", loopName, iterationCount)
+		turnNonce := strings.ToLower(utils.RandStringBytes(6))
+		decisionBody := fmt.Sprintf("[%v]======== ReAct iteration %d ========", loopName, iterationCount)
 		if reason != "" {
-			msg += "\nReason/Next-Step: " + reason
+			decisionBody += "\nReason/Next-Step: " + reason
+		}
+		msg := decisionBody
+		if b := wrapTimelineAITagBlock(timelineAITagModelThinking, turnNonce, iterationModelThinking); b != "" {
+			msg = b + "\n\n" + decisionBody
 		}
 		r.GetInvoker().AddToTimeline("iteration", msg)
+
+		// 主 loop next_movements 兜底拦截: 详见 applyNextMovementsBottomLine.
+		// 时序保证: AddToTimeline("iteration") 已完成 → 兜底 apply + emit →
+		// handler.AsyncMode check / ActionHandler 才跑. async mode reject
+		// (continue 跳出) 之前兜底也已经执行, 不会漏 apply.
+		// 关键词: 主 loop next_movements 兜底入口, 孤儿待办修复
+		applyNextMovementsBottomLine(r, task, iterationCount, actionParams)
 
 		if handler.AsyncMode {
 			r.loadingStatus("当前任务进入异步模式 / Async mode, ending loop")
@@ -813,22 +1038,40 @@ LOOP:
 			return nil
 		}
 
-		// 只有在 operator 没有明确终止时，才检查 context canceled
-		select {
-		case <-task.GetContext().Done():
-			return utils.Errorf("task context done in executing execute ReActLoop(after ActionHandler): %v", task.GetContext().Err())
-		default:
+		// 只有在 operator 没有明确终止时，才检查 context canceled.
+		// 例外: 动态 async 动作 (如 load_capability 触发 RequestAsyncMode) 已把
+		// task 置为 async, 并把 ctx 生命周期交给 forge 的异步执行. forge 若极快
+		// 完成会立刻 cancel 该 ctx, 此处若 early-return 就会跳过下面的 async 交接
+		// (effectiveAsyncMode 块里的 onAsyncTaskTrigger), 造成 async 生命周期事件
+		// 缺失 (与静态 async 路径不等价). 因此 async-mode 任务不在这里因 ctx done
+		// 提前返回, 交由 effectiveAsyncMode 块统一收口.
+		// 关键词: 动态 async ctx done 竞态, onAsyncTaskTrigger 漏触发, async 交接顺序
+		if !(operator.IsAsyncModeRequested() || task.IsAsyncMode()) {
+			select {
+			case <-task.GetContext().Done():
+				return utils.Errorf("task context done in executing execute ReActLoop(after ActionHandler): %v", task.GetContext().Err())
+			default:
+			}
 		}
 
-		// 执行自我反思（如果启用）
+		// 执行自我反思 (如果启用且策略命中).
+		// Critical(失败归因) 走同步以保证下一轮 prompt 立即含失败上下文;
+		// 其它级别(主要是 SPIN/Standard) 走异步 fire-and-forget, 主循环不阻塞.
+		// 关键词: 反思入口, 异步 fire-and-forget, SPIN 不干扰执行
 		reflectionLevel := r.shouldTriggerReflection(handler, operator, iterationCount)
 		if reflectionLevel != ReflectionLevel_None {
-			r.loadingStatus(fmt.Sprintf("[%v]反思中 / [%v] self-reflecting...", actionName, actionName))
-			log.Infof("trigger self-reflection for action[%s] with level[%s]", actionName, reflectionLevel.String())
-			r.executeReflection(handler, actionParams, operator, reflectionLevel, iterationCount, actionExecutionDuration)
+			log.Infof("trigger self-reflection for action[%s] with level[%s] (async=%v)",
+				actionName, reflectionLevel.String(), reflectionLevel != ReflectionLevel_Critical)
+			r.MaybeExecuteReflection(handler, actionParams, operator, reflectionLevel, iterationCount, actionExecutionDuration)
 		}
 
+		// T1: perception after action execution (async, non-blocking)
+		r.MaybeTriggerPerceptionAfterAction(iterationCount)
+
 		if r.ShouldForceExitDueToSpin() {
+			// T3: force perception update on SPIN detection
+			r.TriggerPerceptionOnSpin()
+
 			log.Warnf("ReactLoop[%v] spin threshold reached (%d consecutive warnings), adding timeline pressure instead of force-exiting",
 				r.loopName, r.consecutiveSpinWarnings)
 			r.GetInvoker().AddToTimeline("spin_pressure",
@@ -838,7 +1081,6 @@ LOOP:
 					"The task remains incomplete and requires a new direction. "+
 					"Continuing with the same approach will not help.", r.consecutiveSpinWarnings))
 			r.ResetSpinWarning()
-			// 不强制退出 loop，仅通过 timeline 施压，由 max_iterations 上限兜底
 		}
 
 		// 检查 operator 状态
@@ -1083,32 +1325,6 @@ func (r *ReActLoop) savePromptToFile(task aicommon.AIStatefulTask, iteration int
 	log.Infof("saved prompt to file: %s", filePath)
 }
 
-func (r *ReActLoop) savePromptObservationToFile(task aicommon.AIStatefulTask, iteration int, observation *PromptObservation) {
-	if utils.IsNil(r) || utils.IsNil(task) || observation == nil {
-		return
-	}
-	emitter := r.GetEmitter()
-	if emitter == nil {
-		return
-	}
-
-	promptDir := r.GetLoopContentDir("prompts")
-	if promptDir == "" {
-		log.Errorf("failed to get loop content directory for prompt observations")
-		return
-	}
-
-	filename := fmt.Sprintf("iteration_%d_prompt_observation_%d.txt", iteration, time.Now().Unix())
-	filePath := filepath.Join(promptDir, filename)
-	raw := observation.RenderCLIReport(100)
-	if err := os.WriteFile(filePath, []byte(raw), 0644); err != nil {
-		log.Errorf("failed to save prompt observation to file: %v", err)
-		return
-	}
-	emitter.EmitPinFilename(filePath)
-	log.Infof("saved prompt observation to file: %s", filePath)
-}
-
 func (r *ReActLoop) emitActionExecutionRecord(task aicommon.AIStatefulTask, action *aicommon.Action, iteration int, prompt string) {
 	if utils.IsNil(r) || utils.IsNil(task) || utils.IsNil(action) {
 		return
@@ -1172,6 +1388,45 @@ func (r *ReActLoop) isDebugModeEnabled() bool {
 		}
 	}
 	return false
+}
+
+// extractToolNameFromAction 按优先级从 action 参数里抽取工具名,用于 SPIN
+// 双维度判定(ActionType + ToolName). 字段优先级:
+//  1. directly_call_tool_name 顶层
+//  2. next_action.directly_call_tool_name (legacy 兼容)
+//  3. tool_require_payload (require_tool 路径)
+//  4. tool_name / tool 通用兜底
+//
+// 全部命中为空返回空串, 表示该 action 不是 tool 调用类, SPIN 检测会退化为
+// 只比 ActionType.
+//
+// 关键词: extractToolNameFromAction, SPIN 细粒度, tool_name 抽取优先级
+func extractToolNameFromAction(action *aicommon.Action) string {
+	if utils.IsNil(action) {
+		return ""
+	}
+	if name := strings.TrimSpace(action.GetString("directly_call_tool_name")); name != "" {
+		return name
+	}
+	nextAction := action.GetInvokeParams("next_action")
+	if nextAction != nil {
+		if name := strings.TrimSpace(nextAction.GetString("directly_call_tool_name")); name != "" {
+			return name
+		}
+		if name := strings.TrimSpace(nextAction.GetString("tool_require_payload")); name != "" {
+			return name
+		}
+	}
+	if name := strings.TrimSpace(action.GetString("tool_require_payload")); name != "" {
+		return name
+	}
+	if name := strings.TrimSpace(action.GetString("tool_name")); name != "" {
+		return name
+	}
+	if name := strings.TrimSpace(action.GetString("tool")); name != "" {
+		return name
+	}
+	return ""
 }
 
 func sanitizeActionFilename(name string) string {

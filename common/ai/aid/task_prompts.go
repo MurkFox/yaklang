@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"io"
 	"slices"
-	"strings"
-	"text/template"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
 
@@ -16,67 +14,22 @@ import (
 )
 
 func (t *AiTask) generateToolCallResponsePrompt(result *aitool.ToolResult, targetTool *aitool.Tool) (string, error) {
-	templatedata := map[string]any{
-		"ContextProvider": t.ContextProvider,
-		"Tool":            targetTool,
-		"Result":          result,
-	}
-	temp, err := template.New("tool-result").Parse(__prompt_ToolResultToDecisionPromptTemplate)
-	if err != nil {
-		return "", fmt.Errorf("error parsing tool result template: %w", err)
-	}
-	var promptBuilder strings.Builder
-	err = temp.Execute(&promptBuilder, templatedata)
-	if err != nil {
-		return "", fmt.Errorf("error executing tool result template: %w", err)
-	}
-	return promptBuilder.String(), nil
+	return t.quickBuildTaskPrompt(__prompt_ToolResultToDecisionPromptTemplate, map[string]any{
+		"Tool":   targetTool,
+		"Result": result,
+	})
 }
 
 func (t *AiTask) generateStatusSummaryPrompt() (string, error) {
-	templatedata := map[string]any{
-		"ContextProvider": t.ContextProvider,
-	}
-	temp, err := template.New("tool-result").Parse(__prompt_ToolResultToDecisionPromptTemplate)
-	if err != nil {
-		return "", fmt.Errorf("error parsing tool result template: %w", err)
-	}
-	var promptBuilder strings.Builder
-	err = temp.Execute(&promptBuilder, templatedata)
-	if err != nil {
-		return "", fmt.Errorf("error executing tool result template: %w", err)
-	}
-	return promptBuilder.String(), nil
+	return t.quickBuildTaskPrompt(__prompt_ToolResultToDecisionPromptTemplate, nil)
 }
 
 func (t *AiTask) generateDynamicPlanPrompt(userInput string) (string, error) {
-	// 创建模板数据
-	templateData := map[string]interface{}{
-		"ContextProvider": t.ContextProvider,
-		"UserInput":       userInput,
-	}
-
-	// 解析prompt模板
-	tmpl, err := template.New("dynamic-plan").Parse(__prompt_DynamicPlan)
-	if err != nil {
-		return "", fmt.Errorf("error parsing dynamic plan prompt template: %w", err)
-	}
-
-	// 渲染模板
-	var promptBuilder strings.Builder
-	err = tmpl.Execute(&promptBuilder, templateData)
-	if err != nil {
-		return "", fmt.Errorf("error executing dynamic plan prompt template: %w", err)
-	}
-
-	return promptBuilder.String(), nil
+	return t.buildDynamicPlanPrompt(userInput)
 }
 
 func (t *AiTask) GenerateDeepThinkPlanPrompt(suggestion string) (string, error) {
-	return t.quickBuildPrompt(__prompt_DeepthinkTaskListPrompt, map[string]any{
-		"ContextProvider": t.ContextProvider,
-		"UserInput":       suggestion,
-	})
+	return t.buildDynamicPlanPrompt(suggestion)
 }
 
 func (t *AiTask) DeepThink(suggestion string) error {
@@ -88,13 +41,14 @@ func (t *AiTask) DeepThink(suggestion string) error {
 	err = t.CallAITransaction(
 		prompt,
 		func(rsp *aicommon.AIResponse) error {
+			boundEmitter := rsp.BindEmitter(t.GetEmitter())
 			action, err := aicommon.ExtractValidActionFromStream(
 				t.Ctx,
 				rsp.GetUnboundStreamReader(false),
 				"plan",
 				aicommon.WithActionAlias("require-user-interact"),
 				aicommon.WithActionFieldStreamHandler([]string{"subtask_name"}, func(key string, r io.Reader) {
-					t.EmitDefaultStreamEvent("plan", r, t.GetIndex())
+					boundEmitter.EmitDefaultStreamEvent("plan", r, t.GetIndex())
 				}),
 			)
 			if err != nil {
@@ -115,6 +69,7 @@ func (t *AiTask) DeepThink(suggestion string) error {
 			}
 			return utils.Error("no any ai callback is set, cannot found ai config")
 		},
+		aicommon.WithAIRequest_CallerLabel("subtask-decomposition"),
 	)
 	if err != nil {
 		t.EmitError(err.Error())
@@ -134,21 +89,22 @@ func (t *AiTask) AdjustPlan(suggestion string) error {
 	err = t.CallAITransaction(
 		planPrompt,
 		func(response *aicommon.AIResponse) error {
+			boundEmitter := response.BindEmitter(t.GetEmitter())
 			// 读取 AI 的响应
 			responseReader := response.GetOutputStreamReader("dynamic-plan", false, t.GetEmitter())
 			taskResponse, err := io.ReadAll(responseReader)
 			if err != nil {
-				t.EmitError("error reading AI response: %v", err)
+				boundEmitter.EmitError("error reading AI response: %v", err)
 				return utils.Errorf("error reading AI response: %v", err)
 			}
 			nextPlanTask, err := ExtractNextPlanTaskFromRawResponse(t.Coordinator, string(taskResponse))
 			if err != nil {
-				t.EmitError("error extracting task from raw response: %v", err)
+				boundEmitter.EmitError("error extracting task from raw response: %v", err)
 				return utils.Errorf("error extracting task from raw response: %v", err)
 			}
 
 			if len(nextPlanTask) <= 0 {
-				t.EmitError("any task not found in next plan")
+				boundEmitter.EmitError("any task not found in next plan")
 				return utils.Errorf("any task not found in next plan task, re-do-plan")
 			}
 
@@ -162,7 +118,7 @@ func (t *AiTask) AdjustPlan(suggestion string) error {
 				}
 			}
 			if index == -1 {
-				t.EmitError("current task not found in parent task")
+				boundEmitter.EmitError("current task not found in parent task")
 				return utils.Error("current task not found in parent task")
 			}
 			// 保留之前的任务, 删除后续任务
@@ -178,6 +134,7 @@ func (t *AiTask) AdjustPlan(suggestion string) error {
 			}
 			return nil
 		},
+		aicommon.WithAIRequest_CallerLabel("dynamic-plan"),
 	)
 	if err != nil {
 		t.EmitError("error calling AI transaction: %v", err)

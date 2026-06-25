@@ -2,9 +2,7 @@ package aihttp
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -12,13 +10,33 @@ import (
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
+func (gw *AIAgentHTTPGateway) handleQueryAIEvent(w http.ResponseWriter, r *http.Request) {
+	var req ypb.AIEventQueryRequest
+	if err := readProtoJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	resp, err := gw.yakClient.QueryAIEvent(r.Context(), &req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "query AI event failed: "+err.Error())
+		return
+	}
+
+	writeProtoJSON(w, http.StatusOK, resp)
+}
+
 func (gw *AIAgentHTTPGateway) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 	runID := mux.Vars(r)["run_id"]
 
 	session, ok := gw.runManager.Get(runID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "run not found: "+runID)
-		return
+		var err error
+		session, _, err = gw.ensureReusableSession(runID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "load setting failed: "+err.Error())
+			return
+		}
 	}
 
 	// var since int64
@@ -40,14 +58,11 @@ func (gw *AIAgentHTTPGateway) handleSSEEvents(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	writeSSEData(w, `{"type":"listener_ready","status":"ok","run_id":"`+runID+`"}`)
-
-	if session.Status == RunStatusCompleted || session.Status == RunStatusFailed || session.Status == RunStatusCancelled {
-		writeSSEData(w, `{"type":"done","status":"`+string(session.Status)+`"}`)
+	if err := writeProtoSSEData(w, newSystemOutputEvent("listener_ready")); err != nil {
+		log.Errorf("marshal listener_ready event: %v", err)
 		return
 	}
 
@@ -59,38 +74,39 @@ func (gw *AIAgentHTTPGateway) handleSSEEvents(w http.ResponseWriter, r *http.Req
 		case <-r.Context().Done():
 			return
 		case <-session.ctx.Done():
-			writeSSEData(w, `{"type":"done","status":"`+string(session.Status)+`"}`)
-			flusher.Flush()
+			if err := writeProtoSSEData(w, buildTerminalRunEvent(session.Status, session.Error)); err != nil {
+				log.Errorf("marshal terminal event: %v", err)
+			}
 			return
 		case event, ok := <-ch:
 			if !ok {
 				return
 			}
 
-			data, err := json.Marshal(event)
-			if err != nil {
+			if err := writeProtoSSEData(w, event); err != nil {
 				log.Errorf("marshal event: %v", err)
 				continue
 			}
-			writeSSEData(w, string(data))
 
-			if event.Type == "done" || event.Type == "error" {
+			if isTerminalRunEventType(event.GetType()) {
 				return
 			}
 		case <-heartbeat.C:
-			writeSSEData(w, `{"type":"heartbeat","timestamp":`+strconv.FormatInt(time.Now().Unix(), 10)+`}`)
+			if err := writeProtoSSEData(w, newSystemOutputEvent("heartbeat")); err != nil {
+				log.Errorf("marshal heartbeat event: %v", err)
+			}
 		}
 	}
 }
 
-func (gw *AIAgentHTTPGateway) queryHistoricalRunEvents(ctx context.Context, runID string, since int64) ([]RunEvent, error) {
+func (gw *AIAgentHTTPGateway) queryHistoricalRunEvents(ctx context.Context, runID string, since int64) ([]*ypb.AIOutputEvent, error) {
 	if gw.yakClient == nil {
 		return nil, nil
 	}
 
 	const pageSize int64 = 200
 	page := int64(1)
-	historical := make([]RunEvent, 0, pageSize)
+	historical := make([]*ypb.AIOutputEvent, 0, pageSize)
 
 	for {
 		resp, err := gw.yakClient.QueryAIEvent(ctx, &ypb.AIEventQueryRequest{
@@ -116,8 +132,8 @@ func (gw *AIAgentHTTPGateway) queryHistoricalRunEvents(ctx context.Context, runI
 			if item == nil {
 				continue
 			}
-			event := convertOutputToRunEvent(item)
-			if since > 0 && event.Timestamp <= since {
+			event := normalizeOutputEvent(item)
+			if since > 0 && event.GetTimestamp() <= since {
 				continue
 			}
 			historical = append(historical, event)
@@ -130,4 +146,22 @@ func (gw *AIAgentHTTPGateway) queryHistoricalRunEvents(ctx context.Context, runI
 	}
 
 	return historical, nil
+}
+
+func buildTerminalRunEvent(status RunStatus, errMsg string) *ypb.AIOutputEvent {
+	if status == RunStatusFailed {
+		if errMsg == "" {
+			return newFailedOutputEvent(nil)
+		}
+		return newFailedOutputEvent(&terminalError{message: errMsg})
+	}
+	return newResultOutputEvent(string(status))
+}
+
+type terminalError struct {
+	message string
+}
+
+func (e *terminalError) Error() string {
+	return e.message
 }

@@ -11,6 +11,7 @@ import (
 	cli "github.com/yaklang/yaklang/common/urfavecli"
 	"github.com/yaklang/yaklang/common/yak/ssa2llvm/compiler"
 	"github.com/yaklang/yaklang/common/yak/ssa2llvm/obfuscation"
+	"github.com/yaklang/yaklang/common/yak/ssa2llvm/profile"
 	"github.com/yaklang/yaklang/common/yak/ssa2llvm/trace"
 )
 
@@ -45,9 +46,16 @@ type buildCommandConfig struct {
 	function   string
 	printIR    bool
 	obf        []string
+	profile    string
+	pluginType string
 	stdlibComp bool
 	trace      bool
 	force      bool
+	llvmPlugin string
+	llvmKind   string
+	llvmPasses []string
+	llvmPack   string
+	runArgs    []string
 }
 
 func sharedBuildFlags() []cli.Flag {
@@ -74,9 +82,39 @@ func sharedBuildFlags() []cli.Flag {
 			Usage: "Apply obfuscators by name or glob pattern (repeatable or comma-separated; see `ssa2llvm obfuscators`)",
 			Value: &cli.StringSlice{},
 		},
+		cli.StringFlag{
+			Name:  "profile",
+			Usage: fmt.Sprintf("Apply a built-in profile name or load a profile JSON file (%s)", strings.Join(profile.Names(), ", ")),
+		},
+		cli.StringFlag{
+			Name:  "plugin-type",
+			Usage: "Yak plugin type: yak, codec, or port-scan (mitm is not supported yet)",
+		},
+		cli.StringFlag{
+			Name:  "llvm-plugin",
+			Usage: "Path to an external LLVM plugin or adapter tool",
+		},
+		cli.StringFlag{
+			Name:  "llvm-plugin-kind",
+			Usage: "LLVM interop mode: new-pm, legacy, or tool",
+			Value: "new-pm",
+		},
+		cli.StringSliceFlag{
+			Name:  "llvm-passes",
+			Usage: "LLVM textual passes to run (repeatable or comma-separated)",
+			Value: &cli.StringSlice{},
+		},
+		cli.StringFlag{
+			Name:  "llvm-pack",
+			Usage: "Path to an LLVM pack manifest JSON file",
+		},
 		cli.BoolFlag{
 			Name:  "stdlib-compile",
-			Usage: "Build libyak.a from embedded runtime source in the work dir and link against it (future: compile+obfuscate stdlib together with user code)",
+			Usage: "Build the runtime from embedded source before linking (default; kept for compatibility)",
+		},
+		cli.BoolFlag{
+			Name:  "full-stdlib",
+			Usage: "Disable pruned runtime generation and link the full embedded libyak.a",
 		},
 		cli.BoolFlag{
 			Name:  "x",
@@ -115,7 +153,7 @@ var runCommand = cli.Command{
 	Name:      "run",
 	Aliases:   []string{"r"},
 	Usage:     "Compile and run the executable (use -o to keep the binary)",
-	ArgsUsage: "<source-file>",
+	ArgsUsage: "<source-file> [-- args...]",
 	Flags:     sharedBuildFlags(),
 	Action:    runAction,
 }
@@ -153,7 +191,13 @@ func compileAction(c *cli.Context) error {
 		compiler.WithCompileEmitAsm(emitAsm),
 		compiler.WithCompileOnly(compileOnly),
 		compiler.WithCompilePrintIR(cfg.printIR),
+		compiler.WithCompilePluginType(cfg.pluginType),
 		compiler.WithCompileObfuscators(cfg.obf...),
+		compiler.WithCompileProfile(cfg.profile),
+		compiler.WithCompileLLVMPlugin(cfg.llvmPlugin),
+		compiler.WithCompileLLVMPluginKind(cfg.llvmKind),
+		compiler.WithCompileLLVMPasses(cfg.llvmPasses...),
+		compiler.WithCompileLLVMPack(cfg.llvmPack),
 		compiler.WithCompileStdlibCompile(cfg.stdlibComp),
 		compiler.WithCompileCacheEnabled(true),
 		compiler.WithCompileTrace(cfg.trace),
@@ -177,7 +221,13 @@ func runAction(c *cli.Context) error {
 		compiler.WithCompileLanguage(cfg.language),
 		compiler.WithCompileEntryFunction(cfg.function),
 		compiler.WithCompilePrintIR(cfg.printIR),
+		compiler.WithCompilePluginType(cfg.pluginType),
 		compiler.WithCompileObfuscators(cfg.obf...),
+		compiler.WithCompileProfile(cfg.profile),
+		compiler.WithCompileLLVMPlugin(cfg.llvmPlugin),
+		compiler.WithCompileLLVMPluginKind(cfg.llvmKind),
+		compiler.WithCompileLLVMPasses(cfg.llvmPasses...),
+		compiler.WithCompileLLVMPack(cfg.llvmPack),
 		compiler.WithCompileStdlibCompile(cfg.stdlibComp),
 		compiler.WithCompileCacheEnabled(true),
 		compiler.WithCompileTrace(cfg.trace),
@@ -203,7 +253,7 @@ func runAction(c *cli.Context) error {
 		}
 	}
 
-	cmd := exec.Command(execPath)
+	cmd := exec.Command(execPath, cfg.runArgs...)
 	trace.PrintCmd(cmd)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -229,6 +279,8 @@ func listObfuscatorsAction(c *cli.Context) error {
 	fmt.Println("  ssa2llvm run demo.yak --obf addsub")
 	fmt.Println("  ssa2llvm compile demo.yak --obf xor")
 	fmt.Println("  ssa2llvm run demo.yak --obf 'add*' --obf 'x*'")
+	fmt.Println("  ssa2llvm compile demo.yak --profile resilience-lite")
+	fmt.Println("  ssa2llvm compile demo.yak --llvm-plugin ./tool --llvm-plugin-kind tool")
 	fmt.Println()
 	fmt.Println("Names can be repeated, passed as comma-separated lists, or selected with glob patterns.")
 	fmt.Println("Quote glob patterns like '*' to avoid shell expansion.")
@@ -241,16 +293,26 @@ func newBuildCommandConfig(c *cli.Context) (*buildCommandConfig, error) {
 		return nil, fmt.Errorf("missing source file argument")
 	}
 
-	return &buildCommandConfig{
+	cfg := &buildCommandConfig{
 		sourceFile: c.Args().First(),
 		language:   c.String("language"),
 		function:   c.String("function"),
 		printIR:    c.Bool("print-ir"),
 		obf:        c.StringSlice("obf"),
-		stdlibComp: c.Bool("stdlib-compile"),
+		profile:    c.String("profile"),
+		pluginType: c.String("plugin-type"),
+		stdlibComp: !c.Bool("full-stdlib"),
 		trace:      c.Bool("x"),
 		force:      c.Bool("a"),
-	}, nil
+		llvmPlugin: c.String("llvm-plugin"),
+		llvmKind:   c.String("llvm-plugin-kind"),
+		llvmPasses: splitCSVStrings(c.StringSlice("llvm-passes")),
+		llvmPack:   c.String("llvm-pack"),
+	}
+	if c.Command.Name == "run" && c.NArg() > 1 {
+		cfg.runArgs = append(cfg.runArgs, c.Args().Tail()...)
+	}
+	return cfg, nil
 }
 
 func printObfuscatorGroup(title string, flagExample string, names []string) {
@@ -263,6 +325,20 @@ func printObfuscatorGroup(title string, flagExample string, names []string) {
 		fmt.Printf("  - %s\n", name)
 	}
 	fmt.Printf("  use with: %s\n", flagExample)
+}
+
+func splitCSVStrings(items []string) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		for _, part := range strings.Split(item, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // maybeEnableInfoLoggingForTrace upgrades the global log level when -x is set

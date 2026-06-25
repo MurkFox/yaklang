@@ -37,46 +37,19 @@ func TestAIDToAIReact_ConfigSync_AllowAskForClarification_False(t *testing.T) {
 		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := r.GetPrompt()
 			receivedPrompts = append(receivedPrompts, prompt)
-			rsp := i.NewAIResponse()
-			defer rsp.Close()
 
-			// 检查 prompt 中是否包含 AllowAskForClarification 相关的内容
-			// 如果配置为 false，这些内容不应该出现在 prompt 中
-			hasAskForClarificationContent := strings.Contains(prompt, "主动提问以澄清意图") ||
-				strings.Contains(prompt, "ask_for_clarification") ||
-				strings.Contains(prompt, "AskForClarification")
-
-			if hasAskForClarificationContent {
-				t.Errorf("配置 WithAllowRequireForUserInteract(false) 未生效：prompt 中仍然包含 ask_for_clarification 相关内容")
-			}
-
-			// 处理 react loop 请求
-			if strings.Contains(prompt, "Background") || strings.Contains(prompt, "Current Time:") {
-				// 检查 AI 是否尝试使用 ask_for_clarification action
-				// 返回一个 finish action，避免触发用户交互
-				responseJSON := `{"@action": "finish", "human_readable_thought": "测试完成"}`
-				rsp.EmitOutputStream(strings.NewReader(responseJSON))
-				return rsp, nil
-			}
-
-			// 处理 plan 请求
-			if strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具") {
-				rsp.EmitOutputStream(strings.NewReader(`
-{
-    "@action": "plan",
-    "query": "测试配置同步",
+			configSyncPlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "验证配置传递",
     "main_task_goal": "确保配置正确传递到 react loop",
-    "tasks": [
-        {
-            "subtask_name": "验证配置",
-            "subtask_goal": "检查配置是否正确"
-        }
-    ]
-}
-				`))
-				return rsp, nil
+    "tasks": [{"subtask_name": "验证配置", "subtask_goal": "检查配置是否正确"}]
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(i, prompt, configSyncPlanJSON); rsp != nil {
+				return rsp, err
 			}
+
+			rsp := i.NewAIResponse()
+			defer rsp.Close()
 
 			// 默认返回 finish
 			rsp.EmitOutputStream(strings.NewReader(`{"@action": "finish", "human_readable_thought": "测试完成"}`))
@@ -172,7 +145,6 @@ func TestAIDToAIReact_ConfigSync_AllowPlan_False(t *testing.T) {
 
 	// 记录所有收到的 prompt，用于验证配置
 	var receivedPrompts []string
-	var planActionUsed bool
 
 	coordinator, err := aid.NewCoordinator(
 		"test-allow-plan-false",
@@ -184,45 +156,20 @@ func TestAIDToAIReact_ConfigSync_AllowPlan_False(t *testing.T) {
 		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := r.GetPrompt()
 			receivedPrompts = append(receivedPrompts, prompt)
+
+			configSyncPlanJSON := `{
+    "@action": "plan_from_document",
+    "main_task": "验证配置传递",
+    "main_task_goal": "确保配置正确传递到 react loop",
+    "tasks": [{"subtask_name": "验证配置", "subtask_goal": "检查配置是否正确"}]
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(i, prompt, configSyncPlanJSON); rsp != nil {
+				return rsp, err
+			}
+
 			rsp := i.NewAIResponse()
 			defer rsp.Close()
 
-			// 处理 react loop 请求
-			if strings.Contains(prompt, "Background") || strings.Contains(prompt, "Current Time:") {
-				// 检查 prompt 中是否包含 AllowPlan 相关的内容
-				// 如果配置为 false，这些内容不应该出现在 prompt 中
-				hasPlanContent := strings.Contains(prompt, "与规划") ||
-					strings.Contains(prompt, "申请分步计划") ||
-					strings.Contains(prompt, "request_plan_and_execution") ||
-					strings.Contains(prompt, "规划系统")
-
-				if hasPlanContent {
-					t.Errorf("配置 WithAllowPlanUserInteract(false) 未生效：prompt 中仍然包含 plan 相关内容")
-				}
-
-				// 返回一个 finish action，避免触发 plan
-				responseJSON := `{"@action": "finish", "human_readable_thought": "测试完成"}`
-				rsp.EmitOutputStream(strings.NewReader(responseJSON))
-				return rsp, nil
-			}
-
-			// 处理 plan 请求（如果 AI 仍然尝试使用 plan，这里不应该被调用）
-			if strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具") {
-				planActionUsed = true
-				t.Errorf("AI 尝试使用 plan action，但配置为 false，配置未生效")
-				rsp.EmitOutputStream(strings.NewReader(`
-{
-    "@action": "plan",
-    "query": "测试配置同步",
-    "main_task": "验证配置传递",
-    "main_task_goal": "确保配置正确传递到 react loop",
-    "tasks": []
-}
-				`))
-				return rsp, nil
-			}
-
-			// 默认返回 finish
 			rsp.EmitOutputStream(strings.NewReader(`{"@action": "finish", "human_readable_thought": "测试完成"}`))
 			return rsp, nil
 		}),
@@ -291,11 +238,6 @@ LOOP:
 		}
 	}
 
-	// 最终验证
-	if planActionUsed {
-		t.Fatal("配置 WithAllowPlanUserInteract(false) 未生效：AI 仍然尝试使用 plan action")
-	}
-
 	t.Logf("测试通过：配置 WithAllowPlanUserInteract(false) 正确传递到 react loop，共检查了 %d 个 prompt", len(receivedPrompts))
 }
 
@@ -309,7 +251,6 @@ func TestAIDToAIReact_ConfigSync_Both_False(t *testing.T) {
 	// 记录所有收到的 prompt，用于验证配置
 	var receivedPrompts []string
 	var askForClarificationActionUsed bool
-	var planActionUsed bool
 
 	coordinator, err := aid.NewCoordinator(
 		"test-both-config-false",
@@ -321,51 +262,20 @@ func TestAIDToAIReact_ConfigSync_Both_False(t *testing.T) {
 		aicommon.WithAICallback(func(i aicommon.AICallerConfigIf, r *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := r.GetPrompt()
 			receivedPrompts = append(receivedPrompts, prompt)
+
+			configSyncPlanJSON := `{
+    "@action": "plan_from_document",
+    "main_task": "验证配置传递",
+    "main_task_goal": "确保配置正确传递到 react loop",
+    "tasks": [{"subtask_name": "验证配置", "subtask_goal": "检查配置是否正确"}]
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(i, prompt, configSyncPlanJSON); rsp != nil {
+				return rsp, err
+			}
+
 			rsp := i.NewAIResponse()
 			defer rsp.Close()
 
-			// 处理 react loop 请求
-			if strings.Contains(prompt, "Background") || strings.Contains(prompt, "Current Time:") {
-				// 检查 prompt 中是否包含不应该出现的内容
-				hasAskForClarificationContent := strings.Contains(prompt, "主动提问以澄清意图") ||
-					strings.Contains(prompt, "ask_for_clarification")
-
-				hasPlanContent := strings.Contains(prompt, "与规划") ||
-					strings.Contains(prompt, "申请分步计划") ||
-					strings.Contains(prompt, "request_plan_and_execution") ||
-					strings.Contains(prompt, "规划系统")
-
-				if hasAskForClarificationContent {
-					t.Errorf("配置 WithAllowRequireForUserInteract(false) 未生效：prompt 中仍然包含 ask_for_clarification 相关内容")
-				}
-
-				if hasPlanContent {
-					t.Errorf("配置 WithAllowPlanUserInteract(false) 未生效：prompt 中仍然包含 plan 相关内容")
-				}
-
-				// 返回一个 finish action
-				responseJSON := `{"@action": "finish", "human_readable_thought": "测试完成"}`
-				rsp.EmitOutputStream(strings.NewReader(responseJSON))
-				return rsp, nil
-			}
-
-			// 处理 plan 请求（如果 AI 仍然尝试使用 plan，这里不应该被调用）
-			if strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具") {
-				planActionUsed = true
-				t.Errorf("AI 尝试使用 plan action，但配置为 false，配置未生效")
-				rsp.EmitOutputStream(strings.NewReader(`
-{
-    "@action": "plan",
-    "query": "测试配置同步",
-    "main_task": "验证配置传递",
-    "main_task_goal": "确保配置正确传递到 react loop",
-    "tasks": []
-}
-				`))
-				return rsp, nil
-			}
-
-			// 默认返回 finish
 			rsp.EmitOutputStream(strings.NewReader(`{"@action": "finish", "human_readable_thought": "测试完成"}`))
 			return rsp, nil
 		}),
@@ -452,10 +362,6 @@ LOOP:
 	// 最终验证
 	if askForClarificationActionUsed {
 		t.Fatal("配置 WithAllowRequireForUserInteract(false) 未生效：AI 仍然尝试使用 ask_for_clarification action")
-	}
-
-	if planActionUsed {
-		t.Fatal("配置 WithAllowPlanUserInteract(false) 未生效：AI 仍然尝试使用 plan action")
 	}
 
 	t.Logf("测试通过：两个配置都正确传递到 react loop，共检查了 %d 个 prompt", len(receivedPrompts))

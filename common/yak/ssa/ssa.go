@@ -274,7 +274,6 @@ type Program struct {
 	LineCount   int
 
 	LibraryFile           map[string][]string //library and file relation
-	editorMap             *omap.OrderedMap[string, *memedit.MemEditor]
 	CurrentIncludingStack *utils.Stack[string]
 
 	Cache *ProgramCache
@@ -347,6 +346,8 @@ type Program struct {
 	config *LanguageConfig
 	ctx    context.Context
 
+	compileConfig *ssaconfig.Config
+
 	NameCache *ssadb.NameCache
 }
 
@@ -410,10 +411,19 @@ type Function struct {
 
 	//if blueprint method,we need record.
 	currentBlueprint *Blueprint
+
+	finished bool
 }
 
 func (f *Function) SetCurrentReturnType(t Type) {
 	f.currentReturnType = t
+}
+
+func (f *Function) IsFinished() bool {
+	if utils.IsNil(f) {
+		return false
+	}
+	return f.finished
 }
 func (f *Function) GetCurrentReturnType() Type {
 	return f.currentReturnType
@@ -474,6 +484,13 @@ type BasicBlock struct {
 	*/
 	canBeReached BasicBlockReachableKind
 	Condition    int64 // value
+	// ConditionInst stores the direct instruction id that contributes branch condition
+	// semantics for this block (typically If/Switch/Loop terminator).
+	ConditionInst int64
+	// ConditionValues stores normalized condition value ids derived at build time.
+	ConditionValues []int64
+	// ConditionMeta stores lightweight metadata for condition extraction/versioning.
+	ConditionMeta map[string]any
 
 	// instruction list
 	Insts []int64 // instruction
@@ -485,6 +502,15 @@ type BasicBlock struct {
 	// for build
 	ScopeTable ScopeIF
 	finish     bool // if emitJump finish!
+}
+
+// BlockConditionSummary is a readonly condition projection for CFG/native-call usage.
+type BlockConditionSummary struct {
+	FuncID      int64
+	BlockID     int64
+	CondInstID  int64
+	CondValueID []int64
+	Meta        map[string]any
 }
 
 func (b *BasicBlock) SetReachable(boolean bool) {

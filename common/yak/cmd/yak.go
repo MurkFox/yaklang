@@ -146,10 +146,12 @@ func init() {
 	if gitHash == "" {
 		gitHash = "-"
 	}
+	consts.SetYakGitHash(gitHash)
 
 	if buildTime == "" {
 		buildTime = time.Now().String()
 	}
+	consts.SetYakBuildTime(buildTime)
 
 	if goVersion == "" {
 		goVersion = runtime.Version()
@@ -622,12 +624,19 @@ var startGRPCServerCommand = cli.Command{
 			}
 
 			if cert != nil {
-				log.Infof("use current Root CA to login (For Yakit)\n\n%v\n\n", string(cert))
+				log.Infof("Root CA (For Yakit)\n\n%v\n\n", string(cert))
 			}
 
 			serverCert, serverKey, err := tlsutils.SignServerCrtNKeyWithParams(cert, key, cn, time.Now().Add(100*365*24*time.Hour), false)
 			if err != nil {
 				return err
+			}
+			serverCertIns, err := tlsutils.ParseCertificate(serverCert)
+			if err == nil {
+				text, err := tlsutils.CertificateText(serverCertIns)
+				if err == nil {
+					log.Infof("Server Certificate Fields \n\n%s\n\n", text)
+				}
 			}
 
 			tlsConfig, err := tlsutils.GetX509ServerTlsConfig(cert, serverCert, serverKey)
@@ -675,6 +684,20 @@ const (
 	netListenFailed      = "net.Listen(tcp, addr) failed"
 	buildYakGrpcServer   = "build yak grpc server failed"
 )
+
+func runCheckSecretCleanupWithTimeout(name string, timeout time.Duration, cleanup func()) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cleanup()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Warnf("%s timed out after %s, continue check-secret-local-grpc shutdown", name, timeout)
+	}
+}
 
 var checkSecretLocalGRPCServerCommand = cli.Command{
 	Name:  "check-secret-local-grpc",
@@ -898,7 +921,7 @@ var checkSecretLocalGRPCServerCommand = cli.Command{
 				log.Errorf("grpc serve error: %s", err)
 			}
 		}()
-		defer grpcTrans.Stop()
+		defer runCheckSecretCleanupWithTimeout("stop test grpc server", time.Second, grpcTrans.Stop)
 
 		// 等待服务器启动
 		if err := utils.WaitConnect(addr, 5); err != nil {
@@ -930,7 +953,9 @@ var checkSecretLocalGRPCServerCommand = cli.Command{
 			reason = dialGrpcServerFailed
 			return
 		}
-		defer conn.Close()
+		defer runCheckSecretCleanupWithTimeout("close test grpc client", time.Second, func() {
+			_ = conn.Close()
+		})
 
 		client := ypb.NewYakClient(conn)
 
@@ -1130,6 +1155,8 @@ func main() {
 	app.IgnoreUnknownFlags = true
 	consts.SetPalmVersion(yakVersion)
 	consts.SetYakVersion(yakVersion)
+	consts.SetYakBuildTime(buildTime)
+	consts.SetYakGitHash(gitHash)
 
 	// 启动 bridge
 	tunnelServerCliApp := cybertunnel.GetTunnelServerCommandCli()
@@ -1281,6 +1308,8 @@ func main() {
 	app.Commands = append(app.Commands, cliGroup("Systemd Service Management", yakcmds.SystemdCommands...)...)
 	app.Commands = append(app.Commands, cliGroup("Remote Operations", yakcmds.SSHCommands...)...)
 	app.Commands = append(app.Commands, cliGroup("TUN Device Utils", yakcmds.TunCommands...)...)
+	app.Commands = append(app.Commands, cliGroup("RAG Server", yakcmds.RAGServerCommands...)...)
+	app.Commands = append(app.Commands, cliGroup("Hot Patch Validators", yakcmds.HotPatchValidatorCommands...)...)
 
 	app.Flags = []cli.Flag{
 		cli.StringFlag{

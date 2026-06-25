@@ -13,6 +13,7 @@ import (
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/chanx"
+	"github.com/yaklang/yaklang/common/utils/lowhttp"
 )
 
 type byteCountingReader struct {
@@ -44,16 +45,81 @@ type AIResponse struct {
 	respStartTime time.Time
 	reqStartTime  time.Time
 
+	modelInfoMu      sync.RWMutex
 	providerName     string
 	modelName        string
 	modelVerboseName string
 
 	firstOutputByteTime time.Time
 	totalOutputBytes    atomic.Int64
+	totalOutputTokens   atomic.Int64
 
 	rawHTTPResponseHeaderMu sync.Mutex
 	rawHTTPResponseHeader   []byte
 	rawHTTPResponseBody     []byte
+
+	usageInfoMu sync.RWMutex
+
+	httpHeaderReady     chan struct{}
+	httpHeaderReadyOnce sync.Once
+
+	usageInfo *aispec.ChatUsage
+
+	onReasonChunk   func([]byte)
+	onReasonChunkMu sync.Mutex
+
+	setErrorFunc func(error)  // 设置错误的函数，支持 TeeAIResponse 拷贝
+	getErrorFunc func() error // 获取错误的函数，支持 TeeAIResponse 拷贝
+}
+
+// SetError 设置 AI 调用过程中的错误
+func (a *AIResponse) SetError(err error) {
+	if a == nil || a.setErrorFunc == nil {
+		return
+	}
+	a.setErrorFunc(err)
+}
+
+// GetError 获取 AI 调用过程中的错误
+func (a *AIResponse) GetError() error {
+	if a == nil || a.getErrorFunc == nil {
+		return nil
+	}
+	return a.getErrorFunc()
+}
+
+// SetOnReasonChunk registers a callback invoked for each completed reason/thinking
+// payload from the upstream (after ReadAll per channel chunk). Optional.
+func (a *AIResponse) SetOnReasonChunk(fn func([]byte)) {
+	if a == nil {
+		return
+	}
+	a.onReasonChunkMu.Lock()
+	a.onReasonChunk = fn
+	a.onReasonChunkMu.Unlock()
+}
+
+func (a *AIResponse) invokeReasonChunk(b []byte) {
+	if a == nil || len(b) == 0 {
+		return
+	}
+	a.onReasonChunkMu.Lock()
+	fn := a.onReasonChunk
+	a.onReasonChunkMu.Unlock()
+	if fn == nil {
+		return
+	}
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	fn(cp)
+}
+
+func (a *AIResponse) SetHeaderReady() {
+	a.httpHeaderReadyOnce.Do(func() {
+		if a.httpHeaderReady != nil {
+			close(a.httpHeaderReady)
+		}
+	})
 }
 
 func (a *AIResponse) SetResponseStartTime(t time.Time) {
@@ -88,6 +154,8 @@ func (a *AIResponse) SetModelInfo(provider, model string) {
 	if a == nil {
 		return
 	}
+	a.modelInfoMu.Lock()
+	defer a.modelInfoMu.Unlock()
 	a.providerName = provider
 	a.modelName = model
 	a.modelVerboseName = aispec.ModelVerboseName(model)
@@ -97,6 +165,8 @@ func (a *AIResponse) GetProviderName() string {
 	if a == nil {
 		return ""
 	}
+	a.modelInfoMu.RLock()
+	defer a.modelInfoMu.RUnlock()
 	return a.providerName
 }
 
@@ -104,6 +174,8 @@ func (a *AIResponse) GetModelName() string {
 	if a == nil {
 		return ""
 	}
+	a.modelInfoMu.RLock()
+	defer a.modelInfoMu.RUnlock()
 	return a.modelName
 }
 
@@ -111,7 +183,55 @@ func (a *AIResponse) GetModelVerboseName() string {
 	if a == nil {
 		return ""
 	}
+	a.modelInfoMu.RLock()
+	defer a.modelInfoMu.RUnlock()
 	return a.modelVerboseName
+}
+
+func (a *AIResponse) GetAIEventMeta() AIEventMeta {
+	if a == nil {
+		return AIEventMeta{}
+	}
+	a.modelInfoMu.RLock()
+	defer a.modelInfoMu.RUnlock()
+	return AIEventMeta{
+		Service:          a.providerName,
+		ModelName:        a.modelName,
+		ModelVerboseName: a.modelVerboseName,
+	}
+}
+
+func (a *AIResponse) BindEmitter(base *Emitter) *Emitter {
+	if base == nil {
+		return nil
+	}
+	if a == nil {
+		return base
+	}
+	return base.WithAIInfoProvider(func() AIEventMeta {
+		return a.GetAIEventMeta()
+	})
+}
+
+// WaitForHTTPHeaders blocks until the raw HTTP response headers have been set
+// (via SetRawHTTPResponseData) or the context is cancelled. Returns true if
+// headers arrived, false if the context was cancelled or the response was closed
+// before headers could be set.
+func (a *AIResponse) WaitForHTTPHeaders(ctx context.Context) bool {
+	if a == nil || a.httpHeaderReady == nil {
+		return false
+	}
+	select {
+	case <-a.httpHeaderReady:
+		return true
+	default:
+	}
+	select {
+	case <-a.httpHeaderReady:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (a *AIResponse) SetRawHTTPResponseData(header []byte, body []byte) {
@@ -119,9 +239,22 @@ func (a *AIResponse) SetRawHTTPResponseData(header []byte, body []byte) {
 		return
 	}
 	a.rawHTTPResponseHeaderMu.Lock()
-	defer a.rawHTTPResponseHeaderMu.Unlock()
 	a.rawHTTPResponseHeader = header
 	a.rawHTTPResponseBody = body
+	a.rawHTTPResponseHeaderMu.Unlock()
+
+	a.SetHeaderReady()
+}
+
+func (a *AIResponse) SetRawHTTPResponseHeader(header []byte) {
+	if a == nil {
+		return
+	}
+	a.rawHTTPResponseHeaderMu.Lock()
+	a.rawHTTPResponseHeader = header
+	a.rawHTTPResponseHeaderMu.Unlock()
+
+	a.SetHeaderReady()
 }
 
 func (a *AIResponse) GetRawHTTPResponseDump() string {
@@ -143,6 +276,69 @@ func (a *AIResponse) GetRawHTTPResponseDump() string {
 	return buf.String()
 }
 
+func (a *AIResponse) SetUsageInfo(usage *aispec.ChatUsage) {
+	if a == nil {
+		return
+	}
+	a.usageInfoMu.Lock()
+	defer a.usageInfoMu.Unlock()
+	if usage == nil {
+		a.usageInfo = nil
+		return
+	}
+	usageCopy := *usage
+	if usage.PromptTokensDetails != nil {
+		detailsCopy := *usage.PromptTokensDetails
+		usageCopy.PromptTokensDetails = &detailsCopy
+	}
+	a.usageInfo = &usageCopy
+}
+
+func (a *AIResponse) GetUsageInfo() *aispec.ChatUsage {
+	if a == nil {
+		return nil
+	}
+	a.usageInfoMu.RLock()
+	defer a.usageInfoMu.RUnlock()
+	if a.usageInfo == nil {
+		return nil
+	}
+	usageCopy := *a.usageInfo
+	if a.usageInfo.PromptTokensDetails != nil {
+		detailsCopy := *a.usageInfo.PromptTokensDetails
+		usageCopy.PromptTokensDetails = &detailsCopy
+	}
+	return &usageCopy
+}
+
+// GetHTTPStatusCode extracts the HTTP status code from the raw response header.
+func (a *AIResponse) GetHTTPStatusCode() int {
+	if a == nil {
+		return 0
+	}
+	a.rawHTTPResponseHeaderMu.Lock()
+	header := a.rawHTTPResponseHeader
+	a.rawHTTPResponseHeaderMu.Unlock()
+	if len(header) == 0 {
+		return 0
+	}
+	return lowhttp.GetStatusCodeFromResponse(header)
+}
+
+// GetHTTPHeader extracts a specific header value from the raw response header.
+func (a *AIResponse) GetHTTPHeader(name string) string {
+	if a == nil {
+		return ""
+	}
+	a.rawHTTPResponseHeaderMu.Lock()
+	header := a.rawHTTPResponseHeader
+	a.rawHTTPResponseHeaderMu.Unlock()
+	if len(header) == 0 {
+		return ""
+	}
+	return lowhttp.GetHTTPPacketHeader(header, name)
+}
+
 func (a *AIResponse) SetFirstOutputByteTime(t time.Time) {
 	if a == nil {
 		return
@@ -162,6 +358,13 @@ func (a *AIResponse) GetTotalOutputBytes() int64 {
 		return 0
 	}
 	return a.totalOutputBytes.Load()
+}
+
+func (a *AIResponse) GetTotalOutputTokens() int64 {
+	if a == nil {
+		return 0
+	}
+	return a.totalOutputTokens.Load()
 }
 
 func (a *AIResponse) GetTaskIndex() string {
@@ -280,8 +483,18 @@ func (a *AIResponse) GetUnboundStreamReader(haveReason bool) io.Reader {
 
 func (a *AIResponse) GetOutputStreamReader(nodeId string, system bool, emitter *Emitter) io.Reader {
 	pr, pw := utils.NewBufPipe(nil)
+	emitter = a.BindEmitter(emitter)
 	go func() {
 		cbBuffer := bytes.NewBuffer(make([]byte, 4096))
+		// 关键词: AIResponse output stream goroutine panic 兜底
+		// 这个后台 goroutine 在测试 cleanup / config ctx 取消后仍可能在循环
+		// 发 EmitSystemStreamEvent / EmitStreamEvent. 任何 emitter 路径下游
+		// (channel send 等) 触发的 panic 都不应让整个进程退出.
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Warnf("AIResponse output stream goroutine panic recovered: %v", rec)
+			}
+		}()
 		defer func() {
 			if a.onOutputFinished != nil {
 				a.onOutputFinished(cbBuffer.String())
@@ -294,18 +507,28 @@ func (a *AIResponse) GetOutputStreamReader(nodeId string, system bool, emitter *
 			if i == nil {
 				continue
 			}
-			targetStream := io.TeeReader(i.out, cbBuffer)
-			if a.enableDebug {
-				targetStream = io.TeeReader(targetStream, os.Stdout)
-			}
 			if i.IsReason {
 				wg.Add(1)
-				emitter.EmitDefaultStreamEvent("thought", targetStream, a.GetTaskIndex(), func() {
+				// 关键词: reason stream tee, 思考流 tee 收集
+				// emit 拿到的必须是真正的流 (边读边发, 保持流式 SSE 语义),
+				// 同时用 io.TeeReader 把原始字节旁路到 reasonBuf, 等
+				// emitStreamEvent 内部 io.Copy 完成后, finishCallback 串
+				// 行触发, 此时 reasonBuf 已包含完整 reason payload, 再
+				// 一次性 invokeReasonChunk (保持原"一段 reason 一次完整
+				// 回调"语义). 不能再用 ReadAll + bytes.NewReader 的方式.
+				reasonBuf := new(bytes.Buffer)
+				teedReason := io.TeeReader(i.out, reasonBuf)
+				emitter.EmitDefaultStreamEvent("thought", teedReason, a.GetTaskIndex(), func() {
+					a.invokeReasonChunk(reasonBuf.Bytes())
 					wg.Done()
 				})
 				continue
 			}
 
+			targetStream := io.TeeReader(i.out, cbBuffer)
+			if a.enableDebug {
+				targetStream = io.TeeReader(targetStream, os.Stdout)
+			}
 			targetStream = io.TeeReader(targetStream, pw)
 			if system {
 				wg.Add(1)
@@ -327,7 +550,7 @@ func (a *AIResponse) GetOutputStreamReader(nodeId string, system bool, emitter *
 func (r *AIResponse) EmitOutputStream(reader io.Reader) {
 	counted := &byteCountingReader{reader: reader, counter: &r.totalOutputBytes}
 	r.ch.SafeFeed(&AIResponseOutputStream{
-		out: CreateConsumptionReader(counted, r.consumptionCallback),
+		out: CreateConsumptionReader(counted, r.consumptionCallback, &r.totalOutputTokens),
 	})
 }
 
@@ -335,7 +558,7 @@ func (r *AIResponse) EmitReasonStream(reader io.Reader) {
 	counted := &byteCountingReader{reader: reader, counter: &r.totalOutputBytes}
 	r.ch.SafeFeed(&AIResponseOutputStream{
 		IsReason: true,
-		out:      CreateConsumptionReader(counted, r.consumptionCallback),
+		out:      CreateConsumptionReader(counted, r.consumptionCallback, &r.totalOutputTokens),
 	})
 }
 
@@ -362,16 +585,18 @@ func (r *AIResponse) Close() {
 
 	defer func() {
 		if err := recover(); err != nil {
-			// Handle panic if necessary, e.g., log it
 			log.Errorf("recover from panic when closing AIResponse: %v", err)
 			utils.PrintCurrentGoroutineRuntimeStack()
 		}
 	}()
 
+	r.SetHeaderReady()
 	r.ch.Close()
 }
 
 func NewAIResponse(caller AICallerConfigIf) *AIResponse {
+	var errMu sync.RWMutex
+	var err error
 	return &AIResponse{
 		ch: chanx.NewUnlimitedChan[*AIResponseOutputStream](context.TODO(), 2),
 		consumptionCallback: func(current int) {
@@ -385,6 +610,17 @@ func NewAIResponse(caller AICallerConfigIf) *AIResponse {
 				return
 			}
 			caller.CallAIResponseOutputFinishedCallback(s)
+		},
+		httpHeaderReady: make(chan struct{}),
+		setErrorFunc: func(e error) {
+			errMu.Lock()
+			err = e
+			errMu.Unlock()
+		},
+		getErrorFunc: func() error {
+			errMu.RLock()
+			defer errMu.RUnlock()
+			return err
 		},
 	}
 }
@@ -406,6 +642,12 @@ func TeeAIResponse(
 	secondReasonReader, secondReasonWriter := utils.NewPipe()
 	secondOutputReader, secondOutputWriter := utils.NewPipe()
 
+	// 拷贝错误函数，确保 TeeAIResponse 能获取到 src 的错误
+	first.setErrorFunc = src.setErrorFunc
+	first.getErrorFunc = src.getErrorFunc
+	second.setErrorFunc = src.setErrorFunc
+	second.getErrorFunc = src.getErrorFunc
+
 	refreshFromSrc := func() {
 		first.SetModelInfo(src.GetProviderName(), src.GetModelName())
 		second.SetModelInfo(src.GetProviderName(), src.GetModelName())
@@ -418,6 +660,12 @@ func TeeAIResponse(
 		srcBytes := src.totalOutputBytes.Load()
 		first.totalOutputBytes.Store(srcBytes)
 		second.totalOutputBytes.Store(srcBytes)
+		srcTokens := src.totalOutputTokens.Load()
+		first.totalOutputTokens.Store(srcTokens)
+		second.totalOutputTokens.Store(srcTokens)
+		srcUsage := src.GetUsageInfo()
+		first.SetUsageInfo(srcUsage)
+		second.SetUsageInfo(srcUsage)
 	}
 
 	reasonReader, outputReader := src.GetUnboundStreamReaderEx(func() {
@@ -486,5 +734,6 @@ func newUnboundAIResponse() *AIResponse {
 		ch:                  chanx.NewUnlimitedChan[*AIResponseOutputStream](context.TODO(), 2),
 		consumptionCallback: func(current int) {},
 		onOutputFinished:    func(s string) {},
+		httpHeaderReady:     make(chan struct{}),
 	}
 }

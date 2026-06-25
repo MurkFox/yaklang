@@ -2,11 +2,9 @@ package aicommon
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
-	"github.com/yaklang/yaklang/common/utils/linktable"
 )
 
 func TestTimelineMarshalUnmarshal(t *testing.T) {
@@ -84,8 +82,8 @@ func TestTimelineMarshalUnmarshal(t *testing.T) {
 	t.Log("Timeline marshal/unmarshal test passed")
 }
 
-func TestTimelineMarshalWithSummaryAndReducers(t *testing.T) {
-	// 创建 Timeline 并添加一些数据来生成 summary 和 reducers
+// TestTimelineMarshalWithCompressedHead 测试 single compressed head 的往返一致性
+func TestTimelineMarshalWithCompressedHead(t *testing.T) {
 	originalTimeline := NewTimeline(nil, nil)
 
 	// 添加一些工具结果
@@ -101,50 +99,28 @@ func TestTimelineMarshalWithSummaryAndReducers(t *testing.T) {
 		})
 	}
 
-	// 手动添加一些 summary 数据（模拟压缩后的数据）
-	testItem := &TimelineItem{
-		createdAt: time.Now(),
-		value: &TextTimelineItem{
-			ID:   150,
-			Text: "compressed content",
-		},
+	originalTimeline.compressedHead = &TimelineCompressedHead{
+		Text:             "compressed memory",
+		CoveredEndItemID: 200,
+		CoveredEndAtMs:   1700000000000,
+		Version:          3,
 	}
-	originalTimeline.summary.Set(int64(150), linktable.NewUnlimitedLinkTable(testItem))
 
-	// 手动添加一些 reducers 数据
-	originalTimeline.reducers.Set(int64(200), linktable.NewUnlimitedStringLinkTable("compressed memory"))
-
-	// 序列化
 	jsonStr, err := MarshalTimeline(originalTimeline)
 	require.NoError(t, err)
 	require.NotEmpty(t, jsonStr)
 
-	// 反序列化
 	restoredTimeline, err := UnmarshalTimeline(jsonStr)
 	require.NoError(t, err)
 	require.NotNil(t, restoredTimeline)
 
-	// 验证 summary - 只应该有最后一个值
-	originalTimeline.summary.ForEach(func(id int64, originalLt *linktable.LinkTable[*TimelineItem]) bool {
-		restoredLt, ok := restoredTimeline.summary.Get(id)
-		require.True(t, ok, "Summary for id %d not found", id)
+	require.NotNil(t, restoredTimeline.compressedHead)
+	require.Equal(t, originalTimeline.compressedHead.Text, restoredTimeline.compressedHead.Text)
+	require.Equal(t, originalTimeline.compressedHead.CoveredEndItemID, restoredTimeline.compressedHead.CoveredEndItemID)
+	require.Equal(t, originalTimeline.compressedHead.CoveredEndAtMs, restoredTimeline.compressedHead.CoveredEndAtMs)
+	require.Equal(t, originalTimeline.compressedHead.Version, restoredTimeline.compressedHead.Version)
 
-		// 验证只保留了最后一个值
-		require.Equal(t, originalLt.Value().String(), restoredLt.Value().String())
-		return true
-	})
-
-	// 验证 reducers - 只应该有最后一个值
-	originalTimeline.reducers.ForEach(func(id int64, originalLt *linktable.LinkTable[string]) bool {
-		restoredLt, ok := restoredTimeline.reducers.Get(id)
-		require.True(t, ok, "Reducer for id %d not found", id)
-
-		// 验证只保留了最后一个值
-		require.Equal(t, originalLt.Value(), restoredLt.Value())
-		return true
-	})
-
-	t.Log("Timeline marshal with summary and reducers test passed")
+	t.Log("Timeline marshal with compressed head test passed")
 }
 
 func TestTimelineMarshalEmpty(t *testing.T) {
@@ -162,8 +138,7 @@ func TestTimelineMarshalEmpty(t *testing.T) {
 
 	// 验证为空
 	require.Equal(t, 0, restoredTimeline.idToTimelineItem.Len())
-	require.Equal(t, 0, restoredTimeline.summary.Len())
-	require.Equal(t, 0, restoredTimeline.reducers.Len())
+	require.Nil(t, restoredTimeline.compressedHead)
 
 	t.Log("Empty timeline marshal/unmarshal test passed")
 }

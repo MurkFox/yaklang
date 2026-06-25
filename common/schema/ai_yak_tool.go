@@ -15,14 +15,37 @@ type AIYakTool struct {
 	Description string `json:"description" gorm:"type:text;index"`
 	Keywords    string `json:"keywords" gorm:"type:text;index"`
 	// 工具使用说明，在参数生成阶段披露给 AI（2阶段披露），帮助 AI 更好地使用参数
-	Usage       string `json:"usage" gorm:"type:text"`
-	Content     string `json:"content" gorm:"type:text"`
-	Params      string `json:"params" gorm:"type:text"`
-	Path        string `json:"path" gorm:"type:text;index"`
-	Hash        string `json:"hash"`
-	IsFavorite  bool   `json:"is_favorite" gorm:"default:false;index"`
+	Usage      string `json:"usage" gorm:"type:text"`
+	Content    string `json:"content" gorm:"type:text"`
+	Params     string `json:"params" gorm:"type:text"`
+	Path       string `json:"path" gorm:"type:text;index"`
+	Author     string `json:"author"`
+	IsBuiltin  bool   `json:"is_builtin" gorm:"default:false;index"`
+	Hash       string `json:"hash"`
+	IsFavorite bool   `json:"is_favorite" gorm:"default:false;index"`
 	// 0: unset, 1: disabled, 2: enabled
 	EnableAIOutputLog int `json:"enable_ai_output_log" gorm:"default:0"`
+}
+
+func (a *AIYakTool) ToUpdateMap() map[string]interface{} {
+	if a == nil {
+		return nil
+	}
+
+	return map[string]interface{}{
+		"name":                 a.Name,
+		"verbose_name":         a.VerboseName,
+		"description":          a.Description,
+		"keywords":             a.Keywords,
+		"usage":                a.Usage,
+		"content":              a.Content,
+		"params":               a.Params,
+		"path":                 a.Path,
+		"is_builtin":           a.IsBuiltin,
+		"hash":                 a.CalcHash(),
+		"is_favorite":          a.IsFavorite,
+		"enable_ai_output_log": a.EnableAIOutputLog,
+	}
 }
 
 func (a *AIYakTool) ToGRPC() *ypb.AITool {
@@ -35,6 +58,10 @@ func (a *AIYakTool) ToGRPC() *ypb.AITool {
 		IsFavorite:  a.IsFavorite,
 		ID:          int64(a.ID),
 		VerboseName: a.VerboseName,
+		Author:      a.Author,
+		IsBuiltin:   a.IsBuiltin,
+		CreatedAt:   a.CreatedAt.Unix(),
+		UpdatedAt:   a.UpdatedAt.Unix(),
 	}
 }
 
@@ -44,6 +71,11 @@ func (*AIYakTool) TableName() string {
 
 func (d *AIYakTool) CalcHash() string {
 	return utils.CalcSha1(d.Name, d.Content, d.Params, d.Path, d.Description, d.Keywords, d.Usage)
+}
+
+func (d *AIYakTool) BeforeCreate() error {
+	d.Author = NormalizeAIResourceAuthor(d.Author, AIResourceAuthorAnonymous)
+	return nil
 }
 
 func (d *AIYakTool) BeforeSave() error {

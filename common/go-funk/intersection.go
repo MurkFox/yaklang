@@ -49,6 +49,14 @@ func Intersect(x interface{}, y interface{}) interface{} {
 }
 
 // Intersect / IntersectString 返回两个字符串切片之间的交集
+//
+// 参数:
+//   - x: 第一个字符串切片
+//   - y: 第二个字符串切片
+//
+// 返回值:
+//   - 同时存在于 x 和 y 中的元素组成的切片
+//
 // Example:
 // ```
 // str.Intersect(["1", "2", "3"], ["3", "4", "5"]) // ["3"]
@@ -75,7 +83,24 @@ func IntersectString(x []string, y []string) []string {
 	return set
 }
 
-// Difference returns the difference between two collections.
+// Difference 返回两个集合的差异，分别是仅属于 x 的元素和仅属于 y 的元素
+// 参数:
+//   - x: 第一个集合
+//   - y: 第二个集合
+//
+// 返回值:
+//   - 仅属于 x 的元素集合
+//   - 仅属于 y 的元素集合
+//
+// Example:
+// ```
+// // VARS: 求双向差异
+// left, right = x.Difference([1, 2, 3, 4], [2, 4])
+// // STDOUT: 打印仅属于第一个集合的元素
+// println(left)   // OUT: [1 3]
+// // assert: 第二个集合没有独有元素
+// assert len(right) == 0, "no element is unique to the second set"
+// ```
 func Difference(x interface{}, y interface{}) (interface{}, interface{}) {
 	if !IsCollection(x) {
 		panic("First parameter must be a collection")

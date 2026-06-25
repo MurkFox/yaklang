@@ -128,7 +128,9 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		} else {
 			plainResponse = httpctx.GetPlainResponseBytes(req)
 			if len(plainResponse) <= 0 {
-				plainResponse = lowhttp.DeletePacketEncoding(httpctx.GetBareResponseBytes(req))
+				decoded := lowhttp.DeletePacketEncoding(httpctx.GetBareResponseBytes(req))
+				httpctx.SetPlainResponseBytes(req, decoded)
+				plainResponse = decoded
 			}
 		}
 		return plainResponse
@@ -1378,7 +1380,7 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 						return nil
 					}
 					flow.Hash = flow.CalcHash()
-					flow.AddTagToFirst("[被丢弃]")
+					flow.AddTagToFirst(yakit.HTTPFlowTagDiscarded)
 					flow.Purple()
 
 					log.Debugf("mitmPluginCaller.HijackSaveHTTPFlow for %v cost: %s", truncate(originReqIns.URL.String()), time.Now().Sub(startCreateFlow))
@@ -1556,17 +1558,19 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		}
 
 		flow.Hash = flow.CalcHash()
-		if isViewed {
-			if isModified {
-				flow.AddTagToFirst("[手动修改]")
-				flow.Orange()
+		if isModified {
+			if isViewed {
+				flow.AddTagToFirst(yakit.HTTPFlowTagManualEdit)
 			} else {
-				flow.AddTagToFirst("[手动劫持]")
-				flow.Yellow()
+				flow.AddTagToFirst(yakit.HTTPFlowTagRuleEdit)
 			}
+			flow.Orange()
+		} else if isViewed {
+			flow.AddTagToFirst(yakit.HTTPFlowTagManualHijack)
+			flow.Yellow()
 		}
 		if isResponseDropped {
-			flow.AddTagToFirst("[响应被丢弃]")
+			flow.AddTagToFirst(yakit.HTTPFlowTagResponseDiscarded)
 			flow.Purple()
 		}
 
@@ -1760,17 +1764,37 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 	// 发送第二个来设置 replacer
 	recoverFilterAndReplacerSend()
 
-	log.Infof("start serve mitm server for %s", addr)
-	// err = mServer.Run(ctx)
-	err = mServer.ServeWithListenedCallback(streamCtx, utils.HostPort(host, port), func() {
-		feedbackToUser("MITM 服务器已启动 / starting mitm server")
-	})
-
-	if err != nil {
-		log.Errorf("close mitm server for %s, reason: %v", addr, err)
-		return err
+	extraPorts := firstReq.GetExtraPorts()
+	if len(extraPorts) == 0 {
+		// Single-port path: unchanged behaviour.
+		log.Infof("start serve mitm server for %s", addr)
+		err = mServer.ServeWithListenedCallback(streamCtx, addr, func() {
+			feedbackToUser("MITM 服务器已启动 / starting mitm server")
+		})
+		if err != nil {
+			log.Errorf("close mitm server for %s, reason: %v", addr, err)
+			return err
+		}
+		return nil
 	}
 
+	// Multi-port path: build the deduplicated address list, primary first.
+	allAddrs := make([]string, 0, 1+len(extraPorts))
+	allAddrs = append(allAddrs, addr)
+	for _, p := range extraPorts {
+		allAddrs = append(allAddrs, utils.HostPort(host, int(p)))
+	}
+	log.Infof("start serve mitm server on ports: %v", allAddrs)
+
+	// ServeWithMultipleAddresses deduplicates, binds all listeners, then
+	// routes every accepted connection into the single underlying proxy loop.
+	err = mServer.ServeWithMultipleAddresses(streamCtx, allAddrs, func() {
+		feedbackToUser("MITM 服务器已启动 / starting mitm server")
+	})
+	if err != nil {
+		log.Errorf("close mitm server for %v, reason: %v", allAddrs, err)
+		return err
+	}
 	return nil
 }
 

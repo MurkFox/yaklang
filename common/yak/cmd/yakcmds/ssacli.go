@@ -216,7 +216,10 @@ var ssaCompile = &cli.Command{
 	UsageText: `yak ssa-compile (--target <path> | --config <json>) [--program <name>] [options]`,
 	Description: `Compile source code into SSA program and save it to database.
 Compile stage is shared with code-scan (same auto-detect + script compile pipeline).
-When --syntaxflow is provided, a follow-up SyntaxFlowQuery is executed for quick manual verification.`,
+When --syntaxflow is provided, a follow-up SyntaxFlowQuery is executed for quick manual verification.
+
+Large projects: tune SSACompile JSON (compile_concurrency, exclude_files, peephole_size, incremental flags);
+use log=info for [ssa.compile.summary] and log=debug for per-phase timings (ssa.compile.phase enter …).`,
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "log", Usage: "log level: debug, info, warn, error"},
 		cli.StringFlag{
@@ -283,10 +286,17 @@ When --syntaxflow is provided, a follow-up SyntaxFlowQuery is executed for quick
 			Name:  "file-perf-log",
 			Usage: "enable file-level compile performance log output",
 		},
+		cli.StringFlag{
+			Name:  "pprof",
+			Usage: `enable pprof and save pprof file to the given path`,
+		},
 	},
 	Action: func(c *cli.Context) error {
 		if ret, err := log.ParseLevel(c.String("log")); err == nil {
 			log.SetLevel(ret)
+		}
+		if pprofFile := c.String("pprof"); pprofFile != "" {
+			diagnostics.StartHeapMonitor(30*time.Second, diagnostics.WithFileName(pprofFile))
 		}
 
 		configFilePath := c.String("config")
@@ -311,10 +321,12 @@ When --syntaxflow is provided, a follow-up SyntaxFlowQuery is executed for quick
 			}
 			consts.SetGormSSAProjectDatabase(db)
 		}
-		// if not set dialect, use existed db
+		// if not set dialect, bind the current process to the target SSA database path
 		if databaseDialect == "" && databaseFileRaw != "" {
-			// set database path
 			consts.SetSSADatabaseInfo(databaseFileRaw)
+			if err := consts.SetGormSSAProjectDatabaseByInfo(databaseFileRaw); err != nil {
+				return utils.Errorf("open database failed: %v", err)
+			}
 		}
 
 		var (

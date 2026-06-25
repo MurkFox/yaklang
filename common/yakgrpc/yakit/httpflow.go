@@ -63,18 +63,31 @@ func SaveLowHTTPFlow(r *lowhttp.LowhttpResponse, forceSaveFlowSync bool) {
 	}
 	reqIns = r.RequestInstance
 
-	// db := consts.GetGormProjectDatabase()
-	flow, err := CreateHTTPFlowFromHTTPWithBodySavedFromRaw(
-		https,
-		req,
-		rsp,
-		"scan",
-		url,
-		remoteAddr,
+	wireRsp, displayRsp, keepWire := lowhttpResponsePackets(r)
+	if r.TooLarge {
+		displayRsp = rsp
+	}
+	saveOpts := []CreateHTTPFlowOptions{
 		CreateHTTPFlowWithRequestIns(reqIns),
 		CreateHTTPFlowWithTags(strings.Join(r.Tags, "|")),
 		CreateHTTPFlowWithDuration(duration),
 		CreateHTTPFlowWithAfterSave(r.AfterSaveHTTPFlowHandler...),
+		CreateHTTPFlowWithResponseRaw(displayRsp),
+	}
+	if len(wireRsp) > 0 && !r.TooLarge {
+		saveOpts = append(saveOpts, CreateHTTPFlowWithBareResponseRaw(wireRsp))
+	}
+	if keepWire {
+		saveOpts = append(saveOpts, CreateHTTPFlowWithNoFixContentLength(true))
+	}
+	flow, err := CreateHTTPFlowFromHTTPWithBodySavedFromRaw(
+		https,
+		req,
+		displayRsp,
+		"scan",
+		url,
+		remoteAddr,
+		saveOpts...,
 	)
 	if err != nil {
 		log.Errorf("create httpflow from lowhttp failed: %s", err)
@@ -93,7 +106,9 @@ func SaveLowHTTPFlow(r *lowhttp.LowhttpResponse, forceSaveFlowSync bool) {
 	flow.RuntimeId = runtimeId
 	flow.HiddenIndex = hiddenIndex
 	flow.Payload = strings.Join(payloads, ",")
-	flow.Tags = strings.Join(tags, "|")
+	if len(tags) > 0 {
+		flow.AddTag(tags...)
+	}
 	err = InsertHTTPFlowEx(flow, forceSaveFlowSync)
 	if err != nil {
 		log.Errorf("insert httpflow failed: %s", err)
@@ -105,15 +120,18 @@ func RegisterLowHTTPSaveCallback() {
 }
 
 type TagAndStatusCode struct {
-	Value string
-	Count int
+	Value   string
+	Count   int
+	Builtin bool
 }
 
 type CreateHTTPFlowConfig struct {
 	isHttps            bool
 	reqRaw             []byte
 	rspRaw             []byte
+	bareRspRaw         []byte // wire packet; sidecar KV when it differs from display response
 	fixRspRaw          []byte // 如果设置了，则不会再修复rspRaw
+	noFixContentLength bool   // keep wire in DB (NoFix / 不修复数据包)
 	source             string
 	url                string
 	remoteAddr         string
@@ -172,6 +190,20 @@ func CreateHTTPFlowWithRequestRaw(reqRaw []byte) CreateHTTPFlowOptions {
 func CreateHTTPFlowWithResponseRaw(rspRaw []byte) CreateHTTPFlowOptions {
 	return func(c *CreateHTTPFlowConfig) {
 		c.rspRaw = rspRaw
+	}
+}
+
+// CreateHTTPFlowWithBareResponseRaw sets wire-original response bytes (e.g. LowhttpResponse.BareResponse).
+func CreateHTTPFlowWithBareResponseRaw(bareRspRaw []byte) CreateHTTPFlowOptions {
+	return func(c *CreateHTTPFlowConfig) {
+		c.bareRspRaw = bareRspRaw
+	}
+}
+
+// CreateHTTPFlowWithNoFixContentLength keeps the wire response in DB (WebFuzzer「不修复数据包」).
+func CreateHTTPFlowWithNoFixContentLength(noFix bool) CreateHTTPFlowOptions {
+	return func(c *CreateHTTPFlowConfig) {
+		c.noFixContentLength = noFix
 	}
 }
 
@@ -262,7 +294,32 @@ func SaveFromHTTPWithBodySaved(db *gorm.DB, isHttps bool, req *http.Request, rsp
 	return flow, nil
 }
 
-const maxBodyLength = 4 * 1024 * 1024
+const (
+	// Responses dominate project-DB bloat; cap above fuzzer/MITM limits (~4–5MB) but below huge scan bodies.
+	maxStoredHTTPFlowResponseBodyBytes = 5 * 1024 * 1024
+	// Requests can be large uploads (MITM/fuzzer); keep a higher cap so history stays usable.
+	maxStoredHTTPFlowRequestBodyBytes = 16 * 1024 * 1024
+	storedHTTPFlowTruncateNotice      = "[[yakit: body truncated for storage]]"
+)
+
+// truncateHTTPPacketBodyForStorage caps HTTP body stored in project DB to slow index/bloat growth.
+func truncateHTTPPacketBodyForStorage(packet []byte, maxBody int) []byte {
+	if maxBody <= 0 || len(packet) == 0 {
+		return packet
+	}
+	header, body := lowhttp.SplitHTTPHeadersAndBodyFromPacket(packet)
+	if len(body) <= maxBody {
+		return packet
+	}
+	notice := []byte(fmt.Sprintf("%s original=%s", storedHTTPFlowTruncateNotice, utils.ByteSize(uint64(len(body)))))
+	keep := maxBody - len(notice)
+	if keep < 0 {
+		keep = maxBody
+		notice = nil
+	}
+	truncated := append(body[:keep], notice...)
+	return lowhttp.ReplaceHTTPPacketBody([]byte(header), truncated, false)
+}
 
 func CreateHTTPFlow(opts ...CreateHTTPFlowOptions) (*schema.HTTPFlow, error) {
 	c := &CreateHTTPFlowConfig{}
@@ -274,7 +331,9 @@ func CreateHTTPFlow(opts ...CreateHTTPFlowOptions) (*schema.HTTPFlow, error) {
 		isHttps            = c.isHttps
 		reqRaw             = c.reqRaw
 		rspRaw             = c.rspRaw
+		bareRspRaw         = c.bareRspRaw
 		fixRspRaw          = c.fixRspRaw
+		noFixContentLength = c.noFixContentLength
 		source             = c.source
 		url                = c.url
 		remoteAddr         = c.remoteAddr
@@ -299,10 +358,8 @@ func CreateHTTPFlow(opts ...CreateHTTPFlowOptions) (*schema.HTTPFlow, error) {
 		return nil
 	})
 
-	if false && len(body) > maxBodyLength {
-		// Truncated by saver
-		reqRaw = lowhttp.ReplaceHTTPPacketBody([]byte(header), body[:maxBodyLength], false)
-	}
+	_ = header
+	reqRaw = truncateHTTPPacketBodyForStorage(reqRaw, maxStoredHTTPFlowRequestBodyBytes)
 	requestRaw := strconv.Quote(string(reqRaw))
 	if strings.HasPrefix(requestRaw, `"HTTP/1.`) {
 		log.Errorf("[BUG] requestRaw is invalid: %s", requestRaw)
@@ -310,29 +367,30 @@ func CreateHTTPFlow(opts ...CreateHTTPFlowOptions) (*schema.HTTPFlow, error) {
 		log.Errorf("[BUG] requestRaw is invalid: %s", requestRaw)
 	}
 
-	// 如果已经修复过响应，则不会再修复
-	if len(fixRspRaw) == 0 {
-		rawNoGzip, _, _ := lowhttp.FixHTTPResponse(rspRaw)
-		if len(rawNoGzip) > 0 {
-			rspRaw = rawNoGzip
-		}
-	} else {
-		rspRaw = fixRspRaw
-	}
+	wireRsp := httpFlowWireResponse(bareRspRaw, rspRaw)
+	rspRaw = resolveHTTPFlowStoredResponse(wireRsp, rspRaw, fixRspRaw, noFixContentLength)
 	if rspRaw == nil {
 		rspRaw = make([]byte, 0)
 	}
+	storeBareWire := httpFlowShouldStoreBareWire(wireRsp, rspRaw, noFixContentLength)
 
 	var rspContentType string
+	rspRaw = truncateHTTPPacketBodyForStorage(rspRaw, maxStoredHTTPFlowResponseBodyBytes)
 	header, body = lowhttp.SplitHTTPHeadersAndBodyFromPacket(rspRaw, func(line string) {
 		k, v := lowhttp.SplitHTTPHeader(line)
 		if strings.ToLower(k) == "content-type" {
 			rspContentType = v
 		}
 	})
+	_ = header
 	responseRaw := strconv.Quote(string(rspRaw))
 
+	if storeBareWire {
+		c.afterSaveHandlers = append(c.afterSaveHandlers, afterSaveHTTPFlowBareResponse(wireRsp))
+	}
+
 	flow := &schema.HTTPFlow{
+		NoFixContentLength:         noFixContentLength,
 		IsHTTPS:                    isHttps,
 		Url:                        url,
 		Path:                       requestUri,
@@ -353,6 +411,9 @@ func CreateHTTPFlow(opts ...CreateHTTPFlowOptions) (*schema.HTTPFlow, error) {
 		TooLargeResponseBodyFile:   tooLargeBodyFile,
 		TooLargeResponseHeaderFile: tooLargeHeaderFile,
 		FromPlugin:                 fromPlugin,
+	}
+	if storeBareWire {
+		flow.AddTagToFirst(HTTPFlowTagAutoFixResponse)
 	}
 	if len(c.afterSaveHandlers) > 0 {
 		flow.AfterSaveHandlers = append([]func(*schema.HTTPFlow){}, c.afterSaveHandlers...)
@@ -386,14 +447,7 @@ func CreateHTTPFlow(opts ...CreateHTTPFlowOptions) (*schema.HTTPFlow, error) {
 	if fReq != nil {
 		flow.GetParamsTotal = len(fReq.GetGetQueryParams())
 
-		postParams := fReq.GetPostJsonParams()
-		if len(postParams) <= 0 {
-			postParams = fReq.GetPostXMLParams()
-		}
-		if len(postParams) <= 0 {
-			postParams = fReq.GetPostParams()
-		}
-		flow.PostParamsTotal = len(postParams)
+		flow.PostParamsTotal = len(fReq.GetPostCommonParams())
 
 		flow.CookieParamsTotal = len(fReq.GetCookieParams())
 	}
@@ -478,6 +532,12 @@ func createHTTPFlowFromHTTP(isHttps bool, req *http.Request, rsp *http.Response,
 		plainResponse = make([]byte, 0)
 	}
 
+	wireResponse := httpctx.GetBareResponseBytes(req)
+	if len(wireResponse) == 0 {
+		wireResponse = plainResponse
+	}
+	opts = append(opts, CreateHTTPFlowWithBareResponseRaw(wireResponse))
+
 	return CreateHTTPFlowFromHTTPWithBodySavedFromRaw(isHttps, plainRequest, plainResponse, source, urlRaw, remoteAddr, opts...)
 }
 
@@ -500,10 +560,12 @@ func UpdateHTTPFlowTags(db *gorm.DB, i *schema.HTTPFlow) (finErr error) {
 		if finErr == nil {
 			// 需要手动触发广播，因为要拿到id，在AfterSave/AfterUpdate中无法拿到id
 			schema.GetBroadCast_Data().Call("httpflow", map[string]any{
-				"id":     id,
-				"tags":   tags,
-				"action": "update",
+				"id":         id,
+				"tags":       tags,
+				"action":     "update",
+				"runtime_id": i.RuntimeId,
 			})
+			schema.PublishRuntimeScopedBroadcast(schema.RuntimeScopedBroadcastTypeHTTPFlow, i.RuntimeId, "update", uint(id))
 		}
 	}()
 	updateData := map[string]interface{}{
@@ -544,7 +606,7 @@ func InsertHTTPFlow(db *gorm.DB, i *schema.HTTPFlow) (fErr error) {
 	if i.PathSuffix == "" && i.Path != "" {
 		i.PathSuffix = lowhttp.GetPathSuffix(i.Path)
 	}
-	if db = db.Model(&schema.HTTPFlow{}).Save(i); db.Error != nil {
+	if db = db.Create(i); db.Error != nil {
 		return utils.Errorf("insert HTTPFlow failed: %s", db.Error)
 	}
 	callHTTPFlowAfterSaveHandlers(i)
@@ -1030,6 +1092,8 @@ func FilterHTTPFlow(db *gorm.DB, params *ypb.QueryHTTPFlowRequest) *gorm.DB {
 		db = bizhelper.ExactQueryStringArrayOr(db, "process_name", params.ProcessName)
 	}
 
+	db = filterHTTPFlowByMITMExtractAggregateRows(db, params.GetMitmExtractAggregateFilterRows())
+
 	return db
 }
 
@@ -1178,6 +1242,13 @@ func YieldHTTPFlowsEx(db *gorm.DB, ctx context.Context, countCallback func(int))
 	return bizhelper.YieldModel[*schema.HTTPFlow](ctx, db, bizhelper.WithYieldModel_CountCallback(countCallback))
 }
 
+// YieldHTTPFlowsByFilter 根据过滤条件流式返回HTTPFlow
+// 如果filter为nil，则返回所有流量
+func YieldHTTPFlowsByFilter(db *gorm.DB, ctx context.Context, filter *ypb.QueryHTTPFlowRequest) chan *schema.HTTPFlow {
+	query := FilterHTTPFlow(db, filter)
+	return YieldHTTPFlows(query, ctx)
+}
+
 const (
 	HTTPFLOW_TAG        = "HTTPFLOW_TAG"
 	HTTPFLOW_STATUSCODE = "HTTPFLOW_STATUSCODE"
@@ -1244,8 +1315,9 @@ func HTTPFlowTags(refreshRequest bool) ([]*TagAndStatusCode, error) {
 	for k, v := range tagCounts {
 		if !strings.HasPrefix(k, schema.COLORPREFIX) {
 			tags = append(tags, &TagAndStatusCode{
-				Value: k,
-				Count: v,
+				Value:   k,
+				Count:   v,
+				Builtin: IsHTTPFlowBuiltinTag(k),
 			})
 		}
 	}
@@ -1268,10 +1340,31 @@ func QueryHTTPFlowTags() ([]*TagAndStatusCode, error) {
 	tags := make([]*TagAndStatusCode, 0)
 	for tag := range tagSet {
 		tags = append(tags, &TagAndStatusCode{
-			Value: tag,
+			Value:   tag,
+			Builtin: IsHTTPFlowBuiltinTag(tag),
 		})
 	}
 	return tags, nil
+}
+
+func HTTPFlowSuffixes() ([]*TagAndStatusCode, error) {
+	suffixSet := make(map[string]int)
+	db := consts.GetGormProjectDatabase().Model(&schema.HTTPFlow{}).Select("id, path_suffix").Where("path_suffix IS NOT NULL AND path_suffix != ''")
+	for flow := range YieldHTTPFlows(db, context.Background()) {
+		suffix := strings.TrimSpace(flow.PathSuffix)
+		if suffix != "" {
+			suffixSet[suffix]++
+		}
+	}
+
+	suffixes := make([]*TagAndStatusCode, 0)
+	for suffix := range suffixSet {
+		suffixes = append(suffixes, &TagAndStatusCode{
+			Value: suffix,
+			Count: suffixSet[suffix],
+		})
+	}
+	return suffixes, nil
 }
 
 func QueryWebsocketFlowsByHTTPFlowHash(db *gorm.DB, req *ypb.DeleteHTTPFlowRequest) *gorm.DB {

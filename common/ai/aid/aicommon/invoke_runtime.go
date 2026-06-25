@@ -2,6 +2,7 @@ package aicommon
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
@@ -14,12 +15,20 @@ type VerifyNextMovement struct {
 	ID      string `json:"id"`
 }
 
+type EvidenceOperation struct {
+	ID      string `json:"id"`
+	Op      string `json:"op"`
+	Content string `json:"content,omitempty"`
+}
+
 // VerifySatisfactionResult represents the result of user satisfaction verification
 type VerifySatisfactionResult struct {
 	Satisfied          bool                 `json:"satisfied"`            // Whether the user is satisfied
 	Reasoning          string               `json:"reasoning"`            // The reasoning for the satisfaction status
 	CompletedTaskIndex string               `json:"completed_task_index"` // Index of completed task(s), e.g., "1-1" or "1-1,1-2"
 	NextMovements      []VerifyNextMovement `json:"next_movements"`       // AI's next action plan for in-progress status tracking
+	Evidence           string               `json:"evidence"`             // Legacy: markdown evidence string
+	EvidenceOps        []EvidenceOperation  `json:"evidence_ops"`         // Structured evidence incremental operations
 	OutputFiles        []string             `json:"output_files"`         // File paths created/modified by tool execution, extracted by verify AI
 }
 
@@ -42,6 +51,15 @@ func NewVerifySatisfactionResultWithNextMovements(satisfied bool, reasoning stri
 	}
 }
 
+func HasNewTodoAddOps(movements []VerifyNextMovement) bool {
+	for _, m := range movements {
+		if strings.EqualFold(strings.TrimSpace(m.Op), "add") && strings.TrimSpace(m.Content) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func FormatVerifyNextMovementsSummary(nextMovements []VerifyNextMovement) string {
 	if len(nextMovements) == 0 {
 		return ""
@@ -61,11 +79,99 @@ func FormatVerifyNextMovementsSummary(nextMovements []VerifyNextMovement) string
 			parts = append(parts, "DONE["+movement.ID+"]")
 		case "delete":
 			parts = append(parts, "DELETE["+movement.ID+"]")
+		case "skip":
+			// 显式跳过 op summary, 与 done/delete 平行展示, 形成
+			// "三种主动关闭方式" (DONE/DELETE/SKIP) 的统一摘要文本.
+			// 关键词: FormatVerifyNextMovementsSummary skip 摘要
+			parts = append(parts, "SKIP["+movement.ID+"]")
 		default:
 			parts = append(parts, strings.ToUpper(movement.Op)+"["+movement.ID+"]")
 		}
 	}
 	return strings.Join(parts, "; ")
+}
+
+func FormatEvidenceOpLine(op EvidenceOperation, language string) string {
+	id := strings.TrimSpace(op.ID)
+	content := strings.TrimSpace(op.Content)
+	firstLine := ""
+	if content != "" {
+		firstLine = strings.SplitN(content, "\n", 2)[0]
+	}
+
+	isCN := strings.Contains(strings.ToLower(language), "zh") ||
+		strings.Contains(strings.ToLower(language), "chinese")
+
+	switch strings.ToLower(strings.TrimSpace(op.Op)) {
+	case "add":
+		if id == "" && content == "" {
+			return ""
+		}
+		if isCN {
+			if id != "" && firstLine != "" {
+				return fmt.Sprintf("- **新发现**: %s `#%s`", firstLine, id)
+			}
+			if firstLine != "" {
+				return fmt.Sprintf("- **新发现**: %s", firstLine)
+			}
+			return fmt.Sprintf("- **新发现**: `#%s`", id)
+		}
+		if id != "" && firstLine != "" {
+			return fmt.Sprintf("- **New finding**: %s `#%s`", firstLine, id)
+		}
+		if firstLine != "" {
+			return fmt.Sprintf("- **New finding**: %s", firstLine)
+		}
+		return fmt.Sprintf("- **New finding**: `#%s`", id)
+	case "update":
+		if id == "" {
+			return ""
+		}
+		if isCN {
+			if firstLine != "" {
+				return fmt.Sprintf("- **更新证据**: %s `#%s`", firstLine, id)
+			}
+			return fmt.Sprintf("- **更新证据**: `#%s`", id)
+		}
+		if firstLine != "" {
+			return fmt.Sprintf("- **Updated**: %s `#%s`", firstLine, id)
+		}
+		return fmt.Sprintf("- **Updated**: `#%s`", id)
+	case "delete":
+		if id == "" {
+			return ""
+		}
+		if isCN {
+			return fmt.Sprintf("- **移除过时信息**: `#%s`", id)
+		}
+		return fmt.Sprintf("- **Removed outdated**: `#%s`", id)
+	default:
+		if id == "" && content == "" {
+			return ""
+		}
+		label := strings.ToUpper(strings.TrimSpace(op.Op))
+		if label == "" {
+			label = "?"
+		}
+		if id != "" && firstLine != "" {
+			return fmt.Sprintf("- **%s**: %s `#%s`", label, firstLine, id)
+		}
+		if firstLine != "" {
+			return fmt.Sprintf("- **%s**: %s", label, firstLine)
+		}
+		return fmt.Sprintf("- **%s**: `#%s`", label, id)
+	}
+}
+
+func FormatEvidenceOpsLines(ops []EvidenceOperation, language string) string {
+	var lines []string
+	for _, op := range ops {
+		line := FormatEvidenceOpLine(op, language)
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // SelectedKnowledgeBaseResult represents the result of knowledge base selection
@@ -82,8 +188,90 @@ func NewSelectedKnowledgeBaseResult(reason string, knowledgeBases []string) *Sel
 	}
 }
 
+type LoopPromptAssemblyInput struct {
+	Nonce             string
+	UserQuery         string
+	TaskInstruction   string
+	OutputExample     string
+	Schema            string
+	SkillsContext     string
+	ExtraCapabilities string
+	SessionEvidence   string
+	// TodoSnapshot 是全局 TODO 列表的渲染输出 (含 <|TODO_LIST_<nonce>|>...
+	// 边界标签的整段块), 紧跟在 SessionEvidence 后面注入到 timeline-open 段。
+	// 与 SessionEvidence 一样落在所有缓存边界外, 保证不污染上游 prefix cache.
+	// 空字符串时 timeline-open 模板自动跳过该块。
+	//
+	// 关键词: TodoSnapshot, 全局 TODO 块, timeline-open 段, SessionEvidence 后,
+	//        loop prompt 任何时刻可见
+	TodoSnapshot   string
+	ReactiveData   string
+	InjectedMemory string
+
+	// RecentToolsCache 是 CACHE_TOOL_CALL 块的渲染输出 (含 directly_call_tool
+	// routing hint + 最近工具的 schema/footer), 用稳定 nonce 渲染, 字节级跨 turn
+	// 稳定. 物理位置在 semi-dynamic 段, 让其与 Skills + Schema 一起被
+	// AI_CACHE_SEMI 边界包裹进入 prefix cache. 空字符串时模板自动跳过.
+	//
+	// 关键词: LoopPromptAssemblyInput, RecentToolsCache, semi-dynamic 段,
+	//        AI_CACHE_SEMI prefix cache
+	RecentToolsCache string
+
+	// FrozenUserContext 用于承载 PE-TASK 等场景下"PLAN 阶段产出 + 用户原始
+	// 输入"两类只读上下文。注: 命名虽为 "Frozen", 但实际并不放入冻结段;
+	// 跨同一 plan 周期内同一子任务执行的多次 turn 字节稳定, 但子任务切换仍
+	// 会让其内容抖动, 故不适合 cache。
+	//
+	// 物理位置: 包装为 <|PLAN_CONTEXT_<stable-nonce>|>...<|PLAN_CONTEXT_END_
+	// <stable-nonce>|> 后, 注入到 timeline-open 段最末尾 (UserHistory 之后)。
+	// timeline-open 段不被 AI_CACHE_FROZEN / AI_CACHE_SEMI 任何缓存边界包裹,
+	// 是"易变尾段"。
+	//
+	// 设计取舍 (历史演进):
+	//   - v1: 注入 dynamic 段 (turn nonce), 完全不可缓存;
+	//   - v2: 迁到 frozen-block, 但 root task / 普通 ReAct 时为空, 渲染态
+	//     抖动破坏 AI_CACHE_FROZEN 命中;
+	//   - v3: 迁到 semi-dynamic, 但子任务切换仍让其内容抖动, 破坏
+	//     AI_CACHE_SEMI 命中;
+	//   - v4 (当前): 迁到 timeline-open 末尾, 主动让其落在所有 cache 边界外,
+	//     不再追求自身缓存, 而是保护更上游 SYSTEM / FROZEN / SEMI 三段缓存。
+	//
+	// 老路径 (普通 ReAct loop / focus mode 等没有 PLAN 上下文的场景): 此字段
+	// 为空, timeline-open 段 PlanContext 子块自然不渲染, 段位置稳定。
+	//
+	// 关键词: FrozenUserContext, PLAN_CONTEXT 段, timeline-open 末尾注入,
+	//        缓存边界外, 上游缓存保护, PE-TASK PLAN 产物
+	FrozenUserContext string
+
+	// FrozenPartitions 是业务侧提供的通用 frozen-block 分区。共享模板只识别
+	// FrozenBlockPartition，不直接依赖 planAndExec / FACTS / DOCUMENT 等业务类型。
+	FrozenPartitions []FrozenBlockPartition
+}
+
+type LoopPromptAssemblyResult struct {
+	Prompt   string
+	Sections any
+}
+
+// ExecutePlanInput carries an approved plan generated outside Coordinator plan loop.
+type ExecutePlanInput struct {
+	PlanPayload  string
+	PlanData     string
+	PlanFacts    string
+	PlanDocument string
+}
+
+// PlanCoordinatorSession keeps a plan-exec coordinator alive across review and async execution.
+type PlanCoordinatorSession interface {
+	CoordinatorID() string
+	ReviewPlan(ctx context.Context) error
+	ApprovedPlanInput() *ExecutePlanInput
+	Close()
+}
+
 type AIInvokeRuntime interface {
 	GetBasicPromptInfo(tools []*aitool.Tool) (string, map[string]any, error)
+	AssembleLoopPrompt(tools []*aitool.Tool, input *LoopPromptAssemblyInput) (*LoopPromptAssemblyResult, error)
 	SetCurrentTask(task AIStatefulTask)
 	GetCurrentTask() AIStatefulTask
 	GetCurrentTaskId() string
@@ -93,6 +281,8 @@ type AIInvokeRuntime interface {
 	AskForClarification(ctx context.Context, question string, payloads []string) string
 	DirectlyAnswer(ctx context.Context, query string, tools []*aitool.Tool, opts ...any) (string, error)
 	CompressLongTextWithDestination(ctx context.Context, i any, destination string, targetByteSize int64) (string, error)
+	// QuickKnowledgeSearch performs a fast local knowledge-base search using LIKE + BM25.
+	QuickKnowledgeSearch(ctx context.Context, query string, keywords []string, collections ...string) (string, error)
 	// EnhanceKnowledgeGetterEx 支持多种 EnhancePlan 的知识增强获取器
 	// enhancePlans 参数可选，支持：
 	//   - nil 或空切片：使用默认完整增强流程
@@ -102,7 +292,14 @@ type AIInvokeRuntime interface {
 	// VerifyUserSatisfaction verifies if the user is satisfied with the result
 	VerifyUserSatisfaction(ctx context.Context, query string, isToolCall bool, payload string) (*VerifySatisfactionResult, error)
 	RequireAIForgeAndAsyncExecute(ctx context.Context, forgeName string, onFinish func(error))
+	AsyncPlanOnly(ctx context.Context, planPayload string, onFinish func(error))
 	AsyncPlanAndExecute(ctx context.Context, planPayload string, onFinish func(error))
+	ReviewExecutePlan(ctx context.Context, input *ExecutePlanInput) (*ExecutePlanInput, error)
+	ForceReviewExecutePlan(ctx context.Context, input *ExecutePlanInput) (*ExecutePlanInput, error)
+	BeginPlanCoordinatorSession(ctx context.Context, input *ExecutePlanInput, forceManualReview bool) (PlanCoordinatorSession, error)
+	PublishDetachedPlan(ctx context.Context, input *ExecutePlanInput, reactTaskID string) (coordinatorID string, err error)
+	AsyncExecutePlan(ctx context.Context, input *ExecutePlanInput, onFinish func(error))
+	AsyncExecuteCod(ctx context.Context, coordinatorID string, onFinish func(error))
 	InvokeLiteForge(ctx context.Context, actionName string, prompt string, outputs []aitool.ToolOption, opts ...GeneralKVConfigOption) (*Action, error)
 	InvokeSpeedPriorityLiteForge(ctx context.Context, actionName string, prompt string, outputs []aitool.ToolOption, opts ...GeneralKVConfigOption) (*Action, error)
 	InvokeQualityPriorityLiteForge(ctx context.Context, actionName string, prompt string, outputs []aitool.ToolOption, opts ...GeneralKVConfigOption) (*Action, error)

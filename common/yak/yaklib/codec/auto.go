@@ -88,6 +88,22 @@ func EncodeByType(t string, i interface{}) string {
 	return ""
 }
 
+// AutoDecode 自动识别并逐层解码输入数据(依次尝试 URL/HTML 实体/Hex/Unicode/Base32/Base64/JWT/字符集等)
+// 参数:
+//   - i: 待自动解码的数据，可为 string、[]byte 等
+//
+// 返回值:
+//   - 解码过程的结果列表，每个元素含 Type(编码类型)、Origin(本层输入)、Result(本层输出)等字段；无法识别时返回单个 Type 为 No 的结果
+//
+// Example:
+// ```
+// // VARS: 对 Base64 文本自动解码
+// results = codec.AutoDecode(codec.EncodeBase64("hello world"))
+// // STDOUT: 打印是否得到解码步骤
+// println(len(results) > 0)   // OUT: true
+// // assert: 锁定结论(返回非空解码结果列表)
+// assert len(results) > 0, "AutoDecode should return decode steps"
+// ```
 func AutoDecode(i interface{}) []*AutoDecodeResult {
 	rawStr := string(interfaceToBytes(i))
 	origin := rawStr

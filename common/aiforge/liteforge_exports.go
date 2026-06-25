@@ -48,17 +48,46 @@ var LiteForgeExport = map[string]interface{}{
 	"knowledgeEntryLength": RefineWithKnowledgeEntryLength,
 	"refinePrompt":         _refine_WithRefinePrompt,
 	"strictRefine":         _refine_WithStrict,
+
+	// 视频 omni 知识构建关键词: BuildVideoKnowledgeFromOmni, AnalyzeVideoOmni, omniPreset
+	"BuildVideoKnowledgeFromOmni": BuildVideoKnowledgeFromOmni,
+	"AnalyzeVideoOmni":            AnalyzeVideoOmni,
+	"omniPresetTurbo":             VideoOmniPresetTurbo,
+	"omniPresetFlash":             VideoOmniPresetFlash,
+	"omniPresetPlus":              VideoOmniPresetPlus,
+	"omniType":                    WithVideoOmniType,
+	"omniModel":                   WithVideoOmniModel,
+	"omniAPIKey":                  WithVideoOmniAPIKey,
+	"omniBaseURL":                 WithVideoOmniBaseURL,
+	"omniSystemPrompt":            WithVideoOmniSystemPrompt,
+	"omniQueryPrompt":             WithVideoOmniQueryPrompt,
+	"omniContext":                 WithVideoOmniContext,
+	"omniTimeout":                 WithVideoOmniTimeout,
+	"omniSegmentSeconds":          WithVideoOmniSegmentSeconds,
+	"omniReencode":                WithVideoOmniReencode,
+	"omniMaxHeight":               WithVideoOmniMaxHeight,
+	"omniTargetFPS":               WithVideoOmniTargetFPS,
+	"omniMaxBase64Bytes":          WithVideoOmniMaxBase64Bytes,
+	"omniMaxSegments":             WithVideoOmniMaxSegments,
+	"omniProgressCallback":        WithVideoOmniProgressCallback,
+	// 关键词: omni zip 归档导出, omniZipFile, omniZipDir
+	"omniZipFile": WithVideoOmniZipFile,
+	"omniZipDir":  WithVideoOmniZipDir,
+	// 关键词: omni 限速重试 / 段间节流导出
+	"omniRateLimitRetry":  WithVideoOmniRateLimitRetry,
+	"omniSegmentInterval": WithVideoOmniSegmentInterval,
 }
 
 type liteforgeConfig struct {
-	query      string
-	output     string
-	action     string
-	id         string
-	ctx        context.Context
-	images     []*aicommon.ImageData
-	forceImage bool
-	speedPriority bool
+	query             string
+	output            string
+	action            string
+	id                string
+	ctx               context.Context
+	images            []*aicommon.ImageData
+	forceImage        bool
+	speedPriority     bool
+	staticInstruction string
 
 	aidOptions []aicommon.ConfigOption
 
@@ -80,9 +109,15 @@ func WithJsonExtractHook(opts ...jsonextractor.CallbackOption) LiteForgeExecOpti
 // example:
 // ```
 // liteforge.Execute(<<<PROMPT
-// SOME_CONTENTN
-// PROMPT, liteforge.output(jsonschema.ActionObject(jsonschema.paramString("value"))),
+// SOME_CONTENT
+// PROMPT, liteforge.output(jsonschema.ActionObject(jsonschema.paramString("value"))))
 // ```
+//
+// 参数:
+//   - output: JSON Schema 字符串，用于约束输出结构
+//
+// 返回值:
+//   - liteforge 执行可选项
 func WithOutputJSONSchema(output string) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		cfg.output = output
@@ -98,6 +133,12 @@ func WithOutputJSONSchema(output string) LiteForgeExecOption {
 // SOME_CONTENT
 // PROMPT, liteforge.forceImage(true))
 // ```
+//
+// 参数:
+//   - force: 是否强制要求图片输入，缺省为 true
+//
+// 返回值:
+//   - liteforge 执行可选项
 func _withForceImage(force ...bool) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		if len(force) > 0 {
@@ -117,6 +158,12 @@ func _withForceImage(force ...bool) LiteForgeExecOption {
 // SOME_CONTENT
 // PROMPT, liteforge.action("analyze"))
 // ```
+//
+// 参数:
+//   - action: 输出的 action 类型
+//
+// 返回值:
+//   - liteforge 执行可选项
 func WithOutputAction(action string) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		cfg.action = action
@@ -132,6 +179,12 @@ func WithOutputAction(action string) LiteForgeExecOption {
 // SOME_CONTENT
 // PROMPT, liteforge.imageFile("path/to/image.jpg"))
 // ```
+//
+// 参数:
+//   - filename: 一个或多个图片文件路径
+//
+// 返回值:
+//   - liteforge 执行可选项
 func _withImageFile(filename ...string) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		for _, file := range filename {
@@ -160,6 +213,12 @@ func _withImageFile(filename ...string) LiteForgeExecOption {
 // SOME_CONTENT
 // PROMPT, liteforge.image(imageData))
 // ```
+//
+// 参数:
+//   - anyImageInput: 一个或多个图片输入（字节、路径、base64 等）
+//
+// 返回值:
+//   - liteforge 执行可选项
 func _withImage(anyImageInput ...any) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		for _, anyImg := range anyImageInput {
@@ -202,10 +261,23 @@ func _withImageCompress(anyImageInput ...any) LiteForgeExecOption {
 }
 
 // liteforge.Execute can create a temporary LiteForge instance and execute it with the given query.
+// 参数:
+//   - query: 提示词/查询内容
+//   - opts: 执行可选项，如 liteforge.output、liteforge.action、liteforge.context 等
+//
+// 返回值:
+//   - 执行结果对象（可通过 Get 读取字段）
+//   - 错误信息
+//
 // Example:
 // ```
-// result = liteforge.Execute(<<<PROMPT
-// PROMPT, liteforge.output(jsonschema.ActionObject(jsonschema.paramString("value"))),
+// // 需要配置可用的 AI 服务（示意性示例）
+// result = liteforge.Execute("extract the title",
+//
+//	liteforge.output(jsonschema.ActionObject("object", jsonschema.paramString("value"))),
+//
+// )~
+// dump(result)
 // ```
 func _executeLiteForgeTemp(query string, opts ...any) (*ForgeResult, error) {
 	cfg := &liteforgeConfig{
@@ -229,6 +301,10 @@ func _executeLiteForgeTemp(query string, opts ...any) (*ForgeResult, error) {
 			// Collect aispec options to extract Type and Model
 			opt(&aiSpecConfig)
 			hasAiSpecOpts = true
+		case aicommon.LiteForgeStaticInstruction:
+			// 关键词: aicache, PROMPT_SECTION, StaticInstruction, LiteForgeStaticInstruction, B 档无循环依赖
+			// 下游包（如 enhancesearch）通过此 marker 类型携带系统侧静态指令，避免 import aiforge 造成循环依赖
+			cfg.staticInstruction = string(opt)
 		}
 	}
 
@@ -260,6 +336,12 @@ func _executeLiteForgeTemp(query string, opts ...any) (*ForgeResult, error) {
 	if cfg.speedPriority {
 		liteForgeOpts = append(liteForgeOpts, WithLiteForge_SpeedPriority(true))
 	}
+	// 关键词: aicache, PROMPT_SECTION, StaticInstruction, _executeLiteForgeTemp, B 档
+	// 调用方可以通过 LiteForgeExecWithStaticInstruction 携带系统侧静态指令
+	// 该指令进入 high-static 段，跨调用稳定哈希
+	if cfg.staticInstruction != "" {
+		liteForgeOpts = append(liteForgeOpts, WithLiteForge_StaticInstruction(cfg.staticInstruction))
+	}
 	liteforgeIns, err := NewLiteForge(cfg.id, liteForgeOpts...)
 	if err != nil {
 		return nil, utils.Errorf("new liteforge failed: %s", err)
@@ -290,6 +372,12 @@ func _executeLiteForgeTemp(query string, opts ...any) (*ForgeResult, error) {
 // SOME_CONTENT
 // PROMPT, liteforge.id("my-forge-instance"))
 // ```
+//
+// 参数:
+//   - id: liteforge 实例 ID
+//
+// 返回值:
+//   - liteforge 执行可选项
 func _withID(id string) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		cfg.id = id
@@ -305,6 +393,12 @@ func _withID(id string) LiteForgeExecOption {
 // SOME_CONTENT
 // PROMPT, liteforge.context(ctx))
 // ```
+//
+// 参数:
+//   - ctx: 上下文，用于控制取消与超时
+//
+// 返回值:
+//   - liteforge 执行可选项
 func LiteForgeExecWithContext(ctx context.Context) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		cfg.ctx = ctx
@@ -320,6 +414,12 @@ func LiteForgeExecWithContext(ctx context.Context) LiteForgeExecOption {
 // SOME_CONTENT
 // PROMPT, liteforge.verboseName("my-forge-instance"))
 // ```
+//
+// 参数:
+//   - opts: 一个或多个底层 aicommon 配置选项
+//
+// 返回值:
+//   - liteforge 执行可选项
 func _withVerboseName(opts ...aicommon.ConfigOption) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		cfg.aidOptions = append(cfg.aidOptions, opts...)
@@ -327,10 +427,31 @@ func _withVerboseName(opts ...aicommon.ConfigOption) LiteForgeExecOption {
 }
 
 // liteforge.speedPriority uses a faster/cheaper AI model for distillation tasks
+// 参数:
+//   - b: 是否启用速度优先，缺省为 true
+//
+// 返回值:
+//   - liteforge 执行可选项
+//
+// Example:
+// ```
+// opt = liteforge.speedPriority(true)
+// println(opt)
+// ```
 func _withSpeedPriority(b ...bool) LiteForgeExecOption {
 	return func(cfg *liteforgeConfig) {
 		if len(b) == 0 || b[0] {
 			cfg.speedPriority = true
 		}
+	}
+}
+
+// LiteForgeExecWithStaticInstruction 是 B 档新增 LiteForgeExecOption
+// 携带系统侧静态指令到 _executeLiteForgeTemp 路径，最终通过 WithLiteForge_StaticInstruction
+// 进入 LiteForge 的 high-static 段，跨调用稳定哈希
+// 关键词: aicache, PROMPT_SECTION, StaticInstruction, LiteForgeExecWithStaticInstruction, B 档
+func LiteForgeExecWithStaticInstruction(s string) LiteForgeExecOption {
+	return func(cfg *liteforgeConfig) {
+		cfg.staticInstruction = s
 	}
 }

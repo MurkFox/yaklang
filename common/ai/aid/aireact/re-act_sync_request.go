@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
+	"github.com/yaklang/yaklang/common/ai/aid/aireact/reactloops"
 	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
@@ -32,6 +34,14 @@ func (r *ReAct) handleSyncMessage(event *ypb.AIInputEvent) error {
 		return r.HandleSyncTypeReactClearTaskEvent(event)
 	case SYNC_TYPE_RECOVERY_PLAN_AND_EXEC:
 		return r.HandleSyncTypeRecoveryPlanAndExecEvent(event)
+	case SYNC_TYPE_EXECUTE_DETACHED_PLAN:
+		return r.HandleSyncTypeExecuteDetachedPlanEvent(event)
+	case aicommon.SYNC_TYPE_CAPABILITY_INVENTORY:
+		return r.HandleSyncTypeCapabilityInventoryEvent(event)
+	case aicommon.SYNC_TYPE_PERCEPTION:
+		return r.HandleSyncTypePerceptionEvent(event)
+	case aicommon.SYNC_TYPE_SESSION_SNAPSHOT:
+		return r.HandleSyncTypeSessionSnapshotEvent(event)
 	default:
 		return fmt.Errorf("unsupported sync type: %s", event.SyncType)
 	}
@@ -46,6 +56,10 @@ func (r *ReAct) RegisterReActSyncEvent() {
 	r.config.InputEventManager.RegisterSyncCallback(SYNC_TYPE_REACT_CLEAR_TASK, r.HandleSyncTypeReactClearTaskEvent)
 	r.config.InputEventManager.RegisterSyncCallback(SYNC_TYPE_REACT_CANCEL_TASK, r.HandleSyncTypeCancelTaskEvent)
 	r.config.InputEventManager.RegisterSyncCallback(SYNC_TYPE_RECOVERY_PLAN_AND_EXEC, r.HandleSyncTypeRecoveryPlanAndExecEvent)
+	r.config.InputEventManager.RegisterSyncCallback(SYNC_TYPE_EXECUTE_DETACHED_PLAN, r.HandleSyncTypeExecuteDetachedPlanEvent)
+	r.config.InputEventManager.RegisterSyncCallback(aicommon.SYNC_TYPE_CAPABILITY_INVENTORY, r.HandleSyncTypeCapabilityInventoryEvent)
+	r.config.InputEventManager.RegisterSyncCallback(aicommon.SYNC_TYPE_PERCEPTION, r.HandleSyncTypePerceptionEvent)
+	r.config.InputEventManager.RegisterSyncCallback(aicommon.SYNC_TYPE_SESSION_SNAPSHOT, r.HandleSyncTypeSessionSnapshotEvent)
 }
 
 func (r *ReAct) UnRegisterReActSyncEvent() {
@@ -57,9 +71,11 @@ func (r *ReAct) UnRegisterReActSyncEvent() {
 	r.config.InputEventManager.UnregisterMirrorOfAIInputEvent(SYNC_TYPE_REACT_CLEAR_TASK)
 	r.config.InputEventManager.UnRegisterSyncCallback(SYNC_TYPE_REACT_CANCEL_TASK)
 	r.config.InputEventManager.UnRegisterSyncCallback(SYNC_TYPE_RECOVERY_PLAN_AND_EXEC)
+	r.config.InputEventManager.UnRegisterSyncCallback(SYNC_TYPE_EXECUTE_DETACHED_PLAN)
+	r.config.InputEventManager.UnRegisterSyncCallback(aicommon.SYNC_TYPE_CAPABILITY_INVENTORY)
+	r.config.InputEventManager.UnRegisterSyncCallback(aicommon.SYNC_TYPE_PERCEPTION)
+	r.config.InputEventManager.UnRegisterSyncCallback(aicommon.SYNC_TYPE_SESSION_SNAPSHOT)
 }
-
-// 单独拆分的 handler 函数
 
 func (r *ReAct) HandleSyncTypeQueueInfoEvent(event *ypb.AIInputEvent) error {
 	// 获取队列信息并通过事件发送
@@ -96,6 +112,7 @@ func (r *ReAct) HandleSyncTypeKnowledgeEvent(event *ypb.AIInputEvent) error {
 func (r *ReAct) HandleSyncTypeRecoveryPlanAndExecEvent(event *ypb.AIInputEvent) error {
 	sessionID := r.config.PersistentSessionId
 	coordinatorID := ""
+	startTaskIndex := ""
 	if event.SyncJsonInput != "" {
 		var params map[string]interface{}
 		if err := json.Unmarshal([]byte(event.SyncJsonInput), &params); err != nil {
@@ -107,6 +124,9 @@ func (r *ReAct) HandleSyncTypeRecoveryPlanAndExecEvent(event *ypb.AIInputEvent) 
 		}
 		if cid, ok := params["coordinator_id"].(string); ok && cid != "" {
 			coordinatorID = cid
+		}
+		if idx, ok := params["start_task_index"].(string); ok && idx != "" {
+			startTaskIndex = idx
 		}
 	}
 	if coordinatorID == "" {
@@ -127,12 +147,13 @@ func (r *ReAct) HandleSyncTypeRecoveryPlanAndExecEvent(event *ypb.AIInputEvent) 
 		return nil
 	}
 	r.EmitSyncEvent("recover_plan_and_exec", map[string]interface{}{
-		"started":        true,
-		"session_id":     sessionID,
-		"coordinator_id": coordinatorID,
+		"started":          true,
+		"session_id":       sessionID,
+		"coordinator_id":   coordinatorID,
+		"start_task_index": startTaskIndex,
 	}, event.SyncID)
 
-	go r.AsyncRecoverPlanAndExecute(r.config.Ctx, coordinatorID, func(err error) {
+	go r.AsyncRecoverPlanAndExecute(r.config.Ctx, coordinatorID, startTaskIndex, func(err error) {
 		if err != nil {
 			log.Errorf("recover plan-and-exec failed: %v", err)
 		}
@@ -343,4 +364,47 @@ func (r *ReAct) HandleSyncTypeReactClearTaskEvent(event *ypb.AIInputEvent) error
 	r.taskQueue.Clear()
 	r.EmitSyncEvent(REACT_TASK_clear, fmt.Sprintf("clear react tas queue at %s", time.Now().String()), event.SyncID)
 	return nil
+}
+
+func (r *ReAct) HandleSyncTypeCapabilityInventoryEvent(event *ypb.AIInputEvent) error {
+	payload := reactloops.BuildCapabilityInventoryPayload(r.config, r.GetCurrentLoop())
+	taskIndex := aicommon.BuildVerificationTodoScope(r.GetCurrentTask()).TaskIndex
+	_, _ = r.EmitSyncJSONWithTaskIndex(schema.EVENT_TYPE_STRUCTURED, aicommon.CapabilityInventoryNodeID, payload, event.SyncID, taskIndex)
+	return nil
+}
+
+func (r *ReAct) HandleSyncTypePerceptionEvent(event *ypb.AIInputEvent) error {
+	var state *reactloops.PerceptionState
+	if loop := r.GetCurrentLoop(); loop != nil {
+		state = loop.GetPerceptionState()
+	}
+	_, _ = r.EmitSyncJSON(schema.EVENT_TYPE_PERCEPTION, "perception", perceptionStateToSyncPayload(state), event.SyncID)
+	return nil
+}
+
+func (r *ReAct) HandleSyncTypeSessionSnapshotEvent(event *ypb.AIInputEvent) error {
+	snapshot := reactloops.BuildSessionSnapshot(r.config, r.GetCurrentLoop(), r.GetCurrentTask())
+	taskIndex := aicommon.BuildVerificationTodoScope(r.GetCurrentTask()).TaskIndex
+	_, _ = r.EmitSyncJSONWithTaskIndex(schema.EVENT_TYPE_STRUCTURED, aicommon.SessionSnapshotNodeID, snapshot, event.SyncID, taskIndex)
+	return nil
+}
+
+func perceptionStateToSyncPayload(state *reactloops.PerceptionState) map[string]any {
+	if state == nil {
+		return map[string]any{"state": nil}
+	}
+	return map[string]any{
+		"state": map[string]any{
+			"topics":           state.Topics,
+			"keywords":         state.Keywords,
+			"summary":          state.OneLinerSummary,
+			"confidence":       state.ConfidenceLevel,
+			"changed":          state.Changed,
+			"epoch":            state.Epoch,
+			"last_trigger":     state.LastTrigger,
+			"last_update_at":   state.LastUpdateAt.Unix(),
+			"prev_topics_hash": state.PrevTopicsHash,
+			"intent_shift":     state.IntentShift,
+		},
+	}
 }

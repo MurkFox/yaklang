@@ -210,8 +210,22 @@ var loopAction_LoadingSkills = &reactloops.LoopAction{
 			for _, name := range loaded {
 				emitSkillReferenceMaterial(invoker, name, mgr)
 			}
+			if cfg, ok := invoker.GetConfig().(*aicommon.Config); ok {
+				aicommon.NotifySessionSnapshotEmit(cfg, true)
+			}
 
-			op.Feedback(fmt.Sprintf("Batch loading complete. %s", summary))
+			var recommendationLines []string
+			for _, name := range loaded {
+				if summary := recommendCapabilitiesFromSkillContent(loop, invoker, name, "Skill "+name); summary != "" {
+					recommendationLines = append(recommendationLines, fmt.Sprintf("%s => %s", name, summary))
+				}
+			}
+
+			feedbackMsg := fmt.Sprintf("Batch loading complete. %s", summary)
+			if len(recommendationLines) > 0 {
+				feedbackMsg += " Referenced capabilities: " + strings.Join(recommendationLines, " | ")
+			}
+			op.Feedback(feedbackMsg)
 			op.Continue()
 			return
 		}
@@ -411,6 +425,10 @@ var loopAction_LoadingSkills = &reactloops.LoopAction{
 
 		persistLoadedSkillNames(loop, invoker)
 		emitSkillReferenceMaterial(invoker, skillName, mgr)
+		if cfg, ok := invoker.GetConfig().(*aicommon.Config); ok {
+			aicommon.NotifySessionSnapshotEmit(cfg, true)
+		}
+		recommendationSummary := recommendCapabilitiesFromSkillContent(loop, invoker, skillName, "Skill "+skillName)
 
 		feedbackMsg := fmt.Sprintf(
 			"Skill '%s' loaded. SKILL.md: %.1fKB | %d files available. "+
@@ -419,6 +437,9 @@ var loopAction_LoadingSkills = &reactloops.LoopAction{
 				"Do NOT load this skill again.",
 			skillName, contextExpansionKB, fileCount, skillName,
 		)
+		if recommendationSummary != "" {
+			feedbackMsg += " Related capabilities mentioned in SKILL.md: " + recommendationSummary
+		}
 		op.Feedback(feedbackMsg)
 		op.Continue()
 	},

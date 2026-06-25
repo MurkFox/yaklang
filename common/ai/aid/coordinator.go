@@ -25,6 +25,7 @@ import (
 // PlanExecutingLoadingStatusKey is the key used to emit loading status events for plan execution
 // Similar to ReActLoadingStatusKey in reactloops, this allows UI to show current execution phase
 const PlanExecutingLoadingStatusKey = "plan-executing-loading-status-key"
+const RecoveryStartTaskIndexConfigKey = "recovery_start_task_index"
 
 // CoordinatorOption 定义配置 Coordinator 的选项接口
 type CoordinatorOption func(c *Coordinator)
@@ -54,16 +55,50 @@ func WithPromptContextProvider(provider *PromptContextProvider) aicommon.ConfigO
 	}
 }
 
+// WithResultHandler 设置协调器执行结束后的结果处理回调（导出名为 aiagent.resultHandler）
 // cycle import issue
+// 参数:
+//   - h: 结果处理函数，参数为协调器对象
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.resultHandler(func(coordinator) { println("done") })
+// println(opt)
+// ```
 func WithResultHandler(h func(c *Coordinator)) aicommon.ConfigOption {
 	return func(config *aicommon.Config) error {
 		return aicommon.WithAppendOtherOption(WithCoordinatorResultHandler(h))(config)
 	}
 }
 
+// WithPlanMocker 设置协调器的计划生成器，用于自定义/模拟任务计划（导出名为 aiagent.plan）
+// 参数:
+//   - i: 计划生成函数，参数为协调器，返回计划响应
+//
+// 返回值:
+//   - 配置选项
+//
+// Example:
+// ```
+// opt = aiagent.plan(func(coordinator) { return nil })
+// println(opt)
+// ```
 func WithPlanMocker(i func(coordinator *Coordinator) *PlanResponse) aicommon.ConfigOption {
 	return func(config *aicommon.Config) error {
 		return aicommon.WithAppendOtherOption(WithCoordinatorPlanMocker(i))(config)
+	}
+}
+
+func WithRecoveryStartTaskIndex(index string) aicommon.ConfigOption {
+	return func(config *aicommon.Config) error {
+		if config == nil {
+			return nil
+		}
+		config.SetConfig(RecoveryStartTaskIndexConfigKey, strings.TrimSpace(index))
+		return nil
 	}
 }
 
@@ -143,7 +178,16 @@ func (c *Coordinator) enableTaskAnalyze() {
 				},
 			}
 
-			action, err := ExecuteAIForge(c.Ctx, "task-analyst", param, aicommon.WithAICallback(c.OriginalAICallback))
+			// 关键词: enableTaskAnalyze, ai.usageCallback 透传, WithUserUsageCallback
+			// task-analyst 子 coordinator 走 WithFastAICallback path, 需把父 Coordinator
+			// 注册的 user UsageCallback 一并继承, 否则 token usage 不会触达 ai.usageCallback.
+			analystOpts := []aicommon.ConfigOption{
+				aicommon.WithFastAICallback(c.GetOriginalAICallback()),
+			}
+			if userUsageCb := c.Config.GetUserUsageCallback(); userUsageCb != nil {
+				analystOpts = append(analystOpts, aicommon.WithUserUsageCallback(userUsageCb))
+			}
+			action, err := ExecuteAIForge(c.Ctx, "task-analyst", param, analystOpts...)
 			if err != nil {
 				return
 			}
@@ -197,6 +241,13 @@ func (c *Coordinator) GetContextProvider() *PromptContextProvider {
 	return c.ContextProvider
 }
 
+func (c *Coordinator) getRecoveryStartTaskIndex() string {
+	if c == nil || c.Config == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.GetConfigString(RecoveryStartTaskIndexConfigKey))
+}
+
 func (c *Coordinator) getCurrentTaskPlan() *AiTask {
 	return c.runtime.RootTask
 }
@@ -246,7 +297,8 @@ func (c *Coordinator) HandleSearch(query string, items *omap.OrderedMap[string, 
 				return nil
 			}
 			return utils.Errorf("no tool found")
-		})
+		},
+		aicommon.WithAIRequest_CallerLabel("keyword-search"))
 	if err != nil {
 		return nil, err
 	}
@@ -330,148 +382,40 @@ func (c *Coordinator) CallAITransaction(prompt string, postHandler func(response
 	}, requestOpts...)
 }
 
+func (c *Coordinator) emitBaseCapabilityInventory() {
+	if c == nil || c.Config == nil || c.GetEmitter() == nil {
+		return
+	}
+	_, _ = c.GetEmitter().EmitSystemStructured(
+		aicommon.CapabilityInventoryNodeID,
+		aicommon.BuildBaseCapabilityInventoryPayload(c.Config),
+	)
+}
+
 func (c *Coordinator) Run() error {
 	c.planLoadingStatus("初始化 / Initializing...")
-	defer c.planLoadingStatus("end")
+	defer c.planLoadingStatus("任务规划执行结束 / Plan Execution Finished")
 
 	c.registerPEModeInputEventCallback()
 	c.EmitCurrentConfigInfo()
+	c.emitBaseCapabilityInventory()
 
-	executeRoot := func(root *AiTask) error {
-		// Phase 6: Executing tasks
-		c.planLoadingStatus("执行任务中 / Executing Tasks...")
-		c.EmitInfo("start to create runtime")
-		rt := c.createRuntime()
-		c.runtime = rt
-		err := rt.Invoke(root)
-		if err != nil {
-			c.planLoadingStatus("任务执行失败 / Task Execution Failed")
-			return err
-		}
-		return nil
-	}
-
-	// Recovery: try resume from persisted plan-exec state
-	recovered := false
-	if recoveredRoot, _, ok := c.tryRecoverPlanAndExec(); ok {
-		c.planLoadingStatus("恢复执行 / Recovering Execution...")
-		c.rootTask = recoveredRoot
-		c.ContextProvider.StoreRootTask(recoveredRoot)
-		if len(recoveredRoot.Subtasks) <= 0 {
-			c.planLoadingStatus("无有效子任务 / No Valid Subtasks")
-			c.EmitError("no subtasks found in recovered task tree")
-			return utils.Errorf("coordinator: no subtasks found in recovered task tree")
-		}
-		if err := executeRoot(recoveredRoot); err != nil {
-			return err
-		}
-		recovered = true
+	recoveryStartTaskIndex := c.getRecoveryStartTaskIndex()
+	recovered, err := c.tryRecoverAndExecute(recoveryStartTaskIndex)
+	if err != nil {
+		return err
 	}
 
 	if !recovered {
-		// Phase 1: Creating plan
-		c.planLoadingStatus("创建任务计划 / Creating Plan...")
-		c.EmitInfo("start to create plan request")
-		planReq, err := c.createPlanRequest(c.userInput)
-		if err != nil {
-			c.planLoadingStatus("计划创建失败 / Plan Creation Failed")
-			c.EmitError("create planRequest failed: %v", err)
-			return utils.Errorf("coordinator: create planRequest failed: %v", err)
+		if err := c.runPlanPhaseThroughReview(); err != nil {
+			return err
 		}
-
-		// Phase 2: Invoking plan (AI generating plan)
-		c.planLoadingStatus("等待 AI 生成计划 / Waiting AI to Generate Plan...")
-		c.EmitInfo("start to invoke plan request")
-		rsp, err := planReq.Invoke()
-		if err != nil {
-			c.planLoadingStatus("计划生成失败 / Plan Generation Failed")
-			c.EmitError("invoke planRequest failed(first): %v", err)
-			return utils.Errorf("coordinator: invoke planRequest failed: %v", err)
-		}
-
-		// Phase 3: Waiting for user review
-		c.planLoadingStatus("等待用户审查计划 / Waiting User to Review Plan...")
-		ep := c.Epm.CreateEndpointWithEventType(schema.EVENT_TYPE_PLAN_REVIEW_REQUIRE)
-		ep.SetDefaultSuggestionContinue()
-
-		c.EmitRequireReviewForPlan(rsp, ep.GetId())
-		c.DoWaitAgree(c.GetContext(), ep)
-		params := ep.GetParams()
-		c.ReleaseInteractiveEvent(ep.GetId(), params)
-		if params == nil {
-			c.planLoadingStatus("用户审查失败 / User Review Failed")
-			c.EmitError("user review params is nil, plan failed")
-			return utils.Errorf("coordinator: user review params is nil")
-		}
-
-		// Phase 4: Processing user review
-		c.planLoadingStatus("处理用户审查结果 / Processing User Review...")
-		c.EmitInfo("start to handle review plan response")
-		rsp, err = planReq.handleReviewPlanResponse(rsp, params)
-		if err != nil {
-			c.planLoadingStatus("处理审查结果失败 / Review Processing Failed")
-			c.EmitError("handle review plan response failed: %v", err)
-			return utils.Errorf("coordinator: handle review plan response failed: %v", err)
-		}
-
-		if rsp.RootTask == nil {
-			c.planLoadingStatus("任务计划无效 / Invalid Task Plan")
-			c.EmitError("root aiTask is nil, plan failed")
-			return utils.Errorf("coordinator: root aiTask is nil")
-		}
-
-		// Phase 5: Initializing tasks
-		c.planLoadingStatus("初始化任务队列 / Initializing Task Queue...")
-		root := rsp.RootTask
-		c.rootTask = root
-		c.ContextProvider.StoreRootTask(root)
-		c.savePlanAndExecState("plan_ready", nil)
-		if len(root.Subtasks) <= 0 {
-			c.planLoadingStatus("无有效子任务 / No Valid Subtasks")
-			c.EmitError("no subtasks found, this task is not a valid task")
-			return utils.Errorf("coordinator: no subtasks found")
-		}
-		log.Infof("create aiTask pipeline: %v", root.Name)
-		for stepIdx, taskIns := range root.Subtasks {
-			log.Infof("step %d: %v", stepIdx, taskIns.Name)
-		}
-		alltools, err := c.AiToolManager.GetEnableTools()
-		if err != nil {
-			log.Warnf("coordinator: get all tools failed: %v", err)
-		}
-		if len(alltools) <= 0 {
-			log.Warnf("coordinator: no tools enable")
-		}
-
-		if err := executeRoot(root); err != nil {
+		if err := c.runExecuteRoot(""); err != nil {
 			return err
 		}
 	}
 
-	// Phase 7: Generating result/report
-	c.planLoadingStatus("生成执行结果 / Generating Results...")
-	/*
-		Result Handler
-		Result Handler 是用户自定义的回调函数，用于处理 AI 的输出结果。
-		用户可以在这个回调函数中处理 AI 的输出结果，或者将结果存储到数据库中。
-	*/
-	if c.ResultHandler != nil {
-		c.ResultHandler(c)
-	} else if c.GenerateReport {
-		c.planLoadingStatus("进入报告生成专注模式 / Entering Report Generation Focus Mode...")
-		c.EmitInfo("start report generation via focus mode loop")
-		if err := c.generateReportViaFocusMode(); err != nil {
-			c.planLoadingStatus("报告生成失败 / Report Generation Failed")
-			c.EmitError("report generation via focus mode failed: %v", err)
-			return utils.Errorf("coordinator: report generation failed: %v", err)
-		}
-	}
-
-	// Phase 8: Completed
-	c.planLoadingStatus("执行完成 / Execution Completed")
-	c.EmitInfo("coordinator run finished")
-	c.Wait()
-	return nil
+	return c.runReportAndFinishPhases()
 }
 
 func (c *Coordinator) GetPromptContextProvider() *PromptContextProvider {
@@ -609,17 +553,27 @@ func (c *Coordinator) FindSubtaskByIndex(index string) *AiTask {
 }
 
 func (c *Coordinator) AppendTask(t *AiTask) {
-	r := c.runtime
-	task, ok := r.TaskLink.Get(r.currentIndex())
-	if !ok {
-		log.Warnf("coordinator: append task failed, current task not found")
+	if t == nil {
 		return
 	}
-	if parent := task.ParentTask; parent != nil {
-		t.ParentTask = parent
-		parent.Subtasks = append(parent.Subtasks, t)
-		c.standardizeTaskTreeAndNotify(parent, "task appended")
+
+	parent := t.ParentTask
+	if parent == nil && c.runtime != nil {
+		currentTask, err := c.runtime.currentInteractiveTask()
+		if err != nil {
+			log.Warnf("coordinator: append task failed, current task unavailable: %v", err)
+			return
+		}
+		parent = currentTask.ParentTask
 	}
+	if parent == nil {
+		log.Warnf("coordinator: append task failed, parent task not found")
+		return
+	}
+
+	t.ParentTask = parent
+	parent.Subtasks = append(parent.Subtasks, t)
+	c.standardizeTaskTreeAndNotify(parent, "task appended")
 }
 
 // HandleSkipSubtaskInPlan 处理跳过子任务的同步事件
@@ -669,10 +623,13 @@ func (c *Coordinator) HandleSkipSubtaskInPlan(event *ypb.AIInputEvent) error {
 	subtaskIndex := utils.InterfaceToString(params["subtask_index"])
 	if subtaskIndex == "" {
 		if utils.InterfaceToBoolean(params["skip_current_task"]) {
-			// 跳过当前任务
-			currentTask, ok := c.runtime.TaskLink.Get(c.runtime.currentIndex())
-			if !ok || currentTask == nil {
-				sendFailResponse("no current task found to skip")
+			currentTask, err := c.runtime.currentInteractiveTask()
+			if err != nil || currentTask == nil {
+				if err != nil {
+					sendFailResponse("no unambiguous current task found to skip: " + err.Error())
+				} else {
+					sendFailResponse("no current task found to skip")
+				}
 				return nil
 			}
 			subtaskIndex = currentTask.Index
@@ -694,6 +651,7 @@ func (c *Coordinator) HandleSkipSubtaskInPlan(event *ypb.AIInputEvent) error {
 
 	// 幂等检查：如果任务已经是 Skipped 状态，不重复处理
 	if task.GetStatus() == aicommon.AITaskState_Skipped {
+		sendFailResponse("subtask already skipped: " + subtaskIndex)
 		return nil
 	}
 

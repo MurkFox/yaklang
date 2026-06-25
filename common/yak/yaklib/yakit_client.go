@@ -73,6 +73,18 @@ type YakitClient struct {
 	runtimeID string
 }
 
+// NewYakitClient 基于 webhook 地址创建一个 Yakit 客户端（导出名为 yakit.NewClient）
+// 参数:
+//   - addr: Yakit webhook 地址，为空时输出回退到日志
+//
+// 返回值:
+//   - Yakit 客户端对象
+//
+// Example:
+// ```
+// client = yakit.NewClient("http://127.0.0.1:8080/webhook")
+// yakit.InitYakit(client)
+// ```
 func NewYakitClient(addr string) *YakitClient {
 	logger := CreateYakLogger()
 	client := &YakitClient{
@@ -173,6 +185,34 @@ func (c *YakitClient) YakitDraw(level string, data interface{}) {
 		log.Error(err)
 	}
 }
+
+// Output 向 Yakit 输出任意可识别对象（自动按类型选择输出通道，导出名为 yakit.Output）
+//
+// 这是 Yakit 结构化输出的统一入口：传入对象后会按其类型自动选择正确的展示通道，无需关心底层协议。
+// 支持的对象类型包括：yakit.NewTable 表格、yakit.New*Graph 图表、风险(risk)、HTTP 流量(schema.HTTPFlow)、
+// 指纹扫描结果(servicescan/fp.MatchResult)、状态卡片、表格行(yakit.TableData) 等。
+// 这意味着可以把扫描器的原生结果对象直接 Output 出去，由 Yakit 渲染成对应的卡片/表格。
+//
+// 参数:
+//   - i: 要输出的对象（表格、图表、扫描结果对象等）
+//
+// 返回值:
+//   - 错误信息（输出失败时返回）
+//
+// Example:
+// ```
+// // 1) 输出表格与图表
+// table = yakit.NewTable("host", "port")
+// table.Append("10.0.0.1", "80")
+// yakit.Output(table)
+//
+// pie = yakit.NewPieGraph("severity"); pie.Add("high", 3); pie.Add("low", 7)
+// yakit.Output(pie)
+//
+// // 2) 联动：把 servicescan 的原生结果对象直接 Output，由 Yakit 渲染为指纹卡片
+// // （端口扫描依赖网络，示意性示例）
+// // for result in servicescan.Scan("127.0.0.1", "80")~ { yakit.Output(result) }
+// ```
 func (c *YakitClient) Output(i interface{}) error {
 	level, msg := MarshalYakitOutput(i)
 	return c.YakitLog(level, msg)

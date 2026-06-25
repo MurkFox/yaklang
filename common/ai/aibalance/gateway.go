@@ -9,6 +9,7 @@ import (
 
 	"github.com/yaklang/yaklang/common/ai/aispec"
 	"github.com/yaklang/yaklang/common/aibalanceclient"
+	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils/lowhttp/poc"
 )
@@ -137,12 +138,20 @@ func (g *GatewayClient) Chat(s string, function ...any) (string, error) {
 		aispec.WithChatBase_ReasonStreamHandler(g.config.ReasonStreamHandler),
 		aispec.WithChatBase_ErrHandler(wrappedErrorHandler),
 		aispec.WithChatBase_ImageRawInstance(g.config.Images...),
-		aispec.WithChatBase_EnableThinkingEx(g.config.EnableThinking, g.config.EnableThinkingField, g.config.EnableThinkingValue),
+		aispec.ChatBaseThinkingOptions(g.config, g.targetUrl),
+		aispec.WithChatBase_AISamplingFromConfig(g.config),
 		aispec.WithChatBase_Tools(g.config.Tools),
 		aispec.WithChatBase_ToolChoice(g.config.ToolChoice),
 		aispec.WithChatBase_ToolCallCallback(g.config.ToolCallCallback),
+		aispec.WithChatBase_RawHTTPResponseHeaderCallback(g.config.RawHTTPResponseHeaderCallback),
 		aispec.WithChatBase_RawHTTPResponseCallback(g.config.RawHTTPResponseCallback),
 		aispec.WithChatBase_RawHTTPRequestResponseCallback(g.config.RawHTTPRequestResponseCallback),
+		aispec.WithChatBase_RawMessages(g.config.RawMessages),
+		// UsageCallback 透传：yak 用户脚本通过 ai.type("aibalance") + ai.usageCallback(...)
+		// 注册的回调，需要这里透传到 ChatBase，才能在 SSE 末帧解析出 usage 时被回调，
+		// 从而读取 aibalance server 端 WriteUsage 发回来的 cached_tokens 等隐式缓存信息。
+		// 关键词: aibalance GatewayClient UsageCallback 透传, cached_tokens 端到端
+		aispec.WithChatBase_UsageCallback(g.config.UsageCallback),
 	)
 
 	// 检查是否是 TOTP 认证失败（需要刷新密钥并重试）
@@ -164,12 +173,16 @@ func (g *GatewayClient) Chat(s string, function ...any) (string, error) {
 			aispec.WithChatBase_ReasonStreamHandler(g.config.ReasonStreamHandler),
 			aispec.WithChatBase_ErrHandler(wrappedErrorHandler),
 			aispec.WithChatBase_ImageRawInstance(g.config.Images...),
-			aispec.WithChatBase_EnableThinkingEx(g.config.EnableThinking, g.config.EnableThinkingField, g.config.EnableThinkingValue),
+			aispec.ChatBaseThinkingOptions(g.config, g.targetUrl),
+			aispec.WithChatBase_AISamplingFromConfig(g.config),
 			aispec.WithChatBase_Tools(g.config.Tools),
 			aispec.WithChatBase_ToolChoice(g.config.ToolChoice),
 			aispec.WithChatBase_ToolCallCallback(g.config.ToolCallCallback),
+			aispec.WithChatBase_RawHTTPResponseHeaderCallback(g.config.RawHTTPResponseHeaderCallback),
 			aispec.WithChatBase_RawHTTPResponseCallback(g.config.RawHTTPResponseCallback),
 			aispec.WithChatBase_RawHTTPRequestResponseCallback(g.config.RawHTTPRequestResponseCallback),
+			aispec.WithChatBase_RawMessages(g.config.RawMessages),
+			aispec.WithChatBase_UsageCallback(g.config.UsageCallback),
 		)
 	}
 
@@ -253,7 +266,8 @@ func (g *GatewayClient) ChatStream(s string) (io.Reader, error) {
 	reader, err := aispec.ChatWithStream(
 		g.targetUrl, g.config.Model, s, wrappedErrorHandler, g.config.ReasonStreamHandler,
 		g.BuildHTTPOptions,
-		aispec.WithChatBase_EnableThinkingEx(g.config.EnableThinking, g.config.EnableThinkingField, g.config.EnableThinkingValue),
+		aispec.ChatBaseThinkingOptions(g.config, g.targetUrl),
+		aispec.WithChatBase_AISamplingFromConfig(g.config),
 	)
 
 	// 检查是否是 TOTP 认证失败
@@ -267,7 +281,8 @@ func (g *GatewayClient) ChatStream(s string) (io.Reader, error) {
 		return aispec.ChatWithStream(
 			g.targetUrl, g.config.Model, s, wrappedErrorHandler, g.config.ReasonStreamHandler,
 			g.BuildHTTPOptions,
-			aispec.WithChatBase_EnableThinkingEx(g.config.EnableThinking, g.config.EnableThinkingField, g.config.EnableThinkingValue),
+			aispec.ChatBaseThinkingOptions(g.config, g.targetUrl),
+			aispec.WithChatBase_AISamplingFromConfig(g.config),
 		)
 	}
 
@@ -427,6 +442,25 @@ func (g *GatewayClient) BuildHTTPOptions() ([]poc.PocConfigOption, error) {
 		"Authorization":   "Bearer " + g.config.APIKey,
 	}
 
+	// 注入客户端版本与构建时间，供 aibalance memfit 版本控流使用
+	// 关键词: X-Yak-Version X-Yak-Build-Time 客户端版本上报, memfit version gate
+	yakVer := consts.GetYakVersion()
+	if yakVer == "" {
+		yakVer = "unknown"
+	}
+	headers["X-Yak-Version"] = yakVer
+	if bt := consts.GetYakBuildTime(); bt != "" {
+		headers["X-Yak-Build-Time"] = bt
+	}
+
+	// 注入本次请求的模型用途类型(tier)，供 aibalance 服务端做用量保护降级
+	// （如 lightweight 调用 memfit-standard-free 自动降级到 memfit-light-free）。
+	// 仅在 aibalance gateway 注入，不会泄漏给第三方 provider。
+	// 关键词: X-Yak-AI-Model-Usage-Type 上报, ModelUsageType tier, 用量降级
+	if usageType := strings.TrimSpace(g.config.ModelUsageType); usageType != "" {
+		headers["X-Yak-AI-Model-Usage-Type"] = usageType
+	}
+
 	// Add TOTP header for memfit models
 	if g.isMemfitModel() {
 		totpCode := g.generateTOTPCode()
@@ -446,6 +480,7 @@ func (g *GatewayClient) BuildHTTPOptions() ([]poc.PocConfigOption, error) {
 		poc.WithConnPool(true), // enable connection pool for better performance
 		poc.WithSave(false),    // do not save AI chat requests to database
 	}
+	opts = aispec.AppendCustomHeadersToPocOptions(opts, aispec.ExtraHeadersToMap(g.config.Headers))
 	opts = append(opts, poc.WithTimeout(g.config.Timeout))
 	if g.config.Proxy != "" {
 		opts = append(opts, poc.WithProxy(g.config.Proxy))

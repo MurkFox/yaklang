@@ -2,7 +2,6 @@ package aihttp
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 	"sync"
 	"time"
@@ -13,11 +12,11 @@ import (
 )
 
 type RunSession struct {
-	RunID  string
-	Status RunStatus
-	Params AIParams
+	RunID       string
+	Status      RunStatus
+	StartParams *ypb.AIInputEvent
 
-	subscribers   map[string]chan RunEvent
+	subscribers   map[string]chan *ypb.AIOutputEvent
 	subscribersMu sync.RWMutex
 
 	inputChan *chanx.UnlimitedChan[*ypb.AIInputEvent]
@@ -33,16 +32,16 @@ type RunSession struct {
 	Error      string
 }
 
-func NewRunSession(parentCtx context.Context, runID string, params AIParams) *RunSession {
+func NewRunSession(parentCtx context.Context, runID string, startParams *ypb.AIInputEvent) *RunSession {
 	ctx, cancel := context.WithCancel(parentCtx)
 	if runID == "" {
-		runID = uuid.New().String()
+		runID = uuid.NewString()
 	}
 	return &RunSession{
 		RunID:       runID,
 		Status:      RunStatusPending,
-		Params:      params,
-		subscribers: make(map[string]chan RunEvent),
+		StartParams: startParams,
+		subscribers: make(map[string]chan *ypb.AIOutputEvent),
 		inputChan:   chanx.NewUnlimitedChan[*ypb.AIInputEvent](ctx, 10),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -50,7 +49,10 @@ func NewRunSession(parentCtx context.Context, runID string, params AIParams) *Ru
 	}
 }
 
-func (rs *RunSession) AddEvent(e RunEvent) {
+func (rs *RunSession) AddEvent(e *ypb.AIOutputEvent) {
+	if e == nil {
+		return
+	}
 	rs.subscribersMu.RLock()
 	defer rs.subscribersMu.RUnlock()
 	for _, ch := range rs.subscribers {
@@ -62,9 +64,9 @@ func (rs *RunSession) AddEvent(e RunEvent) {
 	}
 }
 
-func (rs *RunSession) Subscribe() (string, chan RunEvent) {
-	id := uuid.New().String()
-	ch := make(chan RunEvent, 256)
+func (rs *RunSession) Subscribe() (string, chan *ypb.AIOutputEvent) {
+	id := uuid.NewString()
+	ch := make(chan *ypb.AIOutputEvent, 256)
 
 	rs.subscribersMu.Lock()
 	rs.subscribers[id] = ch
@@ -97,7 +99,7 @@ func (rs *RunSession) MarkStreamStarted() bool {
 }
 
 func (rs *RunSession) Complete(err error) {
-	if rs.Status == RunStatusCancelled {
+	if rs.Status == RunStatusCompleted || rs.Status == RunStatusFailed || rs.Status == RunStatusCancelled {
 		return
 	}
 
@@ -110,17 +112,13 @@ func (rs *RunSession) Complete(err error) {
 		rs.Status = RunStatusCompleted
 	}
 
-	doneEvent := RunEvent{
-		ID:        uuid.New().String(),
-		Type:      "done",
-		Timestamp: now.Unix(),
-	}
 	if err != nil {
-		doneEvent.Type = "error"
-		doneBytes, _ := json.Marshal(map[string]string{"error": err.Error()})
-		doneEvent.Content = string(doneBytes)
+		rs.AddEvent(newFailedOutputEvent(err))
+		rs.cancel()
+		return
 	}
-	rs.AddEvent(doneEvent)
+	rs.AddEvent(newResultOutputEvent(string(RunStatusCompleted)))
+	rs.cancel()
 }
 
 func (rs *RunSession) Cancel() {
@@ -131,14 +129,7 @@ func (rs *RunSession) Cancel() {
 	now := time.Now()
 	rs.FinishedAt = &now
 
-	doneEvent := RunEvent{
-		ID:        uuid.New().String(),
-		Type:      "done",
-		Timestamp: now.Unix(),
-	}
-	doneBytes, _ := json.Marshal(map[string]string{"status": "cancelled"})
-	doneEvent.Content = string(doneBytes)
-	rs.AddEvent(doneEvent)
+	rs.AddEvent(newResultOutputEvent(string(RunStatusCancelled)))
 
 	rs.cancel()
 }
@@ -156,14 +147,27 @@ func NewRunManager(ctx context.Context) *RunManager {
 	}
 }
 
-func (rm *RunManager) Create(runID string, params AIParams) *RunSession {
-	session := NewRunSession(rm.ctx, runID, params)
+func (rm *RunManager) Create(runID string, startParams *ypb.AIInputEvent) *RunSession {
+	session := NewRunSession(rm.ctx, runID, startParams)
 
 	rm.mu.Lock()
 	rm.sessions[session.RunID] = session
 	rm.mu.Unlock()
 
 	return session
+}
+
+func (rm *RunManager) GetOrCreate(runID string, factory func() *RunSession) (*RunSession, bool) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	if session, ok := rm.sessions[runID]; ok {
+		return session, false
+	}
+
+	session := factory()
+	rm.sessions[session.RunID] = session
+	return session, true
 }
 
 func (rm *RunManager) Get(runID string) (*RunSession, bool) {

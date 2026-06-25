@@ -12,6 +12,12 @@ name: Cross-Build-Yak
 # - yakit 版本: 排除 irify 功能，使用 irify_exclude build tag，文件名前缀为 yaklang_yakit_
 # - irify 版本: 排除 yakit 功能，使用 yakit_exclude build tag，文件名前缀为 yaklang_irify_
 # - 标准版本: 包含所有功能，使用默认 gzip_embed build tag，文件名前缀为 yak_
+#
+# Linux 兼容性:
+# - 仅在 go build 时用 docker run manylinux2014（glibc 2.17）；其余 CI 步骤在 Ubuntu runner 上执行
+#   （不能把 job 放进 manylinux 容器：Actions 的 Node 20 需要 GLIBC_2.27+，会在 checkout 阶段失败）
+# - 构建脚本: .github/scripts/build-linux-manylinux.sh
+# - github.com/yaklang/pcap 自带 libpcap.a，随主程序在同一 glibc 基线下链接，无需系统 libpcap
 
 on:
   workflow_dispatch:
@@ -94,15 +100,17 @@ jobs:
             CGO_ENABLED: 1
             GOOS: linux
             GOARCH: amd64
-            CC: x86_64-linux-gnu-gcc
+            runs-on: ubuntu-22.04
+            manylinux_image: quay.io/pypa/manylinux2014_x86_64
           - os: linux-arm64
             binary: yak_linux_arm64
             env: $GITHUB_ENV
             CGO_ENABLED: 1
             GOOS: linux
             GOARCH: arm64
-            CC: aarch64-linux-gnu-gcc
-    runs-on: ${{ contains(matrix.os, 'windows') && 'windows-latest' || 'macos-14' }}
+            runs-on: ubuntu-24.04-arm
+            manylinux_image: quay.io/pypa/manylinux2014_aarch64
+    runs-on: ${{ matrix.runs-on || (contains(matrix.os, 'windows') && 'windows-latest' || 'macos-14') }}
     steps:
       # build
       - uses: actions/checkout@v2
@@ -183,25 +191,21 @@ jobs:
           
           echo "Will try versions: ${VERSIONS_TO_TRY[*]}"
           
+          YAK_OSS_BASE="https://yaklang.oss-accelerate.aliyuncs.com"
+          
           # 依次尝试下载每个二进制名称和版本
           for BINARY_NAME in "${BINARY_NAMES[@]}"; do
             for VERSION in "${VERSIONS_TO_TRY[@]}"; do
-              DOWNLOAD_URL="https://aliyun-oss.yaklang.com/yak/${VERSION}/${BINARY_NAME}"
+              DOWNLOAD_URL="${YAK_OSS_BASE}/yak/${VERSION}/${BINARY_NAME}"
               echo "Trying to download from: $DOWNLOAD_URL"
               
-              # 下载文件并捕获 HTTP 状态码和错误
-              TEMP_STDERR=$(mktemp)
-              HTTP_CODE=$(curl -w "%{http_code}" -sS -L "$DOWNLOAD_URL" -o yak 2>"$TEMP_STDERR")
-              CURL_ERROR=$(cat "$TEMP_STDERR")
-              rm -f "$TEMP_STDERR"
+              # -# 输出进度条；stderr 保留在 CI 日志中便于排查
+              HTTP_CODE=$(curl -w "%{http_code}" -# -L "$DOWNLOAD_URL" -o yak)
               CURL_EXIT=$?
               
               # 检查 curl 是否成功
               if [ $CURL_EXIT -ne 0 ]; then
                 echo "❌ curl failed with exit code: $CURL_EXIT"
-                if [ -n "$CURL_ERROR" ]; then
-                  echo "Error: $CURL_ERROR"
-                fi
                 rm -f yak
                 continue
               fi
@@ -209,9 +213,6 @@ jobs:
               # 检查 HTTP 状态码
               if [ "$HTTP_CODE" != "200" ]; then
                 echo "❌ HTTP error: $HTTP_CODE"
-                if [ -n "$CURL_ERROR" ]; then
-                  echo "Response: $CURL_ERROR"
-                fi
                 rm -f yak
                 continue
               fi
@@ -352,31 +353,15 @@ jobs:
           Get-Content "${{ github.workspace }}\.github\patch_go122\48042aa09c2f878c4faa576948b07fe625c4707a.diff" | patch --verbose -R -p 1
           cd ${{ github.workspace }}
 
-      - name: Download CrossBuild GCC(Linux x64)
-        if: matrix.os == 'linux-amd64'
-        run: |
-          brew uninstall --ignore-dependencies --force pkg-config@0.29.2 || true
-          brew list coreutils >/dev/null 2>&1 || brew install coreutils
-          brew list pkgconf  >/dev/null 2>&1 || brew install pkgconf
-          brew tap messense/macos-cross-toolchains
-          brew install x86_64-unknown-linux-gnu
-          x86_64-linux-gnu-gcc -v
-
-      - name: Download CrossBuild GCC(Linux arm64)
-        if: matrix.os == 'linux-arm64'
-        run: |
-          brew uninstall --ignore-dependencies --force pkg-config@0.29.2 || true
-          brew list coreutils >/dev/null 2>&1 || brew install coreutils
-          brew list pkgconf  >/dev/null 2>&1 || brew install pkgconf
-          brew tap messense/macos-cross-toolchains
-          brew install aarch64-unknown-linux-gnu
-          aarch64-linux-gnu-gcc -v
+      - name: Go module download (Linux)
+        if: startsWith(matrix.os, 'linux')
+        run: go mod download
 
       - name: Generate Document
-        run: go run -gcflags=all="-N -l" common/yak/yakdoc/generate_doc/generate_doc.go common/yak/yakdoc/doc/doc.gob.gzip
+        run: go run -gcflags=all="-N -l" common/yak/yakdoc/generate_doc/generate_doc.go common/yak/yakdoc/doc/doc.gob.zst
 
       - name: Codec Methods Document
-        run: go run -gcflags=all="-N -l" common/yak/yaklib/codec/codegrpc/doc/codec_doc.go common/yak/yaklib/codec/codegrpc/codec.gob.gzip
+        run: go run -gcflags=all="-N -l" common/yak/yaklib/codec/codegrpc/doc/codec_doc.go common/yak/yaklib/codec/codegrpc/codec.gob.zst
 
       - name: Sync Embed FS Hash to Code
         shell: bash
@@ -419,10 +404,6 @@ jobs:
           if [ -n "${{ matrix.GOARCH }}" ]; then
             export GOARCH="${{ matrix.GOARCH }}"
           fi
-          if [ -n "${{ matrix.CC }}" ]; then
-            export CC="${{ matrix.CC }}"
-          fi
-          
           # Verify environment variables are set
           echo "BUILD_TAGS=${BUILD_TAGS}"
           echo "OUTPUT_BINARY=${OUTPUT_BINARY}"
@@ -433,8 +414,17 @@ jobs:
             echo "Error: OUTPUT_BINARY is not set"
             exit 1
           fi
+
+          if [[ "${{ matrix.os }}" == linux-* ]]; then
+            bash .github/scripts/build-linux-manylinux.sh \
+              "${{ matrix.manylinux_image }}" \
+              "${OUTPUT_BINARY}" \
+              "${BUILD_TAGS}" \
+              "${YAK_TAG}"
+            exit 0
+          fi
           
-          # Build with proper tag handling
+          # Build with proper tag handling (Windows / macOS matrix on native runners)
           BUILD_CMD="go build"
           if [ -n "${BUILD_TAGS}" ]; then
             BUILD_CMD="${BUILD_CMD} -tags ${BUILD_TAGS}"
@@ -445,6 +435,10 @@ jobs:
           echo "Executing: ${BUILD_CMD}"
           eval "${BUILD_CMD}"
           ls
+
+      - name: Verify glibc baseline (Linux, manylinux2014)
+        if: startsWith(matrix.os, 'linux')
+        run: bash .github/scripts/verify-glibc-baseline.sh "./${{ env.OUTPUT_BINARY }}"
 
       - name: Validate signing secrets
         if: ${{ contains(matrix.os, 'windows') && github.event_name != 'pull_request' }}
@@ -666,26 +660,8 @@ jobs:
       - name: Push Version Info to OSS
         run: |
           echo "start to handle versions"
-          if [ -f current_version.txt ]; then rm current_version.txt; fi
-          if [ -f new_history_versions.txt ]; then rm new_history_versions.txt; fi
-          
-          echo "${{ env.YAK_TAG }}" > current_version.txt
-          # check if history_versions.txt url 404 existed
-          HISTORY_URL="https://aliyun-oss.yaklang.com/yak/version-info/history_versions.txt"
-          if wget --spider --server-response "$HISTORY_URL" 2>&1 | grep 'HTTP/.* 200' >/dev/null; then
-            echo "Downloading history_versions.txt..."
-            wget -O history_versions.txt -q $HISTORY_URL
-            # 去重：当前版本置顶，历史版本中已存在的当前版本会被过滤，避免 rerun CI 产生重复
-            { cat ./current_version.txt; cat history_versions.txt; } | awk '!seen[$0]++' > new_history_versions.txt
-          else
-            echo "history_versions.txt not found or server did not return HTTP 200 for $HISTORY_URL, skipping download."
-            cat ./current_version.txt > new_history_versions.txt
-          fi
-          
-          echo "Uploading version.txt to oss"
-          cat new_history_versions.txt | head -n 100
-          cat new_history_versions.txt | head -n 100 > active_versions.txt
-          
+          bash ./scripts/prepare-version-info-for-oss.sh "${{ env.YAK_TAG }}"
+
           LINUX_BINARY=$(ls | grep -E "(yak|yaklang_(yakit|irify))_linux_amd64$" | head -n 1)
           "./$LINUX_BINARY" upload-oss -f 'new_history_versions.txt:/yak/version-info/history_versions.txt' -ak ${{ secrets.OSS_KEY_ID }} -sk ${{ secrets.OSS_KEY_SECRET }} -t 5
           "./$LINUX_BINARY" upload-oss -f 'active_versions.txt:/yak/version-info/active_versions.txt' -ak ${{ secrets.OSS_KEY_ID }} -sk ${{ secrets.OSS_KEY_SECRET }} -t 5

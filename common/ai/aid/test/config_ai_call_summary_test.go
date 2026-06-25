@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/ai/aid"
 	"github.com/yaklang/yaklang/common/ai/aid/aicommon"
+	"github.com/yaklang/yaklang/common/ai/aispec"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
@@ -18,6 +20,9 @@ import (
 )
 
 func TestCoordinator_AICallSummaryEvent(t *testing.T) {
+	const expectedProviderName = "test-provider"
+	const expectedModelName = "test-model-v1"
+
 	inputChan := chanx.NewUnlimitedChan[*ypb.AIInputEvent](context.Background(), 10)
 	outChan := chanx.NewUnlimitedChan[*schema.AiOutputEvent](context.Background(), 100)
 
@@ -29,33 +34,29 @@ func TestCoordinator_AICallSummaryEvent(t *testing.T) {
 		}),
 		aicommon.WithAICallback(func(config aicommon.AICallerConfigIf, request *aicommon.AIRequest) (*aicommon.AIResponse, error) {
 			prompt := request.GetPrompt()
-			rsp := config.NewAIResponse()
-			rsp.SetModelInfo("test-provider", "test-model-v1")
 
-			isPlanRequest := (strings.Contains(prompt, "任务规划使命") || strings.Contains(prompt, "你是一个输出JSON的任务规划的工具")) &&
-				(strings.Contains(prompt, "PERSISTENT_NcSB") || strings.Contains(prompt, "任务设计输出要求") || strings.Contains(prompt, "```schema"))
-
-			if isPlanRequest {
-				rsp.EmitOutputStream(strings.NewReader(`{
-    "@action": "plan",
-    "query": "test query for ai call summary",
+			summaryTestPlanJSON := `{
+    "@action": "plan_from_document",
     "main_task": "test main task",
     "main_task_goal": "verify ai_call_summary event fields",
-    "tasks": [
-        {
-            "subtask_name": "subtask-1",
-            "subtask_goal": "test subtask goal"
-        }
-    ]
-}`))
-				time.Sleep(100 * time.Millisecond)
-				rsp.Close()
-				return rsp, nil
+    "tasks": [{"subtask_name": "subtask-1", "subtask_goal": "test subtask goal"}]
+}`
+			if rsp, err := tryHandleNewPlanFlowPrompt(config, prompt, summaryTestPlanJSON); rsp != nil {
+				return rsp, err
 			}
 
-			if utils.MatchAllOfSubString(prompt, "status_summary", "task_long_summary", "task_short_summary") ||
-				strings.Contains(prompt, "GenerateTaskSummaryPrompt") ||
-				(strings.Contains(prompt, "@action") && strings.Contains(prompt, "summary")) {
+			rsp := config.NewAIResponse()
+			rsp.SetModelInfo("test-provider", "test-model-v1")
+			rsp.SetUsageInfo(&aispec.ChatUsage{
+				PromptTokens:     123,
+				CompletionTokens: 45,
+				TotalTokens:      168,
+				PromptTokensDetails: &aispec.PromptTokensDetails{
+					CachedTokens: 11,
+				},
+			})
+
+			if isSummaryPrompt(prompt) {
 				rsp.EmitOutputStream(strings.NewReader(`{
     "@action": "summary",
     "status_summary": "test status summary",
@@ -67,7 +68,7 @@ func TestCoordinator_AICallSummaryEvent(t *testing.T) {
 				return rsp, nil
 			}
 
-			if strings.Contains(prompt, "Background") && (strings.Contains(prompt, "Current Time:") || strings.Contains(prompt, "OS/Arch:")) {
+			if isNextActionDecisionPrompt(prompt) {
 				rsp.EmitOutputStream(strings.NewReader(`{
     "@action": "object",
     "next_action": {
@@ -169,6 +170,16 @@ LOOP:
 						t.Fatalf("ai_total_cost_ms missing '%s' field", field)
 					}
 				}
+				if utils.InterfaceToString(data["provider_name"]) != expectedProviderName ||
+					utils.InterfaceToString(data["model_name"]) != expectedModelName {
+					continue
+				}
+				require.Equal(t, 45, utils.InterfaceToInt(data["estimated_output_tokens"]))
+				require.Equal(t, 45, utils.InterfaceToInt(data["output_tokens"]))
+				require.Equal(t, 123, utils.InterfaceToInt(data["input_tokens"]))
+				require.Equal(t, 168, utils.InterfaceToInt(data["total_tokens"]))
+				require.Equal(t, 11, utils.InterfaceToInt(data["cache_hit_token"]))
+				require.Equal(t, "usage", utils.InterfaceToString(data["token_source"]))
 				totalCostCheck = true
 				log.Infof("ai_total_cost_ms enriched fields verified: model=%v, provider=%v, token_rate=%v",
 					data["model_name"], data["provider_name"], data["token_rate"])
@@ -186,12 +197,17 @@ LOOP:
 					"first_byte_cost_ms", "total_cost_ms",
 					"output_bytes", "estimated_output_tokens",
 					"token_rate", "output_duration_ms",
-					"input_token_size",
+					"input_token_size", "output_tokens", "input_tokens",
+					"total_tokens", "cache_hit_token", "token_source",
 				}
 				for _, field := range requiredFields {
 					if _, ok := data[field]; !ok {
 						t.Fatalf("ai_call_summary missing required field '%s', got: %v", field, data)
 					}
+				}
+				if utils.InterfaceToString(data["provider_name"]) != expectedProviderName ||
+					utils.InterfaceToString(data["model_name"]) != expectedModelName {
+					continue
 				}
 
 				totalCostMs := utils.InterfaceToFloat64(data["total_cost_ms"])
@@ -200,9 +216,13 @@ LOOP:
 				}
 
 				inputTokenSize := utils.InterfaceToInt(data["input_token_size"])
-				if inputTokenSize <= 0 {
-					t.Fatalf("ai_call_summary input_token_size should be > 0, got: %v", inputTokenSize)
-				}
+				require.Equal(t, 123, inputTokenSize)
+				require.Equal(t, 45, utils.InterfaceToInt(data["estimated_output_tokens"]))
+				require.Equal(t, 45, utils.InterfaceToInt(data["output_tokens"]))
+				require.Equal(t, 123, utils.InterfaceToInt(data["input_tokens"]))
+				require.Equal(t, 168, utils.InterfaceToInt(data["total_tokens"]))
+				require.Equal(t, 11, utils.InterfaceToInt(data["cache_hit_token"]))
+				require.Equal(t, "usage", utils.InterfaceToString(data["token_source"]))
 
 				summaryCheck = true
 				log.Infof("ai_call_summary verified: model=%v, provider=%v, total_cost_ms=%v, token_rate=%v, input_tokens=%v",
@@ -211,7 +231,7 @@ LOOP:
 				break LOOP
 			}
 
-		case <-time.After(15 * time.Second):
+		case <-time.After(3 * time.Minute):
 			log.Errorf("test timeout: parsedTask=%t, pressureCheck=%t, summaryCheck=%t, firstByteCheck=%t, totalCostCheck=%t",
 				parsedTask, pressureCheck, summaryCheck, firstByteCheck, totalCostCheck)
 			t.Fatal("timeout waiting for ai_call_summary event")

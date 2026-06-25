@@ -176,15 +176,9 @@ func (a *anInstruction) setLocationIDs(funcID, blockID int64) {
 }
 
 func (a *anInstruction) resolveFunctionByID() *Function {
-	if a.funcId <= 0 || a.prog == nil || a.prog.Cache == nil || a.prog.Cache.InstructionCache == nil {
+	if a.funcId <= 0 || a.prog == nil || a.prog.Cache == nil {
 		return nil
 	}
-	if cachedFunc, ok := a.prog.Cache.InstructionCache.Get(a.funcId); ok {
-		if f, ok := ToFunction(cachedFunc); ok {
-			return f
-		}
-	}
-	// DB-read mode may not have the function in InstructionCache yet.
 	if loaded := a.prog.Cache.GetInstruction(a.funcId); loaded != nil {
 		if f, ok := ToFunction(loaded); ok {
 			return f
@@ -248,15 +242,9 @@ func (a *anInstruction) SetBlock(block *BasicBlock) {
 }
 
 func (a *anInstruction) resolveBlockByID() *BasicBlock {
-	if a.blockId <= 0 || a.prog == nil || a.prog.Cache == nil || a.prog.Cache.InstructionCache == nil {
+	if a.blockId <= 0 || a.prog == nil || a.prog.Cache == nil {
 		return nil
 	}
-	if cachedBlock, ok := a.prog.Cache.InstructionCache.Get(a.blockId); ok {
-		if block, ok := ToBasicBlock(cachedBlock); ok {
-			return block
-		}
-	}
-	// DB-read mode may not have the block in InstructionCache yet.
 	if loaded := a.prog.Cache.GetInstruction(a.blockId); loaded != nil {
 		if block, ok := ToBasicBlock(loaded); ok {
 			return block
@@ -359,10 +347,12 @@ type anValue struct {
 	typId    int64
 	userList []int64
 
-	object     int64
-	key        int64
-	member     *omap.OrderedMap[int64, int64] // map[Value]Value
-	memberOnce sync.Once
+	object             int64
+	key                int64
+	member             *omap.OrderedMap[int64, int64] // map[Value]Value
+	memberOnce         sync.Once
+	memberByString     map[string][]int64
+	memberByStringOnce sync.Once
 
 	variables     *omap.OrderedMap[string, *Variable] // map[string]*Variable
 	variablesOnce sync.Once
@@ -426,6 +416,87 @@ func (n *anValue) getMemberMap(create ...bool) *omap.OrderedMap[int64, int64] {
 	return n.member
 }
 
+func (n *anValue) getMemberStringIndex(create ...bool) map[string][]int64 {
+	shouldCreate := false
+	if len(create) > 0 {
+		shouldCreate = create[0]
+	}
+	if n.memberByString == nil && shouldCreate {
+		n.memberByStringOnce.Do(func() {
+			n.memberByString = make(map[string][]int64)
+		})
+	}
+	return n.memberByString
+}
+
+func memberStringKey(v Value) (string, bool) {
+	lit, ok := ToConstInst(v)
+	if !ok || lit == nil {
+		return "", false
+	}
+	key, ok := lit.value.(string)
+	return key, ok
+}
+
+func (n *anValue) rememberStringMemberID(key string, id int64) {
+	index := n.getMemberStringIndex(true)
+	ids := index[key]
+	filtered := ids[:0]
+	for _, currentID := range ids {
+		if currentID != id {
+			filtered = append(filtered, currentID)
+		}
+	}
+	index[key] = append(filtered, id)
+}
+
+func (n *anValue) rememberStringMemberKey(k Value) {
+	key, ok := memberStringKey(k)
+	if !ok {
+		return
+	}
+	n.rememberStringMemberID(key, k.GetId())
+}
+
+func (n *anValue) forgetStringMemberKey(k Value) {
+	key, ok := memberStringKey(k)
+	if !ok {
+		return
+	}
+	index := n.getMemberStringIndex()
+	if index == nil {
+		return
+	}
+	ids := index[key]
+	if len(ids) == 0 {
+		return
+	}
+	filtered := ids[:0]
+	for _, id := range ids {
+		if id != k.GetId() {
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(index, key)
+		return
+	}
+	index[key] = filtered
+}
+
+func (n *anValue) getMemberByKeyID(keyID int64) (Value, bool) {
+	memberMap := n.getMemberMap()
+	if memberMap == nil {
+		return nil, false
+	}
+	ret, ok := memberMap.Get(keyID)
+	if !ok {
+		return nil, false
+	}
+	val, ok := n.GetValueById(ret)
+	return val, ok
+}
+
 func (n *anValue) IsObject() bool {
 	memberMap := n.getMemberMap()
 	if memberMap == nil {
@@ -436,6 +507,7 @@ func (n *anValue) IsObject() bool {
 
 func (n *anValue) AddMember(k, v Value) {
 	n.getMemberMap(true).Set(k.GetId(), v.GetId())
+	n.rememberStringMemberKey(k)
 }
 
 func (n *anValue) DeleteMember(k Value) {
@@ -443,6 +515,7 @@ func (n *anValue) DeleteMember(k Value) {
 	if memberMap != nil {
 		memberMap.Delete(k.GetId())
 	}
+	n.forgetStringMemberKey(k)
 }
 
 func (n *anValue) GetMember(key Value) (Value, bool) {
@@ -476,6 +549,16 @@ func (n *anValue) GetStringMember(key string) (Value, bool) {
 	if memberMap == nil {
 		return nil, false
 	}
+	if index := n.getMemberStringIndex(); index != nil {
+		if ids := index[key]; len(ids) > 0 {
+			for idx := len(ids) - 1; idx >= 0; idx-- {
+				if member, ok := n.getMemberByKeyID(ids[idx]); ok {
+					return member, true
+				}
+			}
+			return nil, false
+		}
+	}
 	keys := memberMap.Keys()
 	for index := len(keys) - 1; index >= 0; index-- {
 		i, ok := n.GetValueById(keys[index])
@@ -483,12 +566,17 @@ func (n *anValue) GetStringMember(key string) (Value, bool) {
 			continue
 		}
 		lit, ok := ToConstInst(i)
-		if !ok {
+		if !ok || lit.Const == nil || lit.Const.str != key {
 			continue
 		}
-		if lit.value == key {
-			return n.GetMember(i)
+		valID, ok := memberMap.Get(keys[index])
+		if !ok {
+			return nil, false
 		}
+		if lit.value == key {
+			n.rememberStringMemberKey(i)
+		}
+		return n.GetValueById(valID)
 	}
 	return nil, false
 }
@@ -498,21 +586,30 @@ func (n *anValue) SetStringMember(key string, v Value) {
 	if memberMap == nil {
 		return
 	}
+	if index := n.getMemberStringIndex(); index != nil {
+		if ids := index[key]; len(ids) > 0 {
+			for idx := len(ids) - 1; idx >= 0; idx-- {
+				if _, ok := memberMap.Get(ids[idx]); ok {
+					memberMap.Set(ids[idx], v.GetId())
+					return
+				}
+			}
+		}
+	}
 	var lastMatch Value
 	for _, id := range memberMap.Keys() {
 		i, ok := n.GetValueById(id)
 		if !ok {
 			continue
 		}
-		lit, ok := i.(*ConstInst)
-		if !ok {
+		lit, ok := ToConstInst(i)
+		if !ok || lit.Const == nil || lit.Const.str != key {
 			continue
 		}
-		if lit.value == key {
-			lastMatch = i
-		}
+		lastMatch = i
 	}
 	if lastMatch != nil {
+		n.rememberStringMemberKey(lastMatch)
 		n.AddMember(lastMatch, v)
 	}
 }
@@ -646,12 +743,14 @@ func (n *anValue) cacheType(typ Type) int64 {
 	if typ == nil {
 		return 0
 	}
-	if cache := n.getProgramCache(); cache != nil && cache.TypeCache != nil {
-		cache.TypeCache.Set(typ)
+	if cache := n.getProgramCache(); cache != nil {
+		cache.rememberType(typ)
 	} else {
 		n.SetLazySaveType(func() {
-			n.getProgramCache().TypeCache.Set(typ)
-			n.typId = typ.GetId()
+			if cache := n.getProgramCache(); cache != nil {
+				cache.rememberType(typ)
+				n.typId = typ.GetId()
+			}
 		})
 	}
 	return typ.GetId()
@@ -659,15 +758,9 @@ func (n *anValue) cacheType(typ Type) int64 {
 
 func (n *anValue) lookupTypeById(id int64) Type {
 	cache := n.getProgramCache()
-	if cache != nil && cache.TypeCache != nil {
-		if typ, ok := cache.TypeCache.Get(id); ok && !utils.IsNil(typ) {
+	if cache != nil {
+		if typ, ok := cache.getType(id); ok && !utils.IsNil(typ) {
 			return typ
-		}
-		if cache.HaveDatabaseBackend() {
-			if typ := GetTypeFromDB(cache, id); !utils.IsNil(typ) {
-				cache.TypeCache.Set(typ)
-				return typ
-			}
 		}
 	}
 	return nil
@@ -704,7 +797,11 @@ func (a *anValue) GetVariable(name string) *Variable {
 		}
 	}
 	if a.IsFromDB() {
-		v := GetVariableFromDB(a.GetId(), name)
+		programName := ""
+		if prog := a.GetProgram(); prog != nil {
+			programName = prog.GetProgramName()
+		}
+		v := GetVariableFromDB(a.GetId(), name, programName)
 		a.AddVariable(v)
 		return v
 	}
@@ -729,10 +826,20 @@ func (a *anValue) GetAllVariables() map[string]*Variable {
 }
 
 func (a *anValue) AddVariable(v *Variable) {
+	if v == nil {
+		return
+	}
 	name := v.GetName()
 	m := a.getVariablesMap(true)
+	if existing, ok := m.Get(name); ok {
+		if existing == v {
+			return
+		}
+		m.Set(name, v)
+		m.BringKeyToLastOne(name)
+		return
+	}
 	m.Set(name, v)
-	m.BringKeyToLastOne(name)
 }
 
 func (i *anValue) getMaskMap(create ...bool) *omap.OrderedMap[int64, int64] {

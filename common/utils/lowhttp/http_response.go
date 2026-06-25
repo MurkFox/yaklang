@@ -118,6 +118,15 @@ func IsHtmlOrXmlMIMEType(s string) bool {
 }
 
 // FixHTTPResponse 尝试对传入的响应进行修复，并返回修复后的响应，响应体和错误
+//
+// 参数:
+//   - raw: 原始 HTTP 响应报文字节
+//
+// 返回值:
+//   - rsp: 修复后的完整响应报文
+//   - body: 修复后的响应体
+//   - err: 错误信息
+//
 // Example:
 // ```
 // fixedResponse, body, err = str.FixHTTPResponse(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=gbk\r\n\r\n<html>你好</html>")
@@ -357,6 +366,14 @@ func RemoveCEHeaders(headerBytes []byte) []byte {
 }
 
 // ReplaceBody 将原始 HTTP 请求报文中的 body 替换为指定的 body，并指定是否为 chunked，返回新的 HTTP 请求报文
+// 参数:
+//   - raw: 原始 HTTP 报文字节数组
+//   - body: 替换后的报文主体内容
+//   - chunk: 是否使用 chunked 传输编码
+//
+// 返回值:
+//   - 修改后的 HTTP 报文字节数组
+//
 // Example:
 // ```
 // poc.ReplaceBody(`POST / HTTP/1.1
@@ -463,6 +480,13 @@ func ReplaceHTTPPacketBodyRaw(raw []byte, body []byte, fixCL bool) []byte {
 }
 
 // ParseBytesToHTTPResponse 将字节数组解析为 HTTP 响应
+// 参数:
+//   - res: 原始 HTTP 响应报文字节数组
+//
+// 返回值:
+//   - 解析得到的 HTTP 响应对象
+//   - 错误信息，解析失败时返回非空
+//
 // Example:
 // ```
 // res, err := str.ParseBytesToHTTPResponse(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")

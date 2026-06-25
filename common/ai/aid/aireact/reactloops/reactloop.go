@@ -2,7 +2,11 @@ package reactloops
 
 import (
 	"bytes"
+	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/yaklang/yaklang/common/log"
 
@@ -31,14 +35,24 @@ type SatisfactionRecord struct {
 	Reason             string                        `json:"reason"`               // 满意/不满意的原因分析
 	CompletedTaskIndex string                        `json:"completed_task_index"` // AI 判断已完成的任务索引，如 "1-1" 或 "1-1,1-2"
 	NextMovements      []aicommon.VerifyNextMovement `json:"next_movements"`       // AI 下一步行动计划，用于任务执行中状态追踪
+	Evidence           string                        `json:"evidence"`             // 运行期新增的证据 Markdown (legacy)
+	EvidenceOps        []aicommon.EvidenceOperation  `json:"evidence_ops"`         // 结构化证据增量操作
+	OutputFiles        []string                      `json:"output_files"`         // 本轮验证识别出的交付文件
 }
 
 // ActionRecord 记录每次迭代执行的 Action 信息
+// 关键词: ActionRecord, SPIN 检测, ActionType+ToolName 双维度判定
 type ActionRecord struct {
 	ActionType     string                 `json:"action_type"`
 	ActionName     string                 `json:"action_name"`
 	ActionParams   map[string]interface{} `json:"action_params"`
 	IterationIndex int                    `json:"iteration_index"`
+
+	// ToolName 是该 action 实际调用的工具名(如 require_tool/directly_call_tool 类动作),
+	// 用于 SPIN 检测的细粒度判定 — 仅当 ActionType 与 ToolName 同时连续匹配时才计为
+	// 一次同质执行, 避免"同 ActionType 不同 tool"被误判为 SPIN.
+	// 关键词: ActionRecord.ToolName, SPIN 细粒度, tool_name 抽取
+	ToolName string `json:"tool_name,omitempty"`
 }
 
 type ReActLoop struct {
@@ -54,9 +68,10 @@ type ReActLoop struct {
 	reflectionOutputExampleProvider ContextProviderFunc
 	reactiveDataBuilder             FeedbackProviderFunc
 
-	allowAIForge      func() bool
-	allowPlanAndExec  func() bool
-	allowRAG          func() bool
+	allowAIForge       func() bool
+	allowPlanAndExec   func() bool
+	planExecActionType string
+	allowRAG           func() bool
 	allowToolCall     func() bool
 	allowUserInteract func() bool
 
@@ -94,6 +109,12 @@ type ReActLoop struct {
 	onPostIteration       []func(loop *ReActLoop, iteration int, task aicommon.AIStatefulTask, isDone bool, reason any, operator *OnPostIterationOperator)
 	onLoopInstanceCreated func(loop *ReActLoop)
 
+	// onRelease 在 loop 任务执行结束时（无论成功失败）按注册顺序调用，
+	// 用于回收 caller / engine / 文件句柄等资源
+	onReleaseMutex sync.Mutex
+	onRelease      []func()
+	released       bool
+
 	// 启动这个 loop 的时候马上要执行的事情
 	// operator 用于控制 init 后的行为：Done/Failed/Continue/NextAction/RemoveNextAction
 	initHandler func(loop *ReActLoop, task aicommon.AIStatefulTask, operator *InitTaskOperator)
@@ -111,17 +132,62 @@ type ReActLoop struct {
 	actionHistory      []*ActionRecord
 	actionHistoryMutex *sync.Mutex
 
+	// modelThinkingBuf holds reason-stream deltas for the in-flight AI transaction;
+	// flushed into the timeline iteration line above the action summary.
+	modelThinkingBuf   bytes.Buffer
+	modelThinkingMutex sync.Mutex
+
+	// verificationRuntimeSnapshot stores the last verification gate baseline so
+	// generic auto-verification can compare the current loop state against the
+	// previous accepted checkpoint.
+	periodicVerificationInterval int // when == 0 , trigger every iteration;
+	DisablePeriodicVerification  bool
+	verificationRuntimeSnapshot  *VerificationRuntimeSnapshot
+	verificationMutex            *sync.Mutex
+	verificationWatchdogTimer    *time.Timer
+	// verificationWatchdogToolSuppressionDepth counts nested synchronous tool calls
+	// that block the ReAct thread; while >0 the verification watchdog must not fire
+	// or reschedule (see verification_gate.go).
+	verificationWatchdogToolSuppressionDepth int
+
 	// timeline differ for tracking changes during task execution
 	timelineDiffer        *aicommon.TimelineDiffer
 	currentIterationIndex int
+
+	// lastIterationTickAt 记录主循环最近一次推进 (iterationCount++) 的
+	// 单调时间戳, 单位 unix nanoseconds. 仅由主循环线程写, stall heartbeat
+	// goroutine 与外部观察方原子读, 故用 atomic.Int64 即可. 心跳协程依此
+	// 判断"我还在动吗?", 90s 无变更则 emit [LOOP_STALL_DETECTED] timeline
+	// + dump goroutine stack 用于事后分析, 但绝不主动中止主循环 — 这是
+	// 兜底观察而非抢断.
+	// 关键词: lastIterationTickAt, 主循环心跳, [LOOP_STALL_DETECTED]
+	lastIterationTickAt atomic.Int64
+
+	// verificationInFlight 标记 verification AI 调用是否正在飞行中, 用于
+	// 让 watchdog 在不持锁的情况下感知 "上一次还没回来". 与 verificationMutex
+	// 解耦后, watchdog 即便正赶上 verification 卡死也能立刻拿到这个原子
+	// 状态, 写一条 [ASYNC_VERIFICATION_WATCHDOG_BUSY] 痕迹后返回, 而不会
+	// 跟着一起阻塞.
+	// 关键词: verificationInFlight, watchdog 解锁, atomic.Bool
+	verificationInFlight atomic.Bool
 
 	// SPIN detection thresholds
 	sameActionTypeSpinThreshold int // 相同任务自旋阈值
 	sameLogicSpinThreshold      int // 相同逻辑自旋阈值
 
 	// SPIN force-exit: consecutive spin warnings counter and threshold
+	// 注: counter 由异步反思 goroutine (IncrementSpinWarning/ResetSpinWarning) 写入,
+	// 主循环线程 (ShouldForceExitDueToSpin) 读取, 必须通过 spinCounterMu 保护以避免
+	// 数据竞争. 关键词: SPIN counter 并发保护
 	consecutiveSpinWarnings    int
 	maxConsecutiveSpinWarnings int
+	spinCounterMu              sync.Mutex
+
+	// reflectionInflight 跟踪异步自我反思 goroutine 数量, 供测试 best-effort
+	// 等待 (WaitForInflightReflections) 与 Release 阶段 join 使用. 生产路径
+	// 不会主动等待 (fire-and-forget).
+	// 关键词: 异步反思 inflight 跟踪, 测试可观测
+	reflectionInflight sync.WaitGroup
 
 	// Init handler action constraints
 	// These are set by the init handler and cleared after first iteration
@@ -137,22 +203,131 @@ type ReActLoop struct {
 	extraCapabilities *ExtraCapabilitiesManager
 
 	noEndLoadingStatus bool
+
+	// disableTodoSnapshot 为 true 时, loop prompt 的 timeline-open 段不注入
+	// TodoSnapshot 数据块 (plan / intent 等轻量子循环使用).
+	disableTodoSnapshot bool
+
+	// scenarioToolWhitelist 是这个 loop 对 "VisibilityScenario 工具" 的拉回
+	// 名单, 由 focus mode 的 __SCENARIO_TOOLS__ dunder 或代码侧 WithScenarioToolWhitelist
+	// 显式声明. 默认 nil/空, 即不把任何 scenario 工具拉回 Tool Inventory.
+	//
+	// 仅影响默认 Tool Inventory 段的 visibility 过滤 (aicommon.FilterToolsByVisibility);
+	// 不影响 search_capabilities / require_tool / load_capability 等其他链路.
+	//
+	// 关键词: scenario tool whitelist, focus mode pull back scenario,
+	//        VisibilityScenario, Tool Inventory render-time only
+	scenarioToolWhitelist []string
+
+	// Perception layer: continuous awareness of what the user is doing,
+	// producing Topics/Keywords/Summary that dynamically adjust the
+	// possibility space throughout the loop lifecycle.
+	perception *perceptionController
 }
 
-func (r *ReActLoop) IncrementSpinWarning() {
-	r.consecutiveSpinWarnings++
-	log.Infof("consecutive spin warnings incremented to %d (max: %d)", r.consecutiveSpinWarnings, r.maxConsecutiveSpinWarnings)
-}
-
-func (r *ReActLoop) ResetSpinWarning() {
-	if r.consecutiveSpinWarnings > 0 {
-		log.Infof("consecutive spin warnings reset from %d to 0", r.consecutiveSpinWarnings)
+// GetScenarioToolWhitelist 返回当前 loop 声明的 scenario 工具拉回名单.
+// nil-safe: receiver 为 nil 时返回 nil, 让 prompt 渲染入口可以无条件调用.
+// 返回值是只读副本式的 nil 或原 slice, 调用方不应修改.
+//
+// 关键词: GetScenarioToolWhitelist, nil-safe, render entry use
+func (r *ReActLoop) GetScenarioToolWhitelist() []string {
+	if r == nil {
+		return nil
 	}
-	r.consecutiveSpinWarnings = 0
+	return r.scenarioToolWhitelist
 }
 
+// GetPromptCandidateTools 返回 loop 的 toolsGetter 原始结果.
+// toolsGetter 由 WithToolsGetter 在 NewReActLoop 时注入; 当前生产 loop 均未设置,
+// 默认 nil. 为空时由 ResolveLoopPromptCandidateTools fallback 到 GetEnableTools,
+// 与 generateLoopPrompt 行为一致.
+func (r *ReActLoop) GetPromptCandidateTools() []*aitool.Tool {
+	if r == nil || r.toolsGetter == nil {
+		return nil
+	}
+	return r.toolsGetter()
+}
+
+// AddOnReleaseHook 添加 loop 释放阶段的清理回调。多次调用按注册顺序执行。
+// 关键词: loop release hook, cleanup callback
+func (r *ReActLoop) AddOnReleaseHook(fn func()) {
+	if fn == nil {
+		return
+	}
+	r.onReleaseMutex.Lock()
+	defer r.onReleaseMutex.Unlock()
+	r.onRelease = append(r.onRelease, fn)
+}
+
+// Release 触发所有 onRelease 回调，仅生效一次。后续重复调用是 no-op。
+// 关键词: loop release execution
+func (r *ReActLoop) Release() {
+	if r == nil {
+		return
+	}
+	r.onReleaseMutex.Lock()
+	if r.released {
+		r.onReleaseMutex.Unlock()
+		return
+	}
+	r.released = true
+	hooks := append([]func(){}, r.onRelease...)
+	r.onReleaseMutex.Unlock()
+
+	for _, h := range hooks {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Errorf("react loop[%v] on-release hook panic: %v", r.loopName, rec)
+				}
+			}()
+			h()
+		}()
+	}
+}
+
+// IncrementSpinWarning 累加 SPIN 警告计数. 异步反思 goroutine 调用.
+// 关键词: SPIN counter mu protected
+func (r *ReActLoop) IncrementSpinWarning() {
+	r.spinCounterMu.Lock()
+	r.consecutiveSpinWarnings++
+	cur := r.consecutiveSpinWarnings
+	max := r.maxConsecutiveSpinWarnings
+	r.spinCounterMu.Unlock()
+	log.Infof("consecutive spin warnings incremented to %d (max: %d)", cur, max)
+}
+
+// ResetSpinWarning 清零 SPIN 警告计数(任务正常推进时调用).
+// 关键词: SPIN counter mu protected
+func (r *ReActLoop) ResetSpinWarning() {
+	r.spinCounterMu.Lock()
+	prev := r.consecutiveSpinWarnings
+	r.consecutiveSpinWarnings = 0
+	r.spinCounterMu.Unlock()
+	if prev > 0 {
+		log.Infof("consecutive spin warnings reset from %d to 0", prev)
+	}
+}
+
+// ShouldForceExitDueToSpin 主循环线程读取 SPIN 计数器, 决定是否强制退出.
+// 关键词: SPIN counter mu protected
 func (r *ReActLoop) ShouldForceExitDueToSpin() bool {
-	return r.maxConsecutiveSpinWarnings > 0 && r.consecutiveSpinWarnings >= r.maxConsecutiveSpinWarnings
+	r.spinCounterMu.Lock()
+	cur := r.consecutiveSpinWarnings
+	max := r.maxConsecutiveSpinWarnings
+	r.spinCounterMu.Unlock()
+	return max > 0 && cur >= max
+}
+
+// WaitForInflightReflections 等待所有异步自我反思 goroutine 完成. 主循环
+// 不应调用 (会破坏 fire-and-forget 语义); 仅用于测试在 Execute 返回后
+// 断言反思历史, 以及 Release/abort 阶段做 best-effort 清理.
+// 关键词: 异步反思 join, 测试可观测
+func (r *ReActLoop) WaitForInflightReflections() {
+	if r == nil {
+		return
+	}
+	r.reflectionInflight.Wait()
 }
 
 func (r *ReActLoop) PushSatisfactionRecord(satisfactory bool, reason string) {
@@ -160,16 +335,26 @@ func (r *ReActLoop) PushSatisfactionRecord(satisfactory bool, reason string) {
 		Satisfactory: satisfactory,
 		Reason:       reason,
 	})
+	// 价值评估额外触发: verification 满意度裁决是关键的客观结局信号.
+	r.submitValueFeedbackSignal(aicommon.ValueFeedbackTriggerVerification)
 }
 
 // PushSatisfactionRecordWithCompletedTaskIndex 推送满意度记录，并同时记录已完成的任务索引和下一步行动计划
-func (r *ReActLoop) PushSatisfactionRecordWithCompletedTaskIndex(satisfactory bool, reason string, completedTaskIndex string, nextMovements []aicommon.VerifyNextMovement) {
-	r.historySatisfactionReasons = append(r.historySatisfactionReasons, &SatisfactionRecord{
+func (r *ReActLoop) PushSatisfactionRecordWithCompletedTaskIndex(satisfactory bool, reason string, completedTaskIndex string, nextMovements []aicommon.VerifyNextMovement, evidence string, outputFiles []string, evidenceOps ...[]aicommon.EvidenceOperation) {
+	record := &SatisfactionRecord{
 		Satisfactory:       satisfactory,
 		Reason:             reason,
 		CompletedTaskIndex: completedTaskIndex,
 		NextMovements:      nextMovements,
-	})
+		Evidence:           evidence,
+		OutputFiles:        append([]string(nil), outputFiles...),
+	}
+	if len(evidenceOps) > 0 {
+		record.EvidenceOps = evidenceOps[0]
+	}
+	r.historySatisfactionReasons = append(r.historySatisfactionReasons, record)
+	// 价值评估额外触发: verification 满意度裁决是关键的客观结局信号.
+	r.submitValueFeedbackSignal(aicommon.ValueFeedbackTriggerVerification)
 }
 
 func (r *ReActLoop) GetLastSatisfactionRecord() (bool, string) {
@@ -193,7 +378,32 @@ func (r *ReActLoop) GetMaxIterations() int {
 	return r.maxIterations
 }
 
-func (r *ReActLoop) getRenderInfo() (string, map[string]any, error) {
+func (r *ReActLoop) GetPeriodicVerificationInterval() int {
+	return r.periodicVerificationInterval
+}
+
+func (r *ReActLoop) AllowPlanAndExec() func() bool {
+	if r == nil {
+		return nil
+	}
+	return r.allowPlanAndExec
+}
+
+func (r *ReActLoop) AllowToolCall() func() bool {
+	if r == nil {
+		return nil
+	}
+	return r.allowToolCall
+}
+
+func (r *ReActLoop) Actions() *omap.OrderedMap[string, *LoopAction] {
+	if r == nil {
+		return nil
+	}
+	return r.actions
+}
+
+func (r *ReActLoop) getRenderValues() (string, map[string]any, error) {
 	var tools []*aitool.Tool
 	if r.toolsGetter == nil {
 		tools = []*aitool.Tool{}
@@ -240,11 +450,7 @@ func (r *ReActLoop) getRenderInfo() (string, map[string]any, error) {
 		info["HasLoadCapability"] = hasLoadCap
 	}
 
-	result, err := utils.RenderTemplate(temp, info)
-	if err != nil {
-		return "", nil, err
-	}
-	return result, info, nil
+	return temp, info, nil
 }
 
 func (r *ReActLoop) DisallowAskForClarification() {
@@ -253,17 +459,38 @@ func (r *ReActLoop) DisallowAskForClarification() {
 	}
 }
 
+func (r *ReActLoop) ensureTaskMutex() {
+	if r == nil {
+		return
+	}
+	if r.taskMutex == nil {
+		r.taskMutex = new(sync.Mutex)
+	}
+}
+
 func (r *ReActLoop) GetCurrentTask() aicommon.AIStatefulTask {
+	if r == nil {
+		return nil
+	}
+	r.ensureTaskMutex()
 	r.taskMutex.Lock()
 	defer r.taskMutex.Unlock()
 	return r.currentTask
 }
 
 func (r *ReActLoop) SetCurrentTask(t aicommon.AIStatefulTask) {
+	if r == nil || t == nil {
+		return
+	}
+	r.ensureTaskMutex()
 	r.taskMutex.Lock()
 	defer r.taskMutex.Unlock()
 	r.currentTask = t
 	t.SetReActLoop(r)
+	// Also set on invoker to keep task state centralized
+	if r.invoker != nil {
+		r.invoker.SetCurrentTask(t)
+	}
 }
 
 func (r *ReActLoop) GetInvoker() aicommon.AIInvokeRuntime {
@@ -296,15 +523,41 @@ func (r *ReActLoop) GetExtraCapabilities() *ExtraCapabilitiesManager {
 	return r.extraCapabilities
 }
 
+// GetBaseFrameContext returns foundational context (time, OS, working directory, timeline)
+// for use in prompt templates that need environmental awareness.
+func (r *ReActLoop) GetBaseFrameContext() map[string]any {
+	result := map[string]any{
+		"CurrentTime": time.Now().Format("2006-01-02 15:04:05"),
+		"OSArch":      fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+	}
+	cfg := r.GetConfig()
+	if cfg == nil {
+		return result
+	}
+	if configImpl, ok := cfg.(*aicommon.Config); ok {
+		if configImpl.Workdir != "" {
+			result["WorkingDir"] = configImpl.Workdir
+		}
+		if t := configImpl.GetTimeline(); t != nil {
+			result["Timeline"] = t.Dump()
+		}
+	}
+	return result
+}
+
 // NewMinimalReActLoop creates a lightweight ReActLoop for unit testing action handlers.
 // It sets up config, invoker, and emitter but skips full action registration.
 func NewMinimalReActLoop(cfg aicommon.AICallerConfigIf, invoker aicommon.AIInvokeRuntime) *ReActLoop {
 	return &ReActLoop{
-		config:    cfg,
-		invoker:   invoker,
-		emitter:   cfg.GetEmitter(),
-		vars:      omap.NewEmptyOrderedMap[string, any](),
-		taskMutex: new(sync.Mutex),
+		config:                     cfg,
+		invoker:                    invoker,
+		emitter:                    cfg.GetEmitter(),
+		verificationMutex:          new(sync.Mutex),
+		vars:                       omap.NewEmptyOrderedMap[string, any](),
+		taskMutex:                  new(sync.Mutex),
+		historySatisfactionReasons: make([]*SatisfactionRecord, 0),
+		actionHistory:              make([]*ActionRecord, 0),
+		actionHistoryMutex:         new(sync.Mutex),
 	}
 }
 
@@ -316,28 +569,31 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 	config := invoker.GetConfig()
 
 	r := &ReActLoop{
-		invoker:                     invoker,
-		loopName:                    name,
-		config:                      config,
-		emitter:                     config.GetEmitter(),
-		maxIterations:               100,
-		actions:                     omap.NewEmptyOrderedMap[string, *LoopAction](),
-		loopActions:                 omap.NewEmptyOrderedMap[string, LoopActionFactory](),
-		streamFields:                omap.NewEmptyOrderedMap[string, *LoopStreamField](),
-		aiTagFields:                 omap.NewEmptyOrderedMap[string, *LoopAITagField](),
-		vars:                        omap.NewEmptyOrderedMap[string, any](),
-		taskMutex:                   new(sync.Mutex),
-		currentMemories:             omap.NewEmptyOrderedMap[string, *aicommon.MemoryEntity](),
-		memorySizeLimit:             10 * 1024,
-		enableSelfReflection:        true,
-		historySatisfactionReasons:  make([]*SatisfactionRecord, 0),
-		actionHistory:               make([]*ActionRecord, 0),
-		actionHistoryMutex:          new(sync.Mutex),
-		currentIterationIndex:       0,
-		sameActionTypeSpinThreshold: 3, // 默认连续 3 次相同 Action 触发检测
-		sameLogicSpinThreshold:      3, // 默认连续 3 次相同逻辑触发 AI 检测
-		maxConsecutiveSpinWarnings:  3, // 默认连续 3 次 SPIN 警告后强制退出
-		extraCapabilities:           NewExtraCapabilitiesManager(),
+		invoker:                      invoker,
+		loopName:                     name,
+		config:                       config,
+		emitter:                      config.GetEmitter(),
+		maxIterations:                100,
+		periodicVerificationInterval: verificationIterationTriggerInterval,
+		verificationMutex:            new(sync.Mutex),
+		actions:                      omap.NewEmptyOrderedMap[string, *LoopAction](),
+		loopActions:                  omap.NewEmptyOrderedMap[string, LoopActionFactory](),
+		streamFields:                 omap.NewEmptyOrderedMap[string, *LoopStreamField](),
+		aiTagFields:                  omap.NewEmptyOrderedMap[string, *LoopAITagField](),
+		vars:                         omap.NewEmptyOrderedMap[string, any](),
+		taskMutex:                    new(sync.Mutex),
+		currentMemories:              omap.NewEmptyOrderedMap[string, *aicommon.MemoryEntity](),
+		memorySizeLimit:              10 * 1024,
+		enableSelfReflection:         true,
+		historySatisfactionReasons:   make([]*SatisfactionRecord, 0),
+		actionHistory:                make([]*ActionRecord, 0),
+		actionHistoryMutex:           new(sync.Mutex),
+		currentIterationIndex:        0,
+		sameActionTypeSpinThreshold:  8, // 默认连续 8 次同 ActionType+ToolName 才触发 SPIN 检测,降低误触发
+		sameLogicSpinThreshold:       8, // 默认连续 8 次同质 action 触发 AI 检测(与简单阈值对齐)
+		maxConsecutiveSpinWarnings:   3, // 默认连续 3 次 SPIN 警告后强制退出
+		extraCapabilities:            NewExtraCapabilitiesManager(),
+		perception:                   newPerceptionController(perceptionDefaultIterationInterval),
 	}
 
 	for _, action := range []*LoopAction{
@@ -360,6 +616,20 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 		opt(r)
 	}
 
+	// 自动注入价值评估埋点 (默认开启, 暂无关闭开关). 该钩子在每轮结束
+	// (iteration_end) 与整循环结束 (loop_end) 组装 ValueFeedbackRecord 并经
+	// aicommon 注册缝交给 aive; 全程非阻塞 + recover, 不影响主循环.
+	// 关键词: 价值评估埋点注入, onPostIteration, SubmitValueFeedback
+	r.onPostIteration = append(r.onPostIteration, buildValueFeedbackPostIteration())
+
+	// Config-level perception disable (e.g. test environments via WithDisablePerception)
+	if config.GetConfigBool("DisablePerception") {
+		r.perception = nil
+	}
+
+	// Auto-register perception context provider (nil-safe, skips if perception disabled)
+	r.RegisterPerceptionContextProvider()
+
 	// Auto-apply skillLoader from config if not already set via options
 	// This allows users to configure skills via aicommon.WithSkillsLocalDir etc.
 	if r.skillsContextManager == nil && config != nil {
@@ -377,24 +647,22 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 				// Restore previously loaded skills from persistent session
 				if realConfig.InitStatus.IsPersistentSessionRestored() {
 					if names := realConfig.GetRestoredSkillNames(); len(names) > 0 {
-						results := mgr.LoadSkills(names)
-						var restored, failed []string
-						for name, err := range results {
-							if err != nil {
-								failed = append(failed, name)
-								log.Warnf("failed to restore skill %q from persistent session: %v", name, err)
-							} else {
-								restored = append(restored, name)
-							}
-						}
-						if len(restored) > 0 {
-							log.Infof("restored %d skills from persistent session: %v", len(restored), restored)
-						}
-						if len(failed) > 0 {
-							log.Warnf("failed to restore %d skills from persistent session: %v", len(failed), failed)
-						}
+						loadConfiguredSkills(mgr, names, "persistent session")
 					}
 				}
+
+				// Load user-specified skills from EnabledCapabilities (AIStartParams)
+				if names := realConfig.GetEnabledSkillNames(); len(names) > 0 {
+					loadConfiguredSkills(mgr, names, "enabled capabilities")
+				}
+			}
+		}
+	}
+
+	if config != nil {
+		if realConfig, ok := config.(*aicommon.Config); ok {
+			if names := realConfig.GetEnabledForgeNames(); len(names) > 0 {
+				LoadEnabledForges(realConfig, r, names)
 			}
 		}
 	}
@@ -427,6 +695,22 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 		}
 	}
 
+	if _, ok := r.actions.Get(schema.AI_REACT_LOOP_ACTION_REQUEST_VERIFICATION); !ok {
+		if verifyNow, ok := GetLoopAction(schema.AI_REACT_LOOP_ACTION_REQUEST_VERIFICATION); ok {
+			r.actions.Set(verifyNow.ActionType, verifyNow)
+		}
+	}
+
+	// adjust_todolist 是 verification.next_movements 的主循环兄弟通道, 写入同一份
+	// 全局 TODO store, 因此默认对所有 loop 开放 (无 allowXxx gate). 子 loop 可在
+	// option 阶段提前 r.actions.Set 同名 key 覆盖, 这里只做缺省兜底 inject.
+	// 关键词: adjust_todolist 默认全 loop 接入, 与 request_verification 同位
+	if _, ok := r.actions.Get(schema.AI_REACT_LOOP_ACTION_ADJUST_TODOLIST); !ok {
+		if adjustTodolist, ok := GetLoopAction(schema.AI_REACT_LOOP_ACTION_ADJUST_TODOLIST); ok {
+			r.actions.Set(adjustTodolist.ActionType, adjustTodolist)
+		}
+	}
+
 	if r.allowRAG == nil || r.allowRAG() {
 		// allow tool call, must have tools
 		ins, ok := GetLoopAction(schema.AI_REACT_LOOP_ACTION_KNOWLEDGE_ENHANCE)
@@ -445,11 +729,15 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 	}
 
 	if r.allowPlanAndExec == nil || r.allowPlanAndExec() {
-		plan, ok := GetLoopAction(schema.AI_REACT_LOOP_ACTION_REQUEST_PLAN_EXECUTION)
-		if !ok {
-			return nil, utils.Errorf("loop action %s not found", schema.AI_REACT_LOOP_ACTION_REQUEST_PLAN_EXECUTION)
+		planActionType := schema.AI_REACT_LOOP_ACTION_REQUEST_PLAN_EXECUTION
+		if r.planExecActionType != "" {
+			planActionType = r.planExecActionType
 		}
-		r.actions.Set(plan.ActionType, plan)
+		planAction, ok := GetLoopAction(planActionType)
+		if !ok {
+			return nil, utils.Errorf("loop action %s not found", planActionType)
+		}
+		r.actions.Set(planAction.ActionType, planAction)
 	}
 
 	if r.allowUserInteract == nil || r.allowUserInteract() {
@@ -473,6 +761,19 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 		if r.allowSkillViewOffset == nil || r.allowSkillViewOffset() {
 			if changeOffset, ok := GetLoopAction(schema.AI_REACT_LOOP_ACTION_CHANGE_SKILL_VIEW_OFFSET); ok {
 				r.actions.Set(changeOffset.ActionType, changeOffset)
+			}
+		}
+	}
+
+	if IsMCPServersAllowed(invoker) {
+		if _, ok := r.actions.Get(schema.AI_REACT_LOOP_ACTION_QUERY_MCP_SERVERS); !ok {
+			if queryMCPServers, ok := GetLoopAction(schema.AI_REACT_LOOP_ACTION_QUERY_MCP_SERVERS); ok {
+				r.actions.Set(queryMCPServers.ActionType, queryMCPServers)
+			}
+		}
+		if _, ok := r.actions.Get(schema.AI_REACT_LOOP_ACTION_QUERY_MCP_TOOLS); !ok {
+			if queryMCPTools, ok := GetLoopAction(schema.AI_REACT_LOOP_ACTION_QUERY_MCP_TOOLS); ok {
+				r.actions.Set(queryMCPTools.ActionType, queryMCPTools)
 			}
 		}
 	}
@@ -552,6 +853,9 @@ func (r *ReActLoop) FinishAsyncTask(t aicommon.AIStatefulTask, err error) {
 		return
 	}
 	t.Finish(err)
+	if t.IsFinished() {
+		r.stopVerificationWatchdogForTask(t)
+	}
 	if r.onAsyncTaskFinished != nil {
 		r.onAsyncTaskFinished(t)
 	}
@@ -689,4 +993,59 @@ func (r *ReActLoop) GetTimelineDiffWithoutUpdate() string {
 	}
 	// Return current content as diff representation since we don't want to update baseline
 	return current
+}
+
+func loadConfiguredSkills(mgr *aiskillloader.SkillsContextManager, names []string, source string) {
+	if mgr == nil || len(names) == 0 {
+		return
+	}
+	results := mgr.LoadSkills(names)
+	var loaded, failed []string
+	for name, err := range results {
+		if err != nil {
+			failed = append(failed, name)
+			log.Warnf("failed to load skill %q from %s: %v", name, source, err)
+		} else {
+			loaded = append(loaded, name)
+		}
+	}
+	if len(loaded) > 0 {
+		log.Infof("loaded %d skills from %s: %v", len(loaded), source, loaded)
+	}
+	if len(failed) > 0 {
+		log.Warnf("failed to load %d skills from %s: %v", len(failed), source, failed)
+	}
+}
+
+func LoadEnabledForges(cfg *aicommon.Config, loop *ReActLoop, names []string) {
+	if cfg == nil || loop == nil || len(names) == 0 {
+		return
+	}
+	forgeMgr := cfg.GetAIForgeManager()
+	if forgeMgr == nil {
+		log.Warnf("enabled forge capabilities skipped: ai forge manager is nil")
+		return
+	}
+	ecm := loop.GetExtraCapabilities()
+	if ecm == nil {
+		log.Warnf("enabled forge capabilities skipped: extra capabilities manager is nil")
+		return
+	}
+	var loaded []string
+	for _, name := range names {
+		forge, err := forgeMgr.GetAIForge(name)
+		if err != nil {
+			log.Warnf("enabled capability forge %q load failed: %v", name, err)
+			continue
+		}
+		ecm.AddForges(ExtraForgeInfo{
+			Name:        forge.ForgeName,
+			VerboseName: forge.ForgeVerboseName,
+			Description: forge.Description,
+		})
+		loaded = append(loaded, forge.ForgeName)
+	}
+	if len(loaded) > 0 {
+		log.Infof("loaded %d forges from enabled capabilities: %v", len(loaded), loaded)
+	}
 }

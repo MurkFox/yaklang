@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"mime"
 	"net/http"
@@ -11,12 +12,14 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yaklang/yaklang/common/filter"
 	"github.com/yaklang/yaklang/common/go-funk"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/chanx"
 	"github.com/yaklang/yaklang/common/utils/lowhttp"
 	"golang.org/x/net/html"
 
@@ -44,19 +47,121 @@ type Crawler struct {
 	linkCounter            int64
 	handlingRequestCounter int
 
-	// 请求通道
-	reqChan chan *Req
-
 	requestedHash *sync.Map
 	foundUrls     *sync.Map
-	reqWaitGroup  *sync.WaitGroup
-	runOnce       *sync.Once
+	scheduler     *requestScheduler
 
-	// waitStartSubmitTasks
-	startUpSubmitTask *sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// login
 	loginOnce *sync.Once // := new(sync.Once)
+}
+
+type requestScheduler struct {
+	ctx context.Context
+	q   *chanx.UnlimitedChan[*Req]
+
+	pending     atomic.Int64
+	startupDone atomic.Bool
+	closed      atomic.Bool
+	closeOnce   sync.Once
+}
+
+func newRequestScheduler(ctx context.Context, queueSize int) *requestScheduler {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if queueSize <= 0 {
+		queueSize = 10
+	}
+	return &requestScheduler{
+		ctx: ctx,
+		q:   chanx.NewUnlimitedChan[*Req](ctx, queueSize),
+	}
+}
+
+func (s *requestScheduler) Output() <-chan *Req {
+	if s == nil || s.q == nil {
+		ch := make(chan *Req)
+		close(ch)
+		return ch
+	}
+	return s.q.OutputChannel()
+}
+
+func (s *requestScheduler) Submit(req *Req) (ok bool) {
+	if s == nil || s.q == nil || req == nil || s.contextDone() || s.closed.Load() {
+		return false
+	}
+	s.pending.Add(1)
+	defer func() {
+		if err := recover(); err != nil {
+			s.pending.Add(-1)
+			s.maybeClose()
+			ok = false
+		}
+	}()
+	if !s.q.SafeFeedWithResult(req) {
+		s.pending.Add(-1)
+		s.maybeClose()
+		return false
+	}
+	return true
+}
+
+func (s *requestScheduler) Done() {
+	if s == nil {
+		return
+	}
+	left := s.pending.Add(-1)
+	if left < 0 {
+		log.Errorf("crawler request scheduler pending counter is negative")
+		s.pending.Store(0)
+		left = 0
+	}
+	if left == 0 {
+		s.maybeClose()
+	}
+}
+
+func (s *requestScheduler) StartupDone() {
+	if s == nil {
+		return
+	}
+	s.startupDone.Store(true)
+	s.maybeClose()
+}
+
+func (s *requestScheduler) Close() {
+	if s == nil || s.q == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.q.Close()
+	})
+}
+
+func (s *requestScheduler) maybeClose() {
+	if s == nil {
+		return
+	}
+	if s.startupDone.Load() && s.pending.Load() == 0 {
+		s.Close()
+	}
+}
+
+func (s *requestScheduler) contextDone() bool {
+	if s == nil || s.ctx == nil {
+		return false
+	}
+	select {
+	case <-s.ctx.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 // Hash 返回当前请求的哈希值，其值由请求的URL与请求方法组成
@@ -237,6 +342,14 @@ func (r *Req) AbsoluteURL(u string) string {
 
 // Start 启动爬虫爬取某个URL，它还可以接收零个到多个选项函数，用于影响爬取行为
 // 返回一个Req结构体引用管道与错误
+// 参数:
+//   - url: 起始爬取的 URL
+//   - opt: 零个或多个爬虫配置选项函数
+//
+// 返回值:
+//   - 一个可迭代的 Req 结构体引用管道，用于读取爬取到的请求
+//   - error: 启动失败时返回错误
+//
 // Example:
 // ```
 // ch, err := crawler.Start("https://www.baidu.com", crawler.concurrent(10))
@@ -245,17 +358,19 @@ func (r *Req) AbsoluteURL(u string) string {
 // }
 // ```
 func StartCrawler(url string, opt ...ConfigOpt) (chan *Req, error) {
-	ch := make(chan *Req)
+	var resultChan *chanx.UnlimitedChan[*Req]
 	opt = append(opt, WithOnRequest(func(req *Req) {
-		ch <- req
+		resultChan.SafeFeed(req)
 	}))
 
 	crawler, err := NewCrawler(url, opt...)
 	if err != nil {
 		return nil, utils.Errorf("create crawler failed: %s", err)
 	}
+	ch := make(chan *Req, 64)
+	resultChan = chanx.NewUnlimitedChanEx[*Req](crawler.ctx, make(chan *Req, 64), ch, 64)
 	go func() {
-		defer close(ch)
+		defer resultChan.Close()
 
 		err := crawler.Run()
 		if err != nil {
@@ -289,21 +404,26 @@ func NewCrawler(urls string, opts ...ConfigOpt) (*Crawler, error) {
 	if config.concurrent <= 0 {
 		config.concurrent = 20
 	}
+	if config.ctx == nil {
+		config.ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(config.ctx)
+	config.ctx = ctx
+	config._cachedOpts = nil
+
 	c := &Crawler{
 		originUrls:       urlList,
 		config:           config,
 		preRequestLock:   new(sync.Mutex),
 		afterRequestLock: new(sync.Mutex),
 
-		finished:          utils.NewBool(false),
-		starting:          utils.NewBool(false),
-		reqChan:           make(chan *Req),
-		requestedHash:     new(sync.Map),
-		foundUrls:         new(sync.Map),
-		reqWaitGroup:      new(sync.WaitGroup),
-		runOnce:           new(sync.Once),
-		startUpSubmitTask: new(sync.WaitGroup),
-		loginOnce:         new(sync.Once),
+		finished:      utils.NewBool(false),
+		starting:      utils.NewBool(false),
+		requestedHash: new(sync.Map),
+		foundUrls:     new(sync.Map),
+		ctx:           ctx,
+		cancel:        cancel,
+		loginOnce:     new(sync.Once),
 	}
 
 	return c, nil
@@ -313,25 +433,28 @@ func (c *Crawler) Run() error {
 	if c.finished.IsSet() || c.starting.IsSet() {
 		return utils.Errorf("cannot call Run multi-times...")
 	}
+	c.initScheduler()
 
-	defer c.finished.Set()
+	defer func() {
+		if c.scheduler != nil {
+			c.scheduler.Close()
+		}
+		if c.cancel != nil {
+			c.cancel()
+		}
+		c.finished.Set()
+	}()
 
 	c.starting.Set()
 	defer c.starting.UnSet()
 
-	swg := utils.NewSizedWaitGroup(2)
-	swg.Add()
-	swg.Add()
-
-	c.startUpSubmitTask.Add(1)
 	go func() {
 		defer func() {
 			utils.Debug(func() {
 				log.Debugf("finished dispatching all tasks...")
 			})
-			c.startUpSubmitTask.Done()
+			c.scheduler.StartupDone()
 		}()
-		defer swg.Done()
 
 		log.Debug("start to submit tasks...")
 		if c.config.startFromParentPath {
@@ -361,6 +484,9 @@ func (c *Crawler) Run() error {
 			}
 		}
 		for _, u := range c.originUrls {
+			if c.contextDone() {
+				return
+			}
 			newReq, err := c.createReqFromUrl(nil, u)
 			if err != nil {
 				log.Error(err)
@@ -371,45 +497,44 @@ func (c *Crawler) Run() error {
 		}
 	}()
 
-	go func() {
-		defer swg.Done()
-
-		log.Debug("start to handling requests")
-		c.run()
-	}()
-
-	swg.Wait()
+	log.Debug("start to handling requests")
+	c.run()
 	return nil
 }
 
 func (c *Crawler) run() {
 	config := c.config
-	swg := utils.NewSizedWaitGroup(config.concurrent)
-	tick := time.Tick(1)
+	concurrent := config.concurrent
+	if concurrent <= 0 {
+		concurrent = 1
+	}
+	workerLimiter := make(chan struct{}, concurrent)
+	var workerWG sync.WaitGroup
+	reqOutput := c.scheduler.Output()
 
-MAINLY:
 	for {
 		select {
-		case <-tick:
-
-		case r, ok := <-c.reqChan:
+		case <-c.ctx.Done():
+			c.scheduler.Close()
+			workerWG.Wait()
+			return
+		case r, ok := <-reqOutput:
 			if !ok {
-				break MAINLY
+				workerWG.Wait()
+				return
 			}
-
-			go c.runOnce.Do(func() {
-				c.startUpSubmitTask.Wait()
-				c.reqWaitGroup.Wait()
-				close(c.reqChan)
-			})
+			if c.contextDone() {
+				c.scheduler.Done()
+				continue
+			}
 
 			log.Debugf("start to handling request: %v", r.request.URL.String())
 
 			// 预处理失败
 			c.preRequestLock.Lock()
-			if !c.preReq(r) {
+			if c.contextDone() || !c.preReq(r) {
 				c.preRequestLock.Unlock()
-				c.reqWaitGroup.Done()
+				c.scheduler.Done()
 				continue
 			}
 
@@ -420,14 +545,14 @@ MAINLY:
 			// 请求最大值限制
 			// 判断请求最大值限制
 			if c.requestCounter > int64(config.maxCountOfRequest) {
-				c.reqWaitGroup.Done()
+				c.scheduler.Done()
 				continue
 			}
 
 			// 已经被请求过了
 			_, ok = c.requestedHash.Load(r.Hash())
 			if ok {
-				c.reqWaitGroup.Done()
+				c.scheduler.Done()
 				continue
 			}
 
@@ -437,34 +562,50 @@ MAINLY:
 			}
 			if !config.CheckShouldBeHandledURL(r.request.URL) {
 				c.requestedHash.Store(r.Hash(), nil)
-				c.reqWaitGroup.Done()
+				c.scheduler.Done()
 				continue
 			}
 
-			swg.Add()
-			go func() {
+			select {
+			case workerLimiter <- struct{}{}:
+			case <-c.ctx.Done():
+				c.scheduler.Done()
+				continue
+			}
+			workerWG.Add(1)
+			go func(r *Req) {
 				defer func() {
-					c.reqWaitGroup.Done()
+					<-workerLimiter
+					c.scheduler.Done()
+					workerWG.Done()
 				}()
 				log.Debugf("request to %v", r.request.URL.String())
 				c.requestedHash.Store(r.Hash(), nil)
 				c.execReq(r)
-				swg.Done()
+				if c.contextDone() {
+					return
+				}
 
 				// 发送结束了
 				c.afterRequestLock.Lock()
 				c.handleReqResult(r)
 				c.handlingRequestCounter--
 				c.afterRequestLock.Unlock()
-			}()
+			}(r)
 		}
 	}
-
-	// 所有的请求都结束了
-	swg.Wait()
 }
 
 // RequestsFromFlow 尝试从一次请求与响应中爬取出所有可能的请求，返回所有可能请求的原始报文与错误
+// 参数:
+//   - isHttps: 该流量是否为 HTTPS
+//   - reqBytes: 请求原始报文
+//   - rspBytes: 响应原始报文
+//
+// 返回值:
+//   - [][]byte: 爬取到的所有可能请求的原始报文列表
+//   - error: 处理失败时返回错误
+//
 // Example:
 // ```
 // reqs, err = crawler.RequestsFromFlow(false, reqBytes, rspBytes)
@@ -542,6 +683,9 @@ func HandleRequestResult(isHttps bool, reqBytes, rspBytes []byte) ([][]byte, err
 }
 
 func (c *Crawler) handleReqResult(r *Req) {
+	if c.contextDone() {
+		return
+	}
 	if r.err != nil {
 		log.Errorf("request error: %s", r.err.Error())
 		return
@@ -553,10 +697,16 @@ func (c *Crawler) handleReqResult(r *Req) {
 	}
 
 	submit := func(reqHttps bool, reqBytes []byte) {
+		if c.contextDone() {
+			return
+		}
 		req, err := c.createReqFromBytes(r, reqHttps, reqBytes)
 		if err != nil {
 			log.Errorf("create request from bytes error: %s", err.Error())
 			return
+		}
+		if config.onUrlFound != nil {
+			config.onUrlFound(req.Url())
 		}
 		if ret, err := url.Parse(req.Url()); err != nil {
 			if !config.CheckShouldBeHandledURL(ret) {
@@ -588,20 +738,15 @@ func (c *Crawler) handleReqResult(r *Req) {
 		}),
 		WithFetcher_HtmlTag(func(s string, node *html.Node) {
 			if s == "script" {
-				// skip js
 				return
 			}
 
-			// form
-			if s == "form" {
-				return
-			}
-
-			// meta
-			// [href] / [src]
 			for _, attr := range node.Attr {
 				switch strings.ToLower(attr.Key) {
-				case "href", "src":
+				case "href", "src", "action":
+					if attr.Val == "" {
+						continue
+					}
 					reqHttps, reqBytes, err := NewHTTPRequest(r.IsHttps(), r.requestRaw, r.responseBody, attr.Val)
 					if err != nil {
 						log.Errorf("new request error: %s", err.Error())
@@ -616,51 +761,62 @@ func (c *Crawler) handleReqResult(r *Req) {
 		log.Errorf("page information walker error: %s", err.Error())
 	}
 
+	// External JS contents are needed by both the SSA path (enableJSParser)
+	// and the AI extract path (enableAIJSExtract). Fetch once if either toggle
+	// is on; the helper is idempotent over content.IsCodeText.
+	if config.enableJSParser || config.enableAIJSExtract {
+		c.fetchExternalJSCodes(r, jsContents)
+	}
+
+	// AI assisted JS / HTML path extraction. Runs independently of jsParser,
+	// so users can opt-in to either or both. Each emitted path goes through
+	// the same submit() pipeline so deduplication / domain filters apply.
+	if config.enableAIJSExtract {
+		var combined bytes.Buffer
+		if len(r.responseBody) > 0 {
+			combined.Write(r.responseBody)
+			// Block-end markers must NOT start with "//" or look like a path,
+			// otherwise both the regex pre-filter and the AI step will mis-read
+			// them as protocol-relative URLs (regression: leaked as
+			// "http://---html-end---/" downstream).
+			combined.WriteString("\n/* yak-html-end */\n")
+		}
+		for _, j := range jsContents {
+			if j.IsCodeText && j.Code != "" {
+				combined.WriteString(j.Code)
+				combined.WriteString("\n/* yak-js-end */\n")
+			}
+		}
+		if combined.Len() > 0 {
+			// Build a per-request shallow copy so that RequestRaw / IsHTTPS do
+			// not leak across concurrent crawler requests sharing the shared
+			// config.aiJSExtractConfig template.
+			extractCfg := *config.aiJSExtractConfig
+			extractCfg.IsHTTPS = r.IsHttps()
+			extractCfg.RequestRaw = r.requestRaw
+
+			extractCtx, extractCancel := context.WithTimeout(c.ctx, 5*time.Minute)
+			err := RunAIJSExtract(extractCtx, combined.String(), &extractCfg, func(p string) {
+				if c.contextDone() {
+					return
+				}
+				httpsR, reqBytes, err := NewHTTPRequest(r.IsHttps(), r.requestRaw, r.responseBody, p)
+				if err != nil {
+					log.Debugf("ai js extract: build http request failed for %q: %v", p, err)
+					return
+				}
+				submit(httpsR, reqBytes)
+			})
+			extractCancel()
+			if err != nil {
+				log.Warnf("ai js extract: pipeline error: %v", err)
+			}
+		}
+	}
+
 	if !config.enableJSParser {
 		return
 	}
-
-	// with JS Parse
-
-	jsConcurrent := config.concurrent / 2
-	if jsConcurrent <= 0 {
-		jsConcurrent = 3
-	}
-	swg := utils.NewSizedWaitGroup(jsConcurrent)
-	for _, content := range jsContents {
-		if content.IsCodeText {
-			continue
-		}
-		swg.Add(1)
-		content := content
-		go func() {
-			defer swg.Done()
-
-			reqHttps, reqBytes, err := NewHTTPRequest(r.IsHttps(), r.requestRaw, r.responseRaw, content.UrlPath)
-			if err != nil {
-				log.Errorf("build http request(js) failed: %s", content.UrlPath)
-				return
-			}
-			urlIns, _ := lowhttp.ExtractURLFromHTTPRequestRaw(reqBytes, reqHttps)
-			if urlIns != nil {
-				log.Infof("Start to fetch JS(via URL): %v", urlIns.String())
-			}
-			rsp, _, err := config.DoHTTPRequest(reqHttps, c.config.runtimeID, lowhttp.WithRequest(reqBytes))
-			if err != nil {
-				return
-			}
-
-			if !utils.IContains(lowhttp.GetHTTPPacketContentType(rsp.RawPacket), "javascript") {
-				return
-			}
-
-			rspHeader, body := lowhttp.SplitHTTPPacketFast(rsp.RawPacket)
-			content.Code = string(body)
-			content.IsCodeText = true
-			_ = rspHeader
-		}()
-	}
-	swg.Wait()
 
 	var fullJSCode bytes.Buffer
 
@@ -672,14 +828,86 @@ func (c *Crawler) handleReqResult(r *Req) {
 		fullJSCode.WriteByte(';')
 		fullJSCode.WriteByte('\n')
 	}
-	utils.CallWithTimeout(30, func() {
+	jsCtx, jsCancel := context.WithTimeout(c.ctx, 30*time.Second)
+	defer jsCancel()
+	_ = utils.CallWithCtx(jsCtx, func() {
 		HandleJSGetNewRequest(r.https, r.requestRaw, fullJSCode.String(), func(b bool, i []byte) {
+			if c.contextDone() {
+				return
+			}
 			submit(b, i)
 		})
 	})
 }
 
-var metaUrlExtractor = regexp.MustCompile(`(?i)url=\s*([^\s]+)`)
+// fetchExternalJSCodes pulls remote JS bodies referenced by jsContents (where
+// IsCodeText is false) and stamps them back as code text. The function is
+// idempotent: items that already carry inline code are skipped, so calling it
+// from multiple gates costs nothing extra.
+func (c *Crawler) fetchExternalJSCodes(r *Req, jsContents []*JavaScriptContent) {
+	config := c.config
+	jsConcurrent := config.concurrent / 2
+	if jsConcurrent <= 0 {
+		jsConcurrent = 3
+	}
+	workerLimiter := make(chan struct{}, jsConcurrent)
+	var wg sync.WaitGroup
+FETCH_LOOP:
+	for _, content := range jsContents {
+		if c.contextDone() {
+			break
+		}
+		if content.IsCodeText {
+			continue
+		}
+		select {
+		case workerLimiter <- struct{}{}:
+		case <-c.ctx.Done():
+			break FETCH_LOOP
+		}
+		wg.Add(1)
+		content := content
+		go func() {
+			defer func() {
+				<-workerLimiter
+				wg.Done()
+			}()
+			if c.contextDone() {
+				return
+			}
+
+			reqHttps, reqBytes, err := NewHTTPRequest(r.IsHttps(), r.requestRaw, r.responseRaw, content.UrlPath)
+			if err != nil {
+				log.Errorf("build http request(js) failed: %s", content.UrlPath)
+				return
+			}
+			urlIns, _ := lowhttp.ExtractURLFromHTTPRequestRaw(reqBytes, reqHttps)
+			if urlIns != nil {
+				log.Infof("Start to fetch JS(via URL): %v", urlIns.String())
+				// External JS <script src=...> is intentionally skipped by the
+				// HtmlTag-based submit pipeline (see handleResponse), so its URL
+				// would otherwise never reach onUrlFound. Report it here to keep
+				// the discovery channel complete.
+				if config.onUrlFound != nil {
+					config.onUrlFound(urlIns.String())
+				}
+			}
+			rsp, _, err := config.DoHTTPRequest(reqHttps, c.config.runtimeID, lowhttp.WithRequest(reqBytes))
+			if err != nil {
+				return
+			}
+
+			if !utils.IContains(lowhttp.GetHTTPPacketContentType(rsp.RawPacket), "javascript") {
+				return
+			}
+
+			_, body := lowhttp.SplitHTTPPacketFast(rsp.RawPacket)
+			content.Code = string(body)
+			content.IsCodeText = true
+		}()
+	}
+	wg.Wait()
+}
 
 func handleReqResultEx(r *Req, reqHandler func(*Req) bool, urlHandler func(string) bool, extractionRulesHandler func(*Req) []interface{}) {
 	foundPathOrUrls := new(sync.Map)
@@ -845,17 +1073,32 @@ func (c *Crawler) preReq(r *Req) bool {
 	return true
 }
 
-func (c *Crawler) submit(r *Req) {
-	c.reqWaitGroup.Add(1)
-	defer func() {
-		if err := recover(); err != nil {
-			// channel 已关闭，回滚 WaitGroup 计数
-			c.reqWaitGroup.Done()
-		}
-	}()
-	select {
-	case c.reqChan <- r:
+func (c *Crawler) contextDone() bool {
+	if c == nil || c.ctx == nil {
+		return false
 	}
+	select {
+	case <-c.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Crawler) initScheduler() {
+	if c == nil {
+		return
+	}
+
+	size := c.config.concurrent * 3
+	c.scheduler = newRequestScheduler(c.ctx, size)
+}
+
+func (c *Crawler) submit(r *Req) bool {
+	if c == nil || c.scheduler == nil {
+		return false
+	}
+	return c.scheduler.Submit(r)
 }
 
 func (c *Crawler) createReqFromUrl(preRequest *Req, u string) (*Req, error) {
@@ -929,9 +1172,16 @@ func (c *Crawler) execReq(r *Req) {
 	if r.request == nil {
 		return
 	}
+	if c.contextDone() {
+		r.err = c.ctx.Err()
+		return
+	}
 
 	if c.config.onLogin != nil && r.IsLoginForm() && r.IsForm() {
 		c.loginOnce.Do(func() {
+			if c.contextDone() {
+				return
+			}
 			c.config.onLogin(r)
 		})
 	}

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
@@ -15,6 +16,9 @@ func TestBuildOptionsFromConfig_AppliesAPIType(t *testing.T) {
 			APIKey:  "test-key",
 			Domain:  "api.openai.com",
 			APIType: "responses",
+			Headers: []*ypb.KVPair{
+				{Key: "X-Test-Header", Value: "test-value"},
+			},
 		},
 	}
 
@@ -23,6 +27,103 @@ func TestBuildOptionsFromConfig_AppliesAPIType(t *testing.T) {
 	assert.Equal(t, "gpt-4.1-mini", resolved.Model)
 	assert.Equal(t, "openai", resolved.Type)
 	assert.Equal(t, "api.openai.com", resolved.Domain)
+	assert.Len(t, resolved.Headers, 1)
+	assert.Equal(t, "X-Test-Header", resolved.Headers[0].GetKey())
+	assert.Equal(t, "test-value", resolved.Headers[0].GetValue())
+}
+
+func TestBuildOptionsFromConfig_AppliesEnableThinking(t *testing.T) {
+	config := &ypb.AIModelConfig{
+		ModelName: "deepseek-ai/DeepSeek-V4-Flash",
+		Provider: &ypb.ThirdPartyApplicationConfig{
+			Type:           "siliconflow",
+			APIKey:         "test-key",
+			Domain:         "api.siliconflow.cn",
+			EnableThinking: true,
+		},
+	}
+
+	// 仅应用 BuildOptionsFromConfig，避免 NewDefaultAIConfig 命中环境里的 tiered 配置并覆盖 thinking 相关字段。
+	resolved := &AIConfig{}
+	for _, opt := range BuildOptionsFromConfig(config) {
+		opt(resolved)
+	}
+	assert.Equal(t, "siliconflow", resolved.Type)
+	assert.Equal(t, "deepseek-ai/DeepSeek-V4-Flash", resolved.Model)
+	require.NotNil(t, resolved.EnableThinking)
+	assert.True(t, *resolved.EnableThinking)
+}
+
+func TestBuildOptionsFromConfig_EnableThinkingOptOverridesEnableThinking(t *testing.T) {
+	disabled := false
+	config := &ypb.AIModelConfig{
+		ModelName: "doubao-pro",
+		Provider: &ypb.ThirdPartyApplicationConfig{
+			Type:               "openai",
+			APIKey:             "test-key",
+			EnableThinking:     true,
+			EnableThinkingOpt:  &disabled,
+		},
+	}
+	resolved := &AIConfig{}
+	for _, opt := range BuildOptionsFromConfig(config) {
+		opt(resolved)
+	}
+	require.NotNil(t, resolved.EnableThinking)
+	assert.False(t, *resolved.EnableThinking)
+}
+
+func TestBuildOptionsFromConfig_EnableThinkingOptTrue(t *testing.T) {
+	enabled := true
+	config := &ypb.AIModelConfig{
+		ModelName: "some-model",
+		Provider: &ypb.ThirdPartyApplicationConfig{
+			Type:              "siliconflow",
+			APIKey:            "k",
+			EnableThinkingOpt: &enabled,
+		},
+	}
+	resolved := &AIConfig{}
+	for _, opt := range BuildOptionsFromConfig(config) {
+		opt(resolved)
+	}
+	require.NotNil(t, resolved.EnableThinking)
+	assert.True(t, *resolved.EnableThinking)
+}
+
+func TestBuildOptionsFromConfig_AppliesModelSamplingParams(t *testing.T) {
+	maxT := int64(8192)
+	temp := 0.7
+	topP := 0.7
+	topK := int64(50)
+	freq := 0.0
+	reason := "high"
+	config := &ypb.AIModelConfig{
+		ModelName: "gpt-4o",
+		Provider: &ypb.ThirdPartyApplicationConfig{
+			Type:               "openai",
+			APIKey:             "test-key",
+			MaxTokens:          &maxT,
+			Temperature:        &temp,
+			TopP:               &topP,
+			TopK:               &topK,
+			FrequencyPenalty:   &freq,
+			ReasoningEffort:    &reason,
+		},
+	}
+
+	resolved := NewDefaultAIConfig(BuildOptionsFromConfig(config)...)
+	require.NotNil(t, resolved.MaxTokens)
+	assert.Equal(t, int64(8192), *resolved.MaxTokens)
+	require.NotNil(t, resolved.Temperature)
+	assert.InDelta(t, 0.7, *resolved.Temperature, 1e-9)
+	require.NotNil(t, resolved.TopP)
+	assert.InDelta(t, 0.7, *resolved.TopP, 1e-9)
+	require.NotNil(t, resolved.TopK)
+	assert.Equal(t, int64(50), *resolved.TopK)
+	require.NotNil(t, resolved.FrequencyPenalty)
+	assert.InDelta(t, 0.0, *resolved.FrequencyPenalty, 1e-9)
+	assert.Equal(t, "high", resolved.ReasoningEffort)
 }
 
 func TestGetBaseURLFromConfig_UsesResponsesAPIType(t *testing.T) {
@@ -44,6 +145,20 @@ func TestGetBaseURLFromConfig_UsesResponsesAPIType(t *testing.T) {
 
 	assert.Equal(t,
 		"https://proxy.example.com/v1/responses",
+		GetBaseURLFromConfig(config, "https://api.openai.com", "/v1/chat/completions"),
+	)
+}
+
+func TestGetBaseURLFromConfig_UsesExplicitEndpointWhenEnabled(t *testing.T) {
+	config := NewDefaultAIConfig(
+		WithType("openai"),
+		WithBaseURL("https://proxy.example.com/v1"),
+		WithEndpoint("https://proxy.example.com/custom/chat/completions"),
+		WithEnableEndpoint(true),
+	)
+
+	assert.Equal(t,
+		"https://proxy.example.com/custom/chat/completions",
 		GetBaseURLFromConfig(config, "https://api.openai.com", "/v1/chat/completions"),
 	)
 }

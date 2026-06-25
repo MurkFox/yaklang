@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +12,10 @@ import (
 	"github.com/yaklang/go-llvm"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yak/ssa2llvm/linkprep"
 	"github.com/yaklang/yaklang/common/yak/ssa2llvm/obfuscation"
+	"github.com/yaklang/yaklang/common/yak/ssa2llvm/profile"
+	"github.com/yaklang/yaklang/common/yak/ssa2llvm/runtime/abi"
 	"github.com/yaklang/yaklang/common/yak/ssa2llvm/runtime/embed"
 	"github.com/yaklang/yaklang/common/yak/ssa2llvm/trace"
 	"github.com/yaklang/yaklang/common/yak/ssaapi"
@@ -40,8 +44,33 @@ type CompileConfig struct {
 	SkipRuntimeLink   bool
 	RuntimeArchive    string
 	PrintEntryResult  bool
+	PluginType        string
 	Obfuscators       []string
 	StdlibCompile     bool
+	StdlibCompileSet  bool
+	ProfileName       string
+	LLVMPluginPath    string
+	LLVMPluginKind    string
+	LLVMPasses        []string
+	LLVMPack          string
+	LLVMOptBinary     string
+	// ObfArchives holds paths to obfuscation runtime archives that the
+	// linker must include alongside libyak.a. Populated automatically
+	// by the compile pipeline from runtime deps declared by active obfuscators.
+	ObfArchives []string
+
+	// BuildSeed is an optional 32-byte seed for build diversification.
+	// When set, obfuscators may use it to vary their output per build.
+	// Derived from the profile's SeedPolicy or supplied by the user.
+	BuildSeed []byte
+
+	// RuntimeSymManifest maps canonical runtime symbol names to per-build link
+	// names when link_prep.randomize_runtime_symbols is enabled.
+	RuntimeSymManifest map[string]string
+
+	// resolvedProfile is populated by prepareCompileConfig from the --profile ref.
+	// It drives function selection and cache keys.
+	resolvedProfile *profile.Profile
 
 	// CacheEnabled uses a deterministic work dir under $TMP and reuses existing artifacts.
 	CacheEnabled bool
@@ -144,14 +173,47 @@ func WithCompilePrintEntryResult(enabled bool) CompileOption {
 	return func(c *CompileConfig) { c.PrintEntryResult = enabled }
 }
 
+func WithCompilePluginType(pluginType string) CompileOption {
+	return func(c *CompileConfig) { c.PluginType = strings.TrimSpace(pluginType) }
+}
+
 func WithCompileObfuscators(names ...string) CompileOption {
 	return func(c *CompileConfig) {
 		c.Obfuscators = appendObfuscatorNames(c.Obfuscators, names...)
 	}
 }
 
+func WithCompileProfile(name string) CompileOption {
+	return func(c *CompileConfig) { c.ProfileName = strings.TrimSpace(name) }
+}
+
+func WithCompileLLVMPlugin(path string) CompileOption {
+	return func(c *CompileConfig) { c.LLVMPluginPath = strings.TrimSpace(path) }
+}
+
+func WithCompileLLVMPluginKind(kind string) CompileOption {
+	return func(c *CompileConfig) { c.LLVMPluginKind = strings.TrimSpace(kind) }
+}
+
+func WithCompileLLVMPasses(passes ...string) CompileOption {
+	return func(c *CompileConfig) {
+		c.LLVMPasses = appendNormalizedCSV(c.LLVMPasses, passes...)
+	}
+}
+
+func WithCompileLLVMPack(packRef string) CompileOption {
+	return func(c *CompileConfig) { c.LLVMPack = strings.TrimSpace(packRef) }
+}
+
+func WithCompileLLVMOptBinary(path string) CompileOption {
+	return func(c *CompileConfig) { c.LLVMOptBinary = strings.TrimSpace(path) }
+}
+
 func WithCompileStdlibCompile(enabled bool) CompileOption {
-	return func(c *CompileConfig) { c.StdlibCompile = enabled }
+	return func(c *CompileConfig) {
+		c.StdlibCompile = enabled
+		c.StdlibCompileSet = true
+	}
 }
 
 func WithCompileCacheEnabled(enabled bool) CompileOption {
@@ -183,11 +245,29 @@ func WithCompileConfig(cfg CompileConfig) CompileOption {
 		c.SkipRuntimeLink = cfg.SkipRuntimeLink
 		c.RuntimeArchive = cfg.RuntimeArchive
 		c.PrintEntryResult = cfg.PrintEntryResult
+		c.PluginType = cfg.PluginType
 		c.Obfuscators = append(c.Obfuscators, cfg.Obfuscators...)
 		c.StdlibCompile = cfg.StdlibCompile
+		c.StdlibCompileSet = cfg.StdlibCompileSet
+		c.ProfileName = cfg.ProfileName
+		c.LLVMPluginPath = cfg.LLVMPluginPath
+		c.LLVMPluginKind = cfg.LLVMPluginKind
+		c.LLVMPasses = append(c.LLVMPasses, cfg.LLVMPasses...)
+		c.LLVMPack = cfg.LLVMPack
+		c.LLVMOptBinary = cfg.LLVMOptBinary
 		c.CacheEnabled = cfg.CacheEnabled
 		c.Force = cfg.Force
 		c.Trace = cfg.Trace
+		c.BuildSeed = append([]byte{}, cfg.BuildSeed...)
+		if len(cfg.RuntimeSymManifest) > 0 {
+			c.RuntimeSymManifest = make(map[string]string, len(cfg.RuntimeSymManifest))
+			for k, v := range cfg.RuntimeSymManifest {
+				c.RuntimeSymManifest[k] = v
+			}
+		}
+		if cfg.resolvedProfile != nil {
+			c.resolvedProfile = cfg.resolvedProfile.Clone()
+		}
 		if len(cfg.ExtraLinkArgs) > 0 {
 			c.ExtraLinkArgs = append(c.ExtraLinkArgs, cfg.ExtraLinkArgs...)
 		}
@@ -208,7 +288,27 @@ func compileInput(
 	entryFunction string,
 	obfuscators []string,
 ) (*ssaapi.Program, *Compiler, string, error) {
-	code, sourceLabel, language, err := resolveCompileInput(sourceFile, sourceCode, language)
+	cfg := newCompileConfig(
+		WithCompileSourceFile(sourceFile),
+		WithCompileSourceCode(sourceCode),
+		WithCompileLanguage(language),
+		WithCompileEntryFunction(entryFunction),
+		WithCompileExternBindings(externBindings),
+		WithCompileObfuscators(obfuscators...),
+	)
+	return compileInputWithConfig(cfg)
+}
+
+func compileInputWithConfig(cfg *CompileConfig) (*ssaapi.Program, *Compiler, string, error) {
+	if cfg == nil {
+		return nil, nil, "", utils.Errorf("compile failed: nil config")
+	}
+
+	code, sourceLabel, language, err := resolveCompileInput(cfg.SourceFile, cfg.SourceCode, cfg.Language)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	code, err = wrapYakPluginSource(code, cfg.PluginType)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -221,31 +321,53 @@ func compileInput(
 	}
 	obfCtx := &obfuscation.Context{
 		SSA:           progBundle.Program,
-		EntryFunction: entryFunction,
+		EntryFunction: cfg.EntryFunctionName,
 		InstrTags:     make(map[int64]string),
+		BuildSeed:     cfg.BuildSeed,
 	}
+
+	if cfg.resolvedProfile != nil {
+		inv := profile.BuildInventoryFromSSA(progBundle.Program, cfg.EntryFunctionName)
+		resolution, err := profile.Resolve(cfg.resolvedProfile, inv)
+		if err != nil {
+			return nil, nil, "", utils.Errorf("resolve compile profile: %v", err)
+		}
+		obfCtx.Selections = resolution.Selections
+	}
+
 	obfCtx.Stage = obfuscation.StageSSAPre
-	if err := obfuscation.Apply(obfCtx, obfuscators); err != nil {
+	if err := obfuscation.Apply(obfCtx, cfg.Obfuscators); err != nil {
 		return nil, nil, "", utils.Errorf("SSA pre-obfuscation failed: %v", err)
 	}
-	if err := PrepareCallLoweringTags(progBundle.Program, externBindings, obfCtx.InstrTags); err != nil {
+	if err := PrepareCallLoweringTags(progBundle.Program, cfg.ExternBindings, obfCtx.InstrTags); err != nil {
 		return nil, nil, "", utils.Errorf("SSA call lowering preparation failed: %v", err)
 	}
 	obfCtx.Stage = obfuscation.StageSSAPost
-	if err := obfuscation.Apply(obfCtx, obfuscators); err != nil {
+	if err := obfuscation.Apply(obfCtx, cfg.Obfuscators); err != nil {
 		return nil, nil, "", utils.Errorf("SSA post-obfuscation failed: %v", err)
 	}
+
+	patchObfuscationRuntimeSymbols(obfCtx, cfg.RuntimeSymManifest)
 
 	llvm.InitializeNativeTarget()
 	llvm.InitializeNativeAsmPrinter()
 
 	log.Infof("compiling %s (%s)", sourceLabel, language)
 
+	var compilerOpts []CompilerOption
+	compilerOpts = append(compilerOpts,
+		WithExternBindings(cfg.ExternBindings),
+		WithInstructionTags(obfCtx.InstrTags),
+		WithRuntimeSymManifest(cfg.RuntimeSymManifest),
+	)
+	if len(obfCtx.FunctionWrappers) > 0 {
+		compilerOpts = append(compilerOpts, WithFunctionWrappers(obfCtx.FunctionWrappers))
+	}
+
 	comp := NewCompiler(
 		ctx,
 		progBundle.Program,
-		WithExternBindings(externBindings),
-		WithInstructionTags(obfCtx.InstrTags),
+		compilerOpts...,
 	)
 	if err := comp.Compile(); err != nil {
 		comp.Dispose()
@@ -253,17 +375,26 @@ func compileInput(
 	}
 	obfCtx.LLVM = comp.Mod
 	obfCtx.Stage = obfuscation.StageLLVM
-	if err := obfuscation.Apply(obfCtx, obfuscators); err != nil {
+	if err := obfuscation.Apply(obfCtx, cfg.Obfuscators); err != nil {
 		comp.Dispose()
 		return nil, nil, "", utils.Errorf("LLVM obfuscation failed: %v", err)
 	}
 
+	ir := comp.Mod.String()
 	if err := llvm.VerifyModule(comp.Mod, llvm.PrintMessageAction); err != nil {
+		if cfg.EmitLLVM {
+			if out, writeErr := writeLLVMIRArtifact(cfg, ir); writeErr != nil {
+				comp.Dispose()
+				return nil, nil, "", utils.Errorf("LLVM verification failed: %v; additionally failed to write LLVM IR: %v", err, writeErr)
+			} else {
+				log.Infof("LLVM IR written to: %s", out)
+			}
+		}
 		comp.Dispose()
 		return nil, nil, "", utils.Errorf("LLVM verification failed: %v", err)
 	}
 
-	return progBundle, comp, comp.Mod.String(), nil
+	return progBundle, comp, ir, nil
 }
 
 func resolveCompileInput(sourceFile, sourceCode, language string) (string, string, string, error) {
@@ -336,17 +467,17 @@ func entryFunctionCandidates(requested string) []string {
 func renameConflictingMainFunctions(mod llvm.Module, entryFunc string) string {
 	atMain := mod.NamedFunction("@main")
 	if !atMain.IsNil() {
-		atMain.SetName("yak_internal_atmain")
+		atMain.SetName(abi.InternalAtMainSymbol)
 		if entryFunc == "@main" {
-			entryFunc = "yak_internal_atmain"
+			entryFunc = abi.InternalAtMainSymbol
 		}
 	}
 
 	plainMain := mod.NamedFunction("main")
 	if !plainMain.IsNil() {
-		plainMain.SetName("yak_internal_main")
+		plainMain.SetName(abi.InternalMainSymbol)
 		if entryFunc == "main" {
-			entryFunc = "yak_internal_main"
+			entryFunc = abi.InternalMainSymbol
 		}
 	}
 
@@ -373,6 +504,9 @@ func CompileToExecutable(opts ...CompileOption) (CompileResult, error) {
 func compileWithConfig(cfg *CompileConfig) (CompileResult, error) {
 	if cfg == nil {
 		return CompileResult{}, utils.Errorf("compile failed: nil config")
+	}
+	if err := prepareCompileConfig(cfg); err != nil {
+		return CompileResult{}, err
 	}
 
 	// If requested, enable go-build-like trace for WORK and command lines.
@@ -429,50 +563,61 @@ func compileWithConfig(cfg *CompileConfig) (CompileResult, error) {
 		}
 	}
 
-	// Prepare runtime archive when linking and no archive is explicitly provided.
+	// Prepare full embedded runtime archive when linking and stdlib pruning is disabled.
+	// Pruned stdlib compilation needs SSA/lowering information, so it is done later,
+	// immediately before native linking.
 	runtimeArchive := strings.TrimSpace(cfg.RuntimeArchive)
 	extraLinkArgs := append([]string{}, cfg.ExtraLinkArgs...)
-	if linking && runtimeArchive == "" {
-		if cfg.StdlibCompile {
-			archivePath, gcLibDir, buildErr := embed.BuildRuntimeArchiveFromEmbeddedSource(cfg.WorkDir)
-			if buildErr != nil {
-				return CompileResult{}, buildErr
-			}
+	if linking && runtimeArchive == "" && !cfg.StdlibCompile {
+		if archivePath, extractErr := embed.ExtractLibyakToDir(cfg.WorkDir); extractErr == nil {
 			runtimeArchive = archivePath
 			cfg.RuntimeArchive = archivePath
-			if strings.TrimSpace(gcLibDir) != "" {
-				extraLinkArgs = append(extraLinkArgs, "-L"+gcLibDir)
-			}
-		} else {
-			if archivePath, extractErr := embed.ExtractLibyakToDir(cfg.WorkDir); extractErr == nil {
-				runtimeArchive = archivePath
-				cfg.RuntimeArchive = archivePath
-			} else if extractErr != embed.ErrNoEmbeddedRuntime {
-				return CompileResult{}, extractErr
-			}
+		} else if extractErr != embed.ErrNoEmbeddedRuntime {
+			return CompileResult{}, extractErr
+		}
 
-			if _, gcErr := embed.ExtractLibgcToDir(cfg.WorkDir); gcErr == nil {
-				// Extracted libgc.a into the work dir; clang will use -L$WORK -lgc.
-				extraLinkArgs = append(extraLinkArgs, "-L"+cfg.WorkDir)
-			} else if gcErr != embed.ErrNoEmbeddedRuntime {
-				return CompileResult{}, gcErr
-			}
+		if _, gcErr := embed.ExtractLibgcToDir(cfg.WorkDir); gcErr == nil {
+			// Extracted libgc.a into the work dir; clang will use -L$WORK -lgc.
+			extraLinkArgs = append(extraLinkArgs, "-L"+cfg.WorkDir)
+		} else if gcErr != embed.ErrNoEmbeddedRuntime {
+			return CompileResult{}, gcErr
 		}
 	}
 	cfg.ExtraLinkArgs = extraLinkArgs
 
-	_, comp, ir, err := compileInput(
-		cfg.SourceFile,
-		cfg.SourceCode,
-		cfg.Language,
-		cfg.ExternBindings,
-		cfg.EntryFunctionName,
-		cfg.Obfuscators,
-	)
+	// When embedding is disabled, ExtractLibyakToDir leaves RuntimeArchive empty and
+	// CompileLLVMToBinary falls back to findRuntimeArchive() at link time. Linkprep
+	// must see the same path up front so archives are rewritten before clang runs.
+	if linking && strings.TrimSpace(cfg.RuntimeArchive) == "" && !cfg.StdlibCompile {
+		p, err := findRuntimeArchive()
+		if err == nil {
+			cfg.RuntimeArchive = p
+			runtimeArchive = p
+		} else {
+			archivePath, gcLibDir, fullBuildErr := embed.BuildRuntimeArchiveFromLocalSource(cfg.WorkDir)
+			if fullBuildErr != nil {
+				return CompileResult{}, fullBuildErr
+			}
+			cfg.RuntimeArchive = archivePath
+			runtimeArchive = archivePath
+			if strings.TrimSpace(gcLibDir) != "" {
+				extraLinkArgs = append(extraLinkArgs, "-L"+gcLibDir)
+				cfg.ExtraLinkArgs = extraLinkArgs
+			}
+		}
+	}
+
+	_, comp, ir, err := compileInputWithConfig(cfg)
 	if err != nil {
 		return CompileResult{}, err
 	}
 	defer comp.Dispose()
+
+	// Collect obf runtime deps for linking.
+	if len(cfg.Obfuscators) > 0 {
+		deps := obfuscation.CollectRuntimeDeps(cfg.Obfuscators)
+		cfg.ObfArchives = obfuscation.ExtraRuntimeArchivePaths(deps, cfg.WorkDir)
+	}
 
 	entryFunc, _, err := resolveEntryFunction(comp.Mod, cfg.EntryFunctionName)
 	if err != nil {
@@ -486,41 +631,19 @@ func compileWithConfig(cfg *CompileConfig) (CompileResult, error) {
 
 	// Verify again after emitting the wrapper entrypoint.
 	if err := llvm.VerifyModule(comp.Mod, llvm.PrintMessageAction); err != nil {
+		if cfg.EmitLLVM {
+			ir = comp.Mod.String()
+			if out, writeErr := writeLLVMIRArtifact(cfg, ir); writeErr != nil {
+				return CompileResult{}, utils.Errorf("LLVM verification failed after adding main wrapper: %v; additionally failed to write LLVM IR: %v", err, writeErr)
+			} else {
+				log.Infof("LLVM IR written to: %s", out)
+			}
+		}
 		return CompileResult{}, utils.Errorf("LLVM verification failed after adding main wrapper: %v", err)
 	}
 
 	// Regenerate IR because we modified the module (renamed function + wrapper).
 	ir = comp.Mod.String()
-
-	if cfg.PrintIR {
-		fmt.Println(ir)
-	}
-
-	outputFile := cfg.OutputFile
-	if outputFile == "" {
-		if runtime.GOOS == "windows" {
-			outputFile = "a.exe"
-		} else {
-			outputFile = "a.out"
-		}
-	}
-
-	if cfg.EmitLLVM {
-		if outputFile == cfg.OutputFile && outputFile != "" {
-		} else {
-			outputFile = replaceExt(cfg.SourceFile, ".ll")
-		}
-		if err := os.WriteFile(outputFile, []byte(ir), 0644); err != nil {
-			return CompileResult{}, utils.Errorf("failed to write LLVM IR: %v", err)
-		}
-		log.Infof("LLVM IR written to: %s", outputFile)
-		if dst := finalOutputPath(cfg); strings.TrimSpace(dst) != "" {
-			if err := CopyFilePreserveMode(outputFile, dst); err != nil {
-				return CompileResult{}, err
-			}
-		}
-		return CompileResult{WorkDir: cfg.WorkDir, Artifact: outputFile, CacheHit: false}, nil
-	}
 
 	tmpLL, err := os.CreateTemp(cfg.WorkDir, "ssa2llvm-*.ll")
 	if err != nil {
@@ -533,12 +656,56 @@ func compileWithConfig(cfg *CompileConfig) (CompileResult, error) {
 	}
 	tmpLL.Close()
 
+	finalLL := tmpLL.Name()
+	interopTemps := []string{}
+	if llAfterInterop, temps, err := applyLLVMInterop(cfg, tmpLL.Name()); err != nil {
+		return CompileResult{}, err
+	} else {
+		finalLL = llAfterInterop
+		interopTemps = temps
+	}
+	for _, p := range interopTemps {
+		path := p
+		defer os.Remove(path)
+	}
+
+	if cfg.PrintIR {
+		data, err := os.ReadFile(finalLL)
+		if err != nil {
+			return CompileResult{}, utils.Errorf("failed to read final LLVM IR: %v", err)
+		}
+		fmt.Println(string(data))
+	}
+
+	outputFile := cfg.OutputFile
+	if outputFile == "" {
+		if runtime.GOOS == "windows" {
+			outputFile = "a.exe"
+		} else {
+			outputFile = "a.out"
+		}
+	}
+
+	if cfg.EmitLLVM {
+		data, err := os.ReadFile(finalLL)
+		if err != nil {
+			return CompileResult{}, utils.Errorf("failed to read final LLVM IR: %v", err)
+		}
+		if out, err := writeLLVMIRArtifact(cfg, string(data)); err != nil {
+			return CompileResult{}, utils.Errorf("failed to write LLVM IR: %v", err)
+		} else {
+			outputFile = out
+		}
+		log.Infof("LLVM IR written to: %s", outputFile)
+		return CompileResult{WorkDir: cfg.WorkDir, Artifact: outputFile, CacheHit: false}, nil
+	}
+
 	if cfg.EmitAsm {
 		if outputFile == cfg.OutputFile && outputFile != "" {
 		} else {
 			outputFile = replaceExt(cfg.SourceFile, ".s")
 		}
-		if err := CompileLLVMToAsm(tmpLL.Name(), outputFile); err != nil {
+		if err := CompileLLVMToAsm(finalLL, outputFile); err != nil {
 			return CompileResult{}, err
 		}
 		log.Infof("Assembly written to: %s", outputFile)
@@ -555,7 +722,7 @@ func compileWithConfig(cfg *CompileConfig) (CompileResult, error) {
 		} else {
 			outputFile = replaceExt(cfg.SourceFile, ".o")
 		}
-		if err := CompileLLVMToObject(tmpLL.Name(), outputFile); err != nil {
+		if err := CompileLLVMToObject(finalLL, outputFile); err != nil {
 			return CompileResult{}, err
 		}
 		log.Infof("Object file written to: %s", outputFile)
@@ -567,7 +734,82 @@ func compileWithConfig(cfg *CompileConfig) (CompileResult, error) {
 		return CompileResult{WorkDir: cfg.WorkDir, Artifact: outputFile, CacheHit: false}, nil
 	}
 
-	if err := CompileLLVMToBinary(tmpLL.Name(), outputFile, !cfg.SkipRuntimeLink, cfg.RuntimeArchive, cfg.ExtraLinkArgs...); err != nil {
+	linkingNative := !cfg.SkipRuntimeLink
+	if linkingNative && strings.TrimSpace(cfg.RuntimeArchive) == "" && cfg.StdlibCompile {
+		deps := runtimeDepsFromCompiler(comp)
+		archivePath, gcLibDir, buildErr := embed.BuildPrunedRuntimeArchiveFromEmbeddedSourceWithDeps(cfg.WorkDir, deps)
+		if errors.Is(buildErr, embed.ErrNoEmbeddedRuntimeSource) {
+			archivePath, gcLibDir, buildErr = embed.BuildPrunedRuntimeArchiveFromLocalSourceWithDeps(cfg.WorkDir, deps)
+		}
+		if buildErr == nil {
+			runtimeArchive = archivePath
+			cfg.RuntimeArchive = archivePath
+			if strings.TrimSpace(gcLibDir) != "" {
+				extraLinkArgs = append(extraLinkArgs, "-L"+gcLibDir)
+				cfg.ExtraLinkArgs = extraLinkArgs
+			}
+		} else if errors.Is(buildErr, embed.ErrUnsupportedPrunedRuntime) || errors.Is(buildErr, embed.ErrNoEmbeddedRuntimeSource) {
+			if archivePath, extractErr := embed.ExtractLibyakToDir(cfg.WorkDir); extractErr == nil {
+				runtimeArchive = archivePath
+				cfg.RuntimeArchive = archivePath
+			} else if extractErr != embed.ErrNoEmbeddedRuntime {
+				return CompileResult{}, extractErr
+			}
+			if _, gcErr := embed.ExtractLibgcToDir(cfg.WorkDir); gcErr == nil {
+				extraLinkArgs = append(extraLinkArgs, "-L"+cfg.WorkDir)
+				cfg.ExtraLinkArgs = extraLinkArgs
+			} else if gcErr != embed.ErrNoEmbeddedRuntime {
+				return CompileResult{}, gcErr
+			}
+			if strings.TrimSpace(cfg.RuntimeArchive) == "" {
+				p, err := findRuntimeArchive()
+				if err == nil {
+					cfg.RuntimeArchive = p
+					runtimeArchive = p
+				} else {
+					archivePath, gcLibDir, fullBuildErr := embed.BuildRuntimeArchiveFromLocalSource(cfg.WorkDir)
+					if fullBuildErr != nil {
+						return CompileResult{}, fullBuildErr
+					}
+					cfg.RuntimeArchive = archivePath
+					runtimeArchive = archivePath
+					if strings.TrimSpace(gcLibDir) != "" {
+						extraLinkArgs = append(extraLinkArgs, "-L"+gcLibDir)
+						cfg.ExtraLinkArgs = extraLinkArgs
+					}
+				}
+			}
+		} else {
+			return CompileResult{}, buildErr
+		}
+	}
+	var linkprepCleanup func()
+	if linkingNative && len(cfg.RuntimeSymManifest) > 0 && strings.TrimSpace(cfg.RuntimeArchive) != "" {
+		archives := []string{filepath.Clean(cfg.RuntimeArchive)}
+		for _, o := range cfg.ObfArchives {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				archives = append(archives, filepath.Clean(o))
+			}
+		}
+		out, cleanup, lpErr := linkprep.PrepareForLink(linkprep.PrepareInput{
+			Archives: archives,
+			Manifest: cfg.RuntimeSymManifest,
+			WorkDir:  cfg.WorkDir,
+			Trace:    cfg.Trace,
+		})
+		if lpErr != nil {
+			return CompileResult{}, utils.Errorf("linkprep: %v", lpErr)
+		}
+		linkprepCleanup = cleanup
+		defer linkprepCleanup()
+		cfg.RuntimeArchive = out[0]
+		if len(out) > 1 {
+			cfg.ObfArchives = append([]string{}, out[1:]...)
+		}
+	}
+
+	if err := CompileLLVMToBinary(finalLL, outputFile, !cfg.SkipRuntimeLink, cfg.RuntimeArchive, cfg.ObfArchives, cfg.ExtraLinkArgs...); err != nil {
 		return CompileResult{}, err
 	}
 
@@ -612,6 +854,40 @@ func finalOutputPath(cfg *CompileConfig) string {
 	}
 }
 
+func llvmOutputPath(cfg *CompileConfig) string {
+	if cfg == nil {
+		return "ssa2llvm.ll"
+	}
+	if out := strings.TrimSpace(cfg.OutputFile); out != "" {
+		return out
+	}
+	if src := strings.TrimSpace(cfg.SourceFile); src != "" {
+		return replaceExt(src, ".ll")
+	}
+	if workDir := strings.TrimSpace(cfg.WorkDir); workDir != "" {
+		return filepath.Join(workDir, "ssa2llvm.ll")
+	}
+	return "ssa2llvm.ll"
+}
+
+func writeLLVMIRArtifact(cfg *CompileConfig, ir string) (string, error) {
+	outputFile := llvmOutputPath(cfg)
+	if dir := filepath.Dir(outputFile); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+	}
+	if err := os.WriteFile(outputFile, []byte(ir), 0o644); err != nil {
+		return "", err
+	}
+	if dst := finalOutputPath(cfg); strings.TrimSpace(dst) != "" && filepath.Clean(dst) != filepath.Clean(outputFile) {
+		if err := CopyFilePreserveMode(outputFile, dst); err != nil {
+			return "", err
+		}
+	}
+	return outputFile, nil
+}
+
 func addMainWrapper(ir, entryFunc string, printEntryResult bool) string {
 	// Construct call target name
 	// If entryFunc is "check", target is "@check"
@@ -621,28 +897,31 @@ func addMainWrapper(ir, entryFunc string, printEntryResult bool) string {
 		callTarget = "@\"@main\""
 	}
 
+	atGC := "@" + abi.RuntimeGCSymbol
+	atPrint := "@" + abi.InternalPrintIntSymbol
+
 	gcDecl := ""
-	if !strings.Contains(ir, "@yak_runtime_gc") {
-		gcDecl = "\ndeclare void @yak_runtime_gc()\n"
+	if !strings.Contains(ir, atGC) {
+		gcDecl = "\ndeclare void @" + abi.RuntimeGCSymbol + "()\n"
 	}
 	printDecl := ""
 	printCall := ""
 	if printEntryResult {
-		if !strings.Contains(ir, "@yak_internal_print_int") {
-			printDecl = "declare void @yak_internal_print_int(i64)\n"
+		if !strings.Contains(ir, atPrint) {
+			printDecl = "declare void @" + abi.InternalPrintIntSymbol + "(i64)\n"
 		}
-		printCall = "  call void @yak_internal_print_int(i64 %result)\n"
+		printCall = "  call void @" + abi.InternalPrintIntSymbol + "(i64 %result)\n"
 	}
 
 	mainWrapper := fmt.Sprintf(`%s%s
 define i32 @main() {
 entry:
   %%result = call i64 %s()
-%s  call void @yak_runtime_gc()
+%s  call void @%s()
   %%exit_code = trunc i64 %%result to i32
   ret i32 %%exit_code
 }
-`, gcDecl, printDecl, callTarget, printCall)
+`, gcDecl, printDecl, callTarget, printCall, abi.RuntimeGCSymbol)
 	return ir + mainWrapper
 }
 
@@ -676,7 +955,7 @@ func detectLanguageFromExt(filename string) string {
 }
 
 func buildSSAOptions(language string) []ssaconfig.Option {
-	var opts []ssaconfig.Option
+	opts := yakCompileSSAOptions()
 
 	if language != "" {
 		lang, err := ssaconfig.ValidateLanguage(language)
@@ -690,4 +969,41 @@ func buildSSAOptions(language string) []ssaconfig.Option {
 
 func appendObfuscatorNames(dst []string, names ...string) []string {
 	return append(dst, obfuscation.NormalizeNames(names)...)
+}
+
+func appendNormalizedCSV(dst []string, items ...string) []string {
+	for _, item := range items {
+		for _, part := range strings.Split(item, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			dst = append(dst, part)
+		}
+	}
+	return dst
+}
+
+func (cfg *CompileConfig) workDirForTemps() string {
+	if cfg == nil || strings.TrimSpace(cfg.WorkDir) == "" {
+		return os.TempDir()
+	}
+	return cfg.WorkDir
+}
+
+// mergeObfuscatorNames adds names from extra into base, deduplicating.
+func mergeObfuscatorNames(base, extra []string) []string {
+	seen := make(map[string]struct{}, len(base))
+	for _, n := range base {
+		seen[n] = struct{}{}
+	}
+	merged := append([]string{}, base...)
+	for _, n := range extra {
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		merged = append(merged, n)
+	}
+	return merged
 }

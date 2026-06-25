@@ -1,6 +1,7 @@
 package yakit
 
 import (
+	"fmt"
 	"hash/fnv"
 	"math"
 	"sort"
@@ -318,6 +319,16 @@ func providerSignature(cfg *ypb.ThirdPartyApplicationConfig) string {
 		builder.WriteString(extra[k])
 		builder.WriteString(";")
 	}
+	var headerBuilder strings.Builder
+	for _, header := range cfg.GetHeaders() {
+		if header == nil {
+			continue
+		}
+		headerBuilder.WriteString(header.GetKey())
+		headerBuilder.WriteString("=")
+		headerBuilder.WriteString(header.GetValue())
+		headerBuilder.WriteString(";")
+	}
 
 	return utils.CalcSha256(
 		cfg.GetType(),
@@ -326,11 +337,54 @@ func providerSignature(cfg *ypb.ThirdPartyApplicationConfig) string {
 		cfg.GetUserSecret(),
 		cfg.GetNamespace(),
 		cfg.GetDomain(),
+		cfg.GetBaseURL(),
+		cfg.GetEndpoint(),
 		cfg.GetWebhookURL(),
 		builder.String(),
+		headerBuilder.String(),
 		cfg.GetProxy(),
 		cfg.GetNoHttps(),
+		cfg.GetEnableEndpoint(),
+		cfg.GetEnableThinking(),
+		optionalBoolSig(cfg.EnableThinkingOpt),
+		optionalInt64Sig(cfg.MaxTokens),
+		optionalFloat64Sig(cfg.Temperature),
+		optionalFloat64Sig(cfg.TopP),
+		optionalInt64Sig(cfg.TopK),
+		optionalFloat64Sig(cfg.FrequencyPenalty),
+		reasoningEffortSig(cfg.ReasoningEffort),
 	)
+}
+
+func optionalBoolSig(p *bool) string {
+	if p == nil {
+		return ""
+	}
+	if *p {
+		return "1"
+	}
+	return "0"
+}
+
+func optionalInt64Sig(p *int64) string {
+	if p == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d", *p)
+}
+
+func optionalFloat64Sig(p *float64) string {
+	if p == nil {
+		return ""
+	}
+	return fmt.Sprintf("%g", *p)
+}
+
+func reasoningEffortSig(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return strings.TrimSpace(*p)
 }
 
 func providerIDFromHash(hash string) int64 {

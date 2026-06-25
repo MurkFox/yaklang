@@ -13,7 +13,6 @@ import (
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/omnisearch/ostype"
 	"github.com/yaklang/yaklang/common/omnisearch/searchers"
-	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/lowhttp"
 )
@@ -193,16 +192,17 @@ func (c *ServerConfig) serveWebSearch(conn net.Conn, rawPacket []byte) {
 		}
 		apiKey = key
 
-		// Check traffic limit for API key users
-		trafficAllowed, err := CheckAiApiKeyTrafficLimit(key.Key)
+		// 字节流量限额已停用：web search 同样改用 Token 维度限额。
+		// 关键词: web search 字节流量限额停用, CheckAiApiKeyTokenLimit
+		tokenAllowed, err := CheckAiApiKeyTokenLimit(key.Key)
 		if err != nil {
-			c.logError("failed to check traffic limit for key %s: %v", utils.ShrinkString(key.Key, 8), err)
-		} else if !trafficAllowed {
-			c.logError("API key %s has exceeded traffic limit", utils.ShrinkString(key.Key, 8))
+			c.logError("failed to check token limit for key %s: %v", utils.ShrinkString(key.Key, 8), err)
+		} else if !tokenAllowed {
+			c.logError("API key %s has exceeded token limit", utils.ShrinkString(key.Key, 8))
 			c.writeJSONResponse(conn, http.StatusTooManyRequests, map[string]interface{}{
 				"error": map[string]string{
-					"message": "API key has exceeded traffic limit",
-					"type":    "traffic_limit_exceeded",
+					"message": "API key has exceeded token limit",
+					"type":    "token_limit_exceeded",
 				},
 			})
 			return
@@ -318,7 +318,7 @@ func (c *ServerConfig) serveWebSearch(conn net.Conn, rawPacket []byte) {
 // resolveWebSearchKeys finds active search API keys for the given searcher type.
 // If searcherType is empty or has no available keys, it auto-selects any type that has active keys.
 // Returns: active keys, resolved searcher type, error
-func (c *ServerConfig) resolveWebSearchKeys(searcherType string) ([]*schema.WebSearchApiKey, string, error) {
+func (c *ServerConfig) resolveWebSearchKeys(searcherType string) ([]*WebSearchApiKey, string, error) {
 	// If a specific type is requested, try to find keys for that type first
 	if searcherType != "" {
 		keys, err := GetActiveWebSearchApiKeysByType(searcherType)
@@ -349,7 +349,7 @@ func (c *ServerConfig) resolveWebSearchKeys(searcherType string) ([]*schema.WebS
 	}
 
 	// Group active keys by type, pick the type with the most keys
-	typeKeys := map[string][]*schema.WebSearchApiKey{}
+	typeKeys := map[string][]*WebSearchApiKey{}
 	for _, k := range allActiveKeys {
 		typeKeys[k.SearcherType] = append(typeKeys[k.SearcherType], k)
 	}
@@ -369,8 +369,8 @@ func (c *ServerConfig) resolveWebSearchKeys(searcherType string) ([]*schema.WebS
 }
 
 // filterActiveKeys returns only active keys from the given list
-func filterActiveKeys(keys []*schema.WebSearchApiKey) []*schema.WebSearchApiKey {
-	active := make([]*schema.WebSearchApiKey, 0, len(keys))
+func filterActiveKeys(keys []*WebSearchApiKey) []*WebSearchApiKey {
+	active := make([]*WebSearchApiKey, 0, len(keys))
 	for _, k := range keys {
 		if k.Active {
 			active = append(active, k)
@@ -381,9 +381,9 @@ func filterActiveKeys(keys []*schema.WebSearchApiKey) []*schema.WebSearchApiKey 
 
 // tryWebSearchWithKeys attempts to perform a web search using the provided keys
 // Keys are randomly shuffled, and on failure, the next key is tried
-func (c *ServerConfig) tryWebSearchWithKeys(keys []*schema.WebSearchApiKey, req *WebSearchRequest) ([]*ostype.OmniSearchResult, error) {
+func (c *ServerConfig) tryWebSearchWithKeys(keys []*WebSearchApiKey, req *WebSearchRequest) ([]*ostype.OmniSearchResult, error) {
 	// Copy and randomly shuffle the keys
-	shuffled := make([]*schema.WebSearchApiKey, len(keys))
+	shuffled := make([]*WebSearchApiKey, len(keys))
 	copy(shuffled, keys)
 	rand.Shuffle(len(shuffled), func(i, j int) {
 		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
@@ -421,7 +421,7 @@ func (c *ServerConfig) tryWebSearchWithKeys(keys []*schema.WebSearchApiKey, req 
 }
 
 // doWebSearch performs the actual search using the appropriate searcher client
-func (c *ServerConfig) doWebSearch(sk *schema.WebSearchApiKey, req *WebSearchRequest) ([]*ostype.OmniSearchResult, error) {
+func (c *ServerConfig) doWebSearch(sk *WebSearchApiKey, req *WebSearchRequest) ([]*ostype.OmniSearchResult, error) {
 	// Determine proxy: key-level proxy takes priority, then global proxy
 	proxy := sk.Proxy
 	if proxy == "" {
@@ -490,16 +490,8 @@ func (c *ServerConfig) sendWebSearchResponse(conn net.Conn, results []*ostype.Om
 		if err := IncrementAiApiKeyWebSearchCount(apiKey); err != nil {
 			log.Errorf("failed to increment web search count for api key: %v", err)
 		}
-		// Update traffic usage with model multiplier for "web-search"
-		multiplier := GetModelTrafficMultiplier("web-search")
-		totalTraffic := inputBytes + outputBytes
-		adjustedTraffic := int64(float64(totalTraffic) * multiplier)
-		if err := UpdateAiApiKeyTrafficUsed(apiKey, adjustedTraffic); err != nil {
-			log.Errorf("failed to update traffic usage for web search: %v", err)
-		} else {
-			log.Infof("web-search traffic usage updated: key=%s, input=%d, output=%d, multiplier=%.2f, adjusted=%d bytes",
-				utils.ShrinkString(apiKey, 8), inputBytes, outputBytes, multiplier, adjustedTraffic)
-		}
+		// 字节流量计费已停用：web search 不再按字节 * TrafficMultiplier 累加 TrafficUsed。
+		// 关键词: web search 字节流量计费停用
 	}()
 
 	c.writeJSONResponse(conn, http.StatusOK, resp)

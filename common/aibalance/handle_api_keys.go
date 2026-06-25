@@ -14,7 +14,6 @@ import (
 
 	uuid "github.com/google/uuid"
 	"github.com/jinzhu/gorm"
-	"github.com/yaklang/yaklang/common/schema"
 )
 
 // ==================== API Key Page Handlers ====================
@@ -141,8 +140,12 @@ func (c *ServerConfig) handleGenerateApiKey(conn net.Conn, request *http.Request
 	}
 
 	// Parse request body
+	// 关键词: handleGenerateApiKey username remark metainfo 创建携带绑定信息
 	var reqBody struct {
 		AllowedModels []string `json:"allowed_models"`
+		Username      string   `json:"username"`
+		Remark        string   `json:"remark"`
+		MetaInfo      string   `json:"metainfo"`
 	}
 
 	bodyBytes, err := io.ReadAll(request.Body)
@@ -167,7 +170,7 @@ func (c *ServerConfig) handleGenerateApiKey(conn net.Conn, request *http.Request
 	}
 
 	// Call function to generate and store API key
-	apiKey, err := c.generateAndStoreAPIKey(reqBody.AllowedModels)
+	apiKey, err := c.generateAndStoreAPIKey(reqBody.AllowedModels, reqBody.Username, reqBody.Remark, reqBody.MetaInfo)
 	if err != nil {
 		c.logError("Failed to generate and store API key: %v", err)
 		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]string{"error": "Failed to generate API key"})
@@ -180,13 +183,13 @@ func (c *ServerConfig) handleGenerateApiKey(conn net.Conn, request *http.Request
 
 // generateAndStoreAPIKey generates a new API key and stores it with associated models
 // API Key format: mf-{uuid} (e.g., mf-2e5565d7-5045-4311-bc74-b5b1247815d7)
-func (c *ServerConfig) generateAndStoreAPIKey(allowedModels []string) (string, error) {
+func (c *ServerConfig) generateAndStoreAPIKey(allowedModels []string, username, remark, metainfo string) (string, error) {
 	apiKey := "mf-" + uuid.New().String()
 	// Sort allowed models for consistent storage
 	sort.Strings(allowedModels)
 	allowedModelsStr := strings.Join(allowedModels, ",")
 
-	newKeyData := &schema.AiApiKeys{
+	newKeyData := &AiApiKeys{
 		APIKey:        apiKey,
 		AllowedModels: allowedModelsStr,
 		UsageCount:    0,
@@ -195,9 +198,13 @@ func (c *ServerConfig) generateAndStoreAPIKey(allowedModels []string) (string, e
 		InputBytes:    0,
 		OutputBytes:   0,
 		LastUsedTime:  time.Time{},
+		Username:      strings.TrimSpace(username),
+		Remark:        remark,
+		MetaInfo:      metainfo,
 	}
 
-	err := SaveAiApiKey(newKeyData.APIKey, newKeyData.AllowedModels)
+	// 使用 SaveAiApiKeyRecord 以便携带 Username/Remark/MetaInfo 扩展字段落库
+	err := SaveAiApiKeyRecord(newKeyData)
 	if err != nil {
 		c.logError("Failed to store new API key in database: %v", err)
 		return "", fmt.Errorf("failed to store new API key: %w", err)
@@ -450,7 +457,7 @@ func (c *ServerConfig) handleUpdateAPIKeyAllowedModels(conn net.Conn, request *h
 
 	// Sort allowed models for consistent storage
 	sort.Strings(reqBody.AllowedModels)
-	
+
 	// Update allowed models
 	allowedModelsStr := strings.Join(reqBody.AllowedModels, ",")
 	err = UpdateAiApiKeyAllowedModels(uint(id), allowedModelsStr)
@@ -781,6 +788,222 @@ func (c *ServerConfig) handleResetAPIKeyTraffic(conn net.Conn, request *http.Req
 	})
 }
 
+// ==================== API Key Token Limit Handlers ====================
+//
+// Token 维度限额是新推荐方式（流量限制语义不直观，且字节计费会因 ContentType
+// 与压缩等因素难以预估）。Token 维度直接按上游 SSE 末帧 ChatUsage 经四维倍率
+// 加权后入账，更接近真实计费成本。
+//
+// 关键词: handleUpdateAPIKeyTokenLimit handleResetAPIKeyToken,
+//        API Key Token 维度限额, 推荐使用 Token 替代 Traffic
+
+// handleUpdateAPIKeyTokenLimit handles POST /portal/api-key-token-limit/{id}.
+// Body: {"token_limit": int64 (raw token), "enable": bool}.
+// 单位说明: 直接传 raw token 数（未做 M 单位缩放），与字节限额保持对齐。
+func (c *ServerConfig) handleUpdateAPIKeyTokenLimit(conn net.Conn, request *http.Request, path string) {
+	c.logInfo("Processing update API key token limit request: %s", path)
+
+	if !c.checkAuth(request) {
+		c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
+		return
+	}
+
+	parts := strings.Split(path, "/")
+	if len(parts) < 4 {
+		c.logError("Invalid path format for update token limit: %s", path)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Invalid request path",
+		})
+		return
+	}
+
+	idStr := parts[len(parts)-1]
+	id, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		c.logError("Invalid API key ID '%s' for token limit update: %v", idStr, err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Invalid API key ID format",
+		})
+		return
+	}
+
+	var reqBody struct {
+		TokenLimit int64 `json:"token_limit"`
+		Enable     bool  `json:"enable"`
+	}
+	bodyBytes, err := io.ReadAll(request.Body)
+	if err != nil {
+		c.logError("Failed to read request body for token limit update: %v", err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Failed to read request body",
+		})
+		return
+	}
+	defer request.Body.Close()
+	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+		c.logError("Failed to parse request body for token limit update: %v", err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Invalid request format",
+		})
+		return
+	}
+	if reqBody.TokenLimit < 0 {
+		reqBody.TokenLimit = 0
+	}
+
+	if err := UpdateAiApiKeyTokenLimit(uint(id), reqBody.TokenLimit, reqBody.Enable); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.writeJSONResponse(conn, http.StatusNotFound, map[string]interface{}{
+				"success": false,
+				"message": "API key not found",
+			})
+			return
+		}
+		c.logError("Failed to update token limit for API key (ID: %d): %v", id, err)
+		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]interface{}{
+			"success": false,
+			"message": "Failed to update token limit",
+		})
+		return
+	}
+
+	c.logInfo("Successfully updated token limit for API key (ID: %d) limit=%d enable=%v",
+		id, reqBody.TokenLimit, reqBody.Enable)
+	c.writeJSONResponse(conn, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Token limit updated successfully",
+	})
+}
+
+// handleUpdateAPIKeyMeta handles POST /portal/api-key-meta/{id}.
+// 更新 API Key 绑定的用户名 / 备注 / metainfo（为 OAuth 等外部系统接入预留）。
+// 关键词: handleUpdateAPIKeyMeta, Username Remark MetaInfo 更新
+func (c *ServerConfig) handleUpdateAPIKeyMeta(conn net.Conn, request *http.Request, path string) {
+	c.logInfo("Processing update API key meta request: %s", path)
+
+	if !c.checkAuth(request) {
+		c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
+		return
+	}
+
+	parts := strings.Split(path, "/")
+	if len(parts) < 4 {
+		c.logError("Invalid path format for update api key meta: %s", path)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Invalid request path",
+		})
+		return
+	}
+
+	idStr := parts[len(parts)-1]
+	id, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		c.logError("Invalid API key ID '%s' for meta update: %v", idStr, err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Invalid API key ID format",
+		})
+		return
+	}
+
+	var reqBody struct {
+		Username string `json:"username"`
+		Remark   string `json:"remark"`
+		MetaInfo string `json:"metainfo"`
+	}
+	bodyBytes, err := io.ReadAll(request.Body)
+	if err != nil {
+		c.logError("Failed to read request body for meta update: %v", err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Failed to read request body",
+		})
+		return
+	}
+	defer request.Body.Close()
+	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+		c.logError("Failed to parse request body for meta update: %v", err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Invalid request format",
+		})
+		return
+	}
+
+	if err := UpdateAiApiKeyMeta(uint(id), reqBody.Username, reqBody.Remark, reqBody.MetaInfo); err != nil {
+		c.logError("Failed to update meta for API key (ID: %d): %v", id, err)
+		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]interface{}{
+			"success": false,
+			"message": "Failed to update API key meta",
+		})
+		return
+	}
+
+	c.logInfo("Successfully updated meta for API key (ID: %d) username=%q", id, strings.TrimSpace(reqBody.Username))
+	c.writeJSONResponse(conn, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "API key meta updated successfully",
+	})
+}
+
+// handleResetAPIKeyToken handles POST /portal/reset-api-key-token/{id}.
+func (c *ServerConfig) handleResetAPIKeyToken(conn net.Conn, request *http.Request, path string) {
+	c.logInfo("Processing reset API key token request: %s", path)
+
+	if !c.checkAuth(request) {
+		c.writeJSONResponse(conn, http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
+		return
+	}
+
+	parts := strings.Split(path, "/")
+	if len(parts) < 4 {
+		c.logError("Invalid path format for reset token: %s", path)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Invalid request path",
+		})
+		return
+	}
+
+	idStr := parts[len(parts)-1]
+	id, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		c.logError("Invalid API key ID '%s' for token reset: %v", idStr, err)
+		c.writeJSONResponse(conn, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"message": "Invalid API key ID format",
+		})
+		return
+	}
+
+	if err := ResetAiApiKeyTokenUsed(uint(id)); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.writeJSONResponse(conn, http.StatusNotFound, map[string]interface{}{
+				"success": false,
+				"message": "API key not found",
+			})
+			return
+		}
+		c.logError("Failed to reset token for API key (ID: %d): %v", id, err)
+		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]interface{}{
+			"success": false,
+			"message": "Failed to reset token",
+		})
+		return
+	}
+
+	c.logInfo("Successfully reset token used for API key (ID: %d)", id)
+	c.writeJSONResponse(conn, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Token usage reset successfully",
+	})
+}
+
 // ==================== API Key Pagination Handlers ====================
 
 // handleGetAPIKeysPaginated handles requests to get API keys with pagination
@@ -819,8 +1042,12 @@ func (c *ServerConfig) handleGetAPIKeysPaginated(conn net.Conn, request *http.Re
 		sortOrder = "desc"
 	}
 
+	// 可选：按绑定用户名精确过滤（用户名可重复，便于管理员查看某个用户的所有 Key）
+	// 关键词: handleGetAPIKeysPaginated username 过滤
+	usernameFilter := strings.TrimSpace(query.Get("username"))
+
 	// Get paginated API keys
-	keys, total, err := GetAiApiKeysPaginated(page, pageSize, sortBy, sortOrder)
+	keys, total, err := GetAiApiKeysPaginatedFiltered(page, pageSize, sortBy, sortOrder, usernameFilter)
 	if err != nil {
 		c.logError("Failed to get paginated API keys: %v", err)
 		c.writeJSONResponse(conn, http.StatusInternalServerError, map[string]interface{}{
@@ -843,6 +1070,8 @@ func (c *ServerConfig) handleGetAPIKeysPaginated(conn net.Conn, request *http.Re
 		sort.Strings(models)
 		sortedAllowedModels := strings.Join(models, ",")
 
+		// 同时返回字节维度与 Token 维度（后者推荐使用，前者仅为兼容旧版本展示）。
+		// 关键词: handleGetAPIKeysPaginated token_limit token_used 暴露
 		keyData := map[string]interface{}{
 			"id":                   key.ID,
 			"api_key":              key.APIKey,
@@ -858,9 +1087,15 @@ func (c *ServerConfig) handleGetAPIKeysPaginated(conn net.Conn, request *http.Re
 			"traffic_limit":        key.TrafficLimit,
 			"traffic_used":         key.TrafficUsed,
 			"traffic_limit_enable": key.TrafficLimitEnable,
+			"token_limit":          key.TokenLimit,
+			"token_used":           key.TokenUsed,
+			"token_limit_enable":   key.TokenLimitEnable,
 			"created_at":           key.CreatedAt.Format("2006-01-02 15:04:05"),
 			"created_by_ops_id":    key.CreatedByOpsID,
 			"created_by_ops_name":  key.CreatedByOpsName,
+			"username":             key.Username,
+			"remark":               key.Remark,
+			"metainfo":             key.MetaInfo,
 		}
 
 		if !key.LastUsedTime.IsZero() {

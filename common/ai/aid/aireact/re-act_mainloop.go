@@ -134,6 +134,7 @@ func (r *ReAct) processReActTask(task aicommon.AIStatefulTask) {
 	// 从任务中提取用户输入
 	userInput := task.GetUserInput()
 
+	log.Info("start to handle ensure work directory and session title for ReAct task")
 	r.ensureWorkDirectory(userInput) // must be first: creates artifact dir + session title
 	r.ensureSessionTitle(userInput)  // will skip if already done by ensureWorkDirectory
 
@@ -238,11 +239,8 @@ func (r *ReAct) ExecuteLoopTaskIF(taskTypeName string, task aicommon.AIStatefulT
 func (r *ReAct) ExecuteLoopTask(taskTypeName string, task aicommon.AIStatefulTask, options ...reactloops.ReActLoopOption) (bool, error) {
 	memoryFlushBuffer := aicommon.NewMemoryFlushBuffer("react", r.config.TimelineDiffer, nil)
 	defer memoryFlushBuffer.Close()
-	defaultOptions := []reactloops.ReActLoopOption{
-		reactloops.WithMemoryTriage(r.memoryTriage),
-		reactloops.WithMemoryPool(r.config.MemoryPool),
-		reactloops.WithMemorySizeLimit(int(r.config.MemoryPoolSize)),
-		reactloops.WithEnableSelfReflection(r.config.EnableSelfReflection),
+	defaultOptions := reactloops.BasicAICommonConfigOption(r.config)
+	defaultOptions = append(defaultOptions,
 		reactloops.WithOnAsyncTaskTrigger(func(i *reactloops.LoopAction, task aicommon.AIStatefulTask) {
 			r.SetCurrentPlanExecutionTask(task)
 		}),
@@ -310,7 +308,7 @@ func (r *ReAct) ExecuteLoopTask(taskTypeName string, task aicommon.AIStatefulTas
 							}
 
 							if len(searchResult.Memories) > 0 {
-								log.Infof("found %d relevant memories for completed task %s (total: %d bytes)", len(searchResult.Memories), task.GetId(), searchResult.ContentBytes)
+								log.Infof("found %d relevant memories for completed task %s (total: %d tokens)", len(searchResult.Memories), task.GetId(), searchResult.ContentTokens)
 								if r.config.DebugEvent {
 									log.Infof("memory search summary: %s", searchResult.SearchSummary)
 								}
@@ -323,7 +321,8 @@ func (r *ReAct) ExecuteLoopTask(taskTypeName string, task aicommon.AIStatefulTas
 			})
 		}),
 		reactloops.WithAllowAIForge(r.config.EnablePlanAndExec),
-	}
+		reactloops.WithAllowPlanAndExec(r.config.EnablePlanAndExec),
+	)
 
 	defaultOptions = append(defaultOptions, options...)
 
@@ -337,6 +336,7 @@ func (r *ReAct) ExecuteLoopTask(taskTypeName string, task aicommon.AIStatefulTas
 
 	if r.GetCurrentPlanExecutionTask() != nil {
 		// have async plan execution task running, disable plan and exec in main loop
+		mainloop.RemoveAction(schema.AI_REACT_LOOP_ACTION_REQUEST_PLAN)
 		mainloop.RemoveAction(schema.AI_REACT_LOOP_ACTION_REQUEST_PLAN_EXECUTION)
 		mainloop.RemoveAction(schema.AI_REACT_LOOP_ACTION_REQUIRE_AI_BLUEPRINT)
 	}
@@ -432,7 +432,7 @@ func (r *ReAct) ensureWorkDirectory(userInput string) {
 
 	// try LiteForge to generate both folder_name and session_title
 	// use a tight timeout to avoid blocking the main flow
-	if trimmedInput != "" && !cfg.GetConfigBool(sessionTitleDisableKey) && cfg.OriginalAICallback != nil {
+	if trimmedInput != "" && !cfg.GetConfigBool(sessionTitleDisableKey) && cfg.GetOriginalAICallback() != nil {
 		func() {
 			defer func() {
 				if err := recover(); err != nil {
@@ -478,6 +478,7 @@ func (r *ReAct) ensureWorkDirectory(userInput string) {
 		if meta, err := yakit.GetAISessionMetaBySessionID(cfg.GetDB(), r.config.PersistentSessionId); err == nil {
 			if existing := strings.TrimSpace(meta.Title); existing != "" {
 				cfg.SetConfig("session_title", existing)
+				cfg.SetSessionTitle(existing)
 				cfg.SetConfig(sessionTitleGeneratedKey, true)
 				r.Emitter.EmitSessionTitle(existing)
 			}
@@ -521,11 +522,13 @@ func (r *ReAct) ensureWorkDirectory(userInput string) {
 		}
 		if updated {
 			cfg.SetConfig("session_title", sessionTitle)
+			cfg.SetSessionTitle(sessionTitle)
 			cfg.SetConfig(sessionTitleGeneratedKey, true)
 			r.Emitter.EmitSessionTitle(sessionTitle)
 		}
 	} else if sessionTitle != "" {
 		cfg.SetConfig("session_title", sessionTitle)
+		cfg.SetSessionTitle(sessionTitle)
 		cfg.SetConfig(sessionTitleGeneratedKey, true)
 		r.Emitter.EmitSessionTitle(sessionTitle)
 	}
@@ -574,6 +577,7 @@ func (r *ReAct) ensureSessionTitle(userInput string) {
 			return
 		}
 
+		log.Info("start to handle session-title-generator,  using speed-priority LiteForge for session title generation")
 		action, err := r.InvokeSpeedPriorityLiteForge(cfg.GetContext(), "session-title-generator", prompt, []aitool.ToolOption{
 			aitool.WithStringParam("session_title", aitool.WithParam_Description("Concise session title"), aitool.WithParam_MaxLength(50), aitool.WithParam_Required(true)),
 		})
@@ -598,6 +602,7 @@ func (r *ReAct) ensureSessionTitle(userInput string) {
 			}
 		}
 		cfg.SetConfig("session_title", sessionTitle)
+		r.config.SetSessionTitle(sessionTitle)
 		r.Emitter.EmitSessionTitle(sessionTitle)
 	}()
 }
@@ -649,8 +654,113 @@ func BuildReActInvoker(ctx context.Context, options ...aicommon.ConfigOption) (a
 	}
 	invoker.promptManager = NewPromptManager(invoker, workdir)
 
+	cfg.SetHotpatchCurrentTaskIdResolver(func() string {
+		return invoker.GetCurrentTaskId()
+	})
+
+	cfg.SetCapabilityHotpatchHandler(func(enable bool, caps []aicommon.EnabledCapability) {
+		loop := invoker.GetCurrentLoop()
+		if loop == nil {
+			return
+		}
+		ecm := loop.GetExtraCapabilities()
+		if ecm == nil {
+			return
+		}
+		toolMgr := invoker.config.GetAiToolManager()
+
+		for _, cap := range caps {
+			switch cap.Type {
+			case aicommon.EnabledCapabilityTypeTool, aicommon.EnabledCapabilityTypePlugin, aicommon.EnabledCapabilityTypeMCPTool:
+				if toolMgr == nil {
+					continue
+				}
+				if enable {
+					if tool, err := toolMgr.GetToolByName(cap.Name); err == nil && tool != nil {
+						ecm.AddTools(tool)
+					}
+				} else {
+					ecm.RemoveToolByName(cap.Name)
+				}
+			case aicommon.EnabledCapabilityTypeForge:
+				if enable {
+					reactloops.LoadEnabledForges(invoker.config, loop, []string{cap.Name})
+				} else {
+					ecm.RemoveForgeByName(cap.Name)
+				}
+			case aicommon.EnabledCapabilityTypeSkill:
+				if enable {
+					ecm.AddSkills(reactloops.ExtraSkillInfo{Name: cap.Name})
+				} else {
+					ecm.RemoveSkillByName(cap.Name)
+				}
+			}
+		}
+	})
+
 	// Register pending context providers
 	invoker.promptManager.cpm = cfg.ContextProviderManager
+
+	cfg.SetSkillHotloadHandler(func(skillNames []string) {
+		if len(skillNames) == 0 {
+			return
+		}
+		if loop := invoker.GetCurrentLoop(); loop != nil {
+			if mgr := loop.GetSkillsContextManager(); mgr != nil {
+				results := mgr.LoadSkills(skillNames)
+				for name, err := range results {
+					if err != nil {
+						log.Warnf("hotload skill %q failed: %v", name, err)
+					}
+				}
+			}
+		}
+	})
+
+	cfg.SetForgeHotloadHandler(func(forgeNames []string) {
+		if len(forgeNames) == 0 {
+			return
+		}
+		if loop := invoker.GetCurrentLoop(); loop != nil {
+			reactloops.LoadEnabledForges(invoker.config, loop, forgeNames)
+		}
+	})
+
+	cfg.SetSkillUnloadHandler(func(skillNames []string) {
+		if len(skillNames) == 0 {
+			return
+		}
+		if loop := invoker.GetCurrentLoop(); loop != nil {
+			if mgr := loop.GetSkillsContextManager(); mgr != nil {
+				for _, name := range skillNames {
+					if mgr.UnloadSkill(name) {
+						log.Infof("hot-unload skill %q from context", name)
+					}
+				}
+			}
+		}
+	})
+
+	cfg.SetForgeUnloadHandler(func(forgeNames []string) {
+		if len(forgeNames) == 0 {
+			return
+		}
+		if loop := invoker.GetCurrentLoop(); loop != nil {
+			if ecm := loop.GetExtraCapabilities(); ecm != nil {
+				for _, name := range forgeNames {
+					if ecm.RemoveForgeByName(name) {
+						log.Infof("hot-unload forge %q from extra capabilities", name)
+					}
+				}
+			}
+		}
+	})
+
+	// Register capability inventory emit handler using this invoker's own loop,
+	// so child invokers do not inherit the parent's react reference.
+	cfg.SetSessionSnapshotEmitHandler(func() {
+		reactloops.EmitSessionSnapshot(invoker.config, invoker.GetCurrentLoop(), invoker.GetCurrentTask())
+	})
 
 	// EmitPinDirectory is deferred to ensureWorkDirectory when user input arrives
 

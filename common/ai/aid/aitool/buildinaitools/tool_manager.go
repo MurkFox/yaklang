@@ -3,6 +3,7 @@ package buildinaitools
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/yaklang/yaklang/common/ai/aid/aitool"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools/searchtools"
 	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools/yakscripttools"
+	"github.com/yaklang/yaklang/common/ai/ytoken"
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/schema"
@@ -20,7 +22,7 @@ import (
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 )
 
-const defaultRecentToolCacheMaxBytes = 40 * 1024 // 40KB
+const defaultRecentToolCacheMaxTokens = 30 * 1024
 
 func isSupportedRecentToolAITagParamName(paramName string) bool {
 	if paramName == "" {
@@ -76,10 +78,11 @@ type AiToolManager struct {
 	forgeSearchTool       []*aitool.Tool
 	noCacheTools          bool // 是否不缓存工具
 	enableAllTools        bool // 是否开启所有工具
+	disallowMCPServers    bool // when true, hide MCP tools from search/list/lookup paths
 
 	recentToolsCache []*RecentToolEntry
 	recentToolsMu    sync.Mutex
-	maxCacheBytes    int
+	maxCacheTokens   int
 }
 
 // ToolManagerOption 定义工具管理器的配置选项
@@ -186,6 +189,14 @@ func WithSearchToolEnabled(enabled bool) ToolManagerOption {
 	}
 }
 
+// WithDisallowMCPServers hides MCP tools from search, prompt inventory, and name lookup.
+func WithDisallowMCPServers(disallow bool) ToolManagerOption {
+	return func(m *AiToolManager) {
+		m.disallowMCPServers = disallow
+		m.searchTool = nil
+	}
+}
+
 func NewToolManagerByToolGetter(getter func() []*aitool.Tool, options ...ToolManagerOption) *AiToolManager {
 	manager := &AiToolManager{
 		toolsGetter:           getter,
@@ -200,6 +211,23 @@ func NewToolManagerByToolGetter(getter func() []*aitool.Tool, options ...ToolMan
 	}
 
 	return manager
+}
+
+// SetDisallowMCPServers updates MCP visibility policy and invalidates cached search tools.
+func (m *AiToolManager) SetDisallowMCPServers(disallow bool) {
+	if m == nil {
+		return
+	}
+	m.disallowMCPServers = disallow
+	m.searchTool = nil
+}
+
+// DisallowMCPServers reports whether MCP tools are hidden from this manager.
+func (m *AiToolManager) DisallowMCPServers() bool {
+	if m == nil {
+		return false
+	}
+	return m.disallowMCPServers
 }
 
 // NewToolManager 创建一个新的默认工具管理器实例
@@ -223,6 +251,11 @@ func (m *AiToolManager) safeToolsGetter() []*aitool.Tool {
 		return []*aitool.Tool{}
 	}
 	allTools := m.toolsGetter()
+	if m.disallowMCPServers {
+		allTools = lo.Filter(allTools, func(tool *aitool.Tool, _ int) bool {
+			return !IsMCPToolName(tool.Name)
+		})
+	}
 	if len(m.disableTools) > 0 {
 		allTools = lo.Filter(allTools, func(tool *aitool.Tool, _ int) bool {
 			_, ok := m.disableTools[tool.Name]
@@ -272,7 +305,7 @@ func (m *AiToolManager) getForgeSearchTools() ([]*aitool.Tool, error) {
 				log.Errorf("get all ai forge error: %v", err)
 			}
 			return forgeList
-		}, searchtools.SearchForgeName)
+		}, searchtools.SearchForgeName, false)
 		if err != nil {
 			return nil, utils.Errorf("create ai forge search tools: %v", err)
 		}
@@ -285,7 +318,12 @@ func (m *AiToolManager) getSearchTools() ([]*aitool.Tool, error) {
 	if m.searchTool == nil {
 		var err error
 		// ai tool search tools
-		aiToolSearchTools, err := searchtools.CreateAISearchTools(m.aiToolsSearcher, m.safeToolsGetter, searchtools.SearchToolName)
+		aiToolSearchTools, err := searchtools.CreateAISearchTools(
+			m.aiToolsSearcher,
+			m.safeToolsGetter,
+			searchtools.SearchToolName,
+			!m.disallowMCPServers,
+		)
 		if err != nil {
 			log.Error(err)
 		}
@@ -330,7 +368,19 @@ func (m *AiToolManager) GetToolByName(name string) (*aitool.Tool, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("cannot find [%v] in ai_yak_tools, yak_scripts, or enabled tools", name)
+	// Look up cached MCP tool metadata using the compound name "mcp_{server}_{tool}".
+	// Skip when MCP servers are disabled for this runtime.
+	if !m.disallowMCPServers {
+		mcpCfg, mcpErr := yakit.GetMCPServerToolConfigByFullName(db, name)
+		if mcpErr == nil && mcpCfg.Enable && mcpCfg.Description != "" {
+			stub := buildStubToolFromMCPCache(name, mcpCfg)
+			if stub != nil {
+				return stub, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("cannot find [%v] in ai_yak_tools, yak_scripts, mcp cache, or enabled tools", name)
 }
 
 // SearchTools 通过字符串搜索相关工具
@@ -348,11 +398,18 @@ func (m *AiToolManager) SearchTools(method string, query string) ([]*aitool.Tool
 // EnableTool 开启单个工具
 func (m *AiToolManager) EnableTool(name string) {
 	m.toolEnabled[name] = true
+	if m.disableTools != nil {
+		delete(m.disableTools, name)
+	}
 }
 
 // DisableTool 关闭单个工具
 func (m *AiToolManager) DisableTool(name string) {
 	m.toolEnabled[name] = false
+	if m.disableTools == nil {
+		m.disableTools = make(map[string]struct{})
+	}
+	m.disableTools[name] = struct{}{}
 }
 
 func (m *AiToolManager) AppendTools(tools ...*aitool.Tool) error {
@@ -381,6 +438,24 @@ func (m *AiToolManager) AppendTools(tools ...*aitool.Tool) error {
 	return nil
 }
 
+// RestrictToTools confines the manager to exactly the named tools: it clears the
+// "enable all" shortcut and both searchers, then enables only the given names.
+// Session-scoped MCP mounts use this so the agent cannot reach builtin/profile
+// tools (e.g. the local "ssa-risk" yak tool) and is limited to the injected set.
+func (m *AiToolManager) RestrictToTools(names ...string) {
+	if m == nil {
+		return
+	}
+	m.enableAllTools = false
+	m.enableSearchTool = false
+	m.enableForgeSearchTool = false
+	enabled := make(map[string]bool, len(names))
+	for _, name := range names {
+		enabled[name] = true
+	}
+	m.toolEnabled = enabled
+}
+
 // OverrideToolByName replaces all tools with the given name, keeping only the new one.
 // If no tool with that name exists, the new tool is appended.
 func (m *AiToolManager) OverrideToolByName(newTool *aitool.Tool) {
@@ -406,6 +481,24 @@ func (m *AiToolManager) OverrideToolByName(newTool *aitool.Tool) {
 	m.EnableTool(newTool.Name)
 }
 
+// RemoveToolByName drops every tool with the given name from the in-memory registry.
+func (m *AiToolManager) RemoveToolByName(name string) {
+	if name == "" {
+		return
+	}
+	originGetter := m.toolsGetter
+	m.toolsGetter = func() []*aitool.Tool {
+		var result []*aitool.Tool
+		for _, t := range originGetter() {
+			if t.Name != name {
+				result = append(result, t)
+			}
+		}
+		return result
+	}
+	m.DisableTool(name)
+}
+
 func (m *AiToolManager) EnableAIToolSearch(searcher searchtools.AISearcher[*aitool.Tool]) error {
 	m.enableSearchTool = true
 	m.aiToolsSearcher = searcher
@@ -418,15 +511,15 @@ func (m *AiToolManager) EnableAIForgeSearch(searcher searchtools.AISearcher[*sch
 	return nil
 }
 
-func (m *AiToolManager) getMaxCacheBytes() int {
-	if m.maxCacheBytes > 0 {
-		return m.maxCacheBytes
+func (m *AiToolManager) getMaxCacheTokens() int {
+	if m.maxCacheTokens > 0 {
+		return m.maxCacheTokens
 	}
-	return defaultRecentToolCacheMaxBytes
+	return defaultRecentToolCacheMaxTokens
 }
 
-func (m *AiToolManager) GetRecentToolCacheMaxBytes() int {
-	return m.getMaxCacheBytes()
+func (m *AiToolManager) GetRecentToolCacheMaxTokens() int {
+	return m.getMaxCacheTokens()
 }
 
 func (m *AiToolManager) totalCacheSize() int {
@@ -450,7 +543,7 @@ func (m *AiToolManager) AddRecentlyUsedTool(tool *aitool.Tool) {
 	desc := tool.GetDescription()
 	schemaStr := tool.ToJSONSchemaString()
 	usage := tool.GetUsage()
-	entrySize := len(name) + len(desc) + len(schemaStr) + len(usage)
+	entrySize := ytoken.CalcTokenCount(name) + ytoken.CalcTokenCount(desc) + ytoken.CalcTokenCount(schemaStr) + ytoken.CalcTokenCount(usage)
 
 	// remove existing entry with same name (will be re-appended at tail)
 	filtered := make([]*RecentToolEntry, 0, len(m.recentToolsCache))
@@ -470,8 +563,8 @@ func (m *AiToolManager) AddRecentlyUsedTool(tool *aitool.Tool) {
 	}
 	m.recentToolsCache = append(m.recentToolsCache, newEntry)
 
-	maxBytes := m.getMaxCacheBytes()
-	for m.totalCacheSize() > maxBytes && len(m.recentToolsCache) > 1 {
+	maxTokens := m.getMaxCacheTokens()
+	for m.totalCacheSize() > maxTokens && len(m.recentToolsCache) > 1 {
 		m.recentToolsCache = m.recentToolsCache[1:]
 	}
 }
@@ -503,6 +596,19 @@ func (m *AiToolManager) HasRecentlyUsedTools() bool {
 	return len(m.recentToolsCache) > 0
 }
 
+// RecentToolCacheStableNonce 是 CACHE_TOOL_CALL 块及其内部所有 AITAG (TOOL_xxx /
+// TOOL_PARAM_xxx) 渲染时使用的稳定 nonce 字面量. 跨 react turn 不变, 让承载
+// 该块的 prompt 段保持字节级稳定, 进入 prefix cache.
+//
+// 字面量必须与 aicommon.RecentToolCacheStableNonce 严格一致 (两边互不 import,
+// 各自定义本地副本; 不一致会导致渲染端写一种, 解析端注册另一种, callback
+// 不命中, 内容丢失). 当前两边都是 "[current-nonce]".
+//
+// 关键词: RecentToolCacheStableNonce, [current-nonce], 占位符语义,
+//
+//	与 aicommon.RecentToolCacheStableNonce 字面量严格一致
+const RecentToolCacheStableNonce = "[current-nonce]"
+
 const recentToolEntryTemplate = `<|TOOL_{{ .Name }}_{{ .Nonce }}|>
 ## Tool: {{ .Name }}
 Description: {{ .Description }}
@@ -523,7 +629,7 @@ Pass it directly as directly_call_tool_params. Do not wrap it with @action, tool
 ### Hybrid mode for block parameters
 Use JSON for simple fields and AITAG blocks for multi-line or escape-heavy fields such as command, body, packet, headers, script, content, query.
 
-Example:
+Example (the literal "{{ .Nonce }}" below is a placeholder; replace it with the SAME nonce that other AITAG blocks in this prompt are using, e.g. the nonce from <|USER_QUERY_xxxx|>):
 {"@action": "directly_call_tool", "directly_call_tool_name": "<name>", "directly_call_identifier": "<snake_case_intent>", "directly_call_expectations": "<timing and fallback>", "directly_call_tool_params": {"timeout": 20}}
 <|TOOL_PARAM_command_{{ .Nonce }}|>
 #!/bin/bash
@@ -531,9 +637,10 @@ echo "hello"
 <|TOOL_PARAM_command_END_{{ .Nonce }}|>
 
 AITAG rules:
-- Start tag: <|TOOL_PARAM_{param_name}_{{ .Nonce }}|>
-- End tag: <|TOOL_PARAM_{param_name}_END_{{ .Nonce }}|>
-- Copy the current nonce {{ .Nonce }} exactly. Do not reuse any old nonce.
+- Start tag: <|TOOL_PARAM_{param_name}_{nonce}|>
+- End tag:   <|TOOL_PARAM_{param_name}_END_{nonce}|>
+- The token "{{ .Nonce }}" written above in this prompt is a PLACEHOLDER for "the current per-turn nonce". When you emit your AITAG blocks, prefer to substitute it with the same nonce that is used by other AITAG blocks in this prompt (look at <|USER_QUERY_xxxx|> for the exact value).
+- If unsure, you may also keep the literal "{{ .Nonce }}" verbatim; the parser accepts both forms.
 - AITAG block values override same-named JSON params.
 - If all params are block-style, directly_call_tool_params may be omitted or left as an empty object.
 {{ if .ParamNames }}
@@ -601,7 +708,7 @@ func renderDirectlyCallParamsSchema(schemaSnippet string) string {
 	rendered := omap.NewEmptyOrderedMap[string, any]()
 	rendered.Set("$schema", "http://json-schema.org/draft-07/schema#")
 	rendered.Set("type", "object")
-	rendered.Set("description", "Only for directly_call_tool. Pass this object directly as directly_call_tool_params. Do not include @action, tool, or params wrapper. For multi-line content, use TOOL_PARAM_* AITAG blocks with the current nonce from CACHE_TOOL_CALL.")
+	rendered.Set("description", "Only for directly_call_tool. Pass this object directly as directly_call_tool_params. Do not include @action, tool, or params wrapper. For multi-line content, use TOOL_PARAM_* AITAG blocks with the literal nonce \""+RecentToolCacheStableNonce+"\" (a fixed string, NOT the per-turn nonce that other tags in this prompt use).")
 	if properties, ok := paramsSchema["properties"]; ok {
 		rendered.Set("properties", properties)
 	}
@@ -707,17 +814,25 @@ func (m *AiToolManager) ImportRecentToolCache(jsonStr string) {
 		existing[entry.Name] = struct{}{}
 	}
 
-	maxBytes := m.getMaxCacheBytes()
-	for m.totalCacheSize() > maxBytes && len(m.recentToolsCache) > 1 {
+	maxTokens := m.getMaxCacheTokens()
+	for m.totalCacheSize() > maxTokens && len(m.recentToolsCache) > 1 {
 		m.recentToolsCache = m.recentToolsCache[1:]
 	}
 }
 
-// GetRecentToolsSummary builds a prompt-friendly summary of cached tools within maxBytes.
+// GetRecentToolsSummary builds a prompt-friendly summary of cached tools within maxTokens.
 // Each tool is wrapped in AITAG boundaries <|TOOL_{name}_{nonce}|> to prevent confusion.
-func (m *AiToolManager) GetRecentToolsSummary(maxBytes int, nonce string) string {
+//
+// 注意: 自从 CACHE_TOOL_CALL 块迁到 semi-dynamic 段并加上 AI_CACHE_SEMI 缓存边界后,
+// 块内所有 AITAG (TOOL_xxx 包装 / TOOL_PARAM_xxx 示例) 的 nonce 一律使用字面量稳定
+// 常量 RecentToolCacheStableNonce, 让该段跨 turn 字节稳定、可命中 prefix cache.
+// 参数 nonce 保留是为了向后兼容旧调用方, 但不再参与渲染.
+//
+// 关键词: GetRecentToolsSummary, RecentToolCacheStableNonce, prefix cache
+func (m *AiToolManager) GetRecentToolsSummary(maxTokens int, nonce string) string {
 	m.recentToolsMu.Lock()
 	defer m.recentToolsMu.Unlock()
+	_ = nonce // 保留参数兼容旧调用; 真正用于渲染的是稳定 nonce.
 
 	if len(m.recentToolsCache) == 0 {
 		return ""
@@ -725,28 +840,103 @@ func (m *AiToolManager) GetRecentToolsSummary(maxBytes int, nonce string) string
 
 	var sb strings.Builder
 	sb.WriteString("# Recently Used Tools (available for directly_call_tool)\n\n")
-	totalLen := sb.Len()
+	totalTokens := ytoken.CalcTokenCount(sb.String())
 	entryWritten := false
 	for reverseIndex := len(m.recentToolsCache) - 1; reverseIndex >= 0; reverseIndex-- {
 		entry := m.recentToolsCache[reverseIndex]
 		block := utils.MustRenderTemplate(recentToolEntryTemplate, map[string]interface{}{
 			"Name":                 entry.Name,
-			"Nonce":                nonce,
+			"Nonce":                RecentToolCacheStableNonce,
 			"Description":          entry.Description,
 			"DisplaySchemaSnippet": renderDirectlyCallParamsSchema(entry.SchemaSnippet),
 			"Usage":                entry.Usage,
 		})
-		// Always include the most recent entry even if it exceeds maxBytes.
-		if entryWritten && maxBytes > 0 && totalLen+len(block) > maxBytes {
+		// Always include the most recent entry even if it exceeds maxTokens.
+		if entryWritten && maxTokens > 0 && totalTokens+ytoken.CalcTokenCount(block) > maxTokens {
 			break
 		}
 		sb.WriteString(block)
-		totalLen += len(block)
+		totalTokens += ytoken.CalcTokenCount(block)
 		entryWritten = true
 	}
 	if !entryWritten {
 		return ""
 	}
-	sb.WriteString(renderRecentToolSummaryFooter(nonce, m.getRecentToolParamNamesLocked()))
+	sb.WriteString(renderRecentToolSummaryFooter(RecentToolCacheStableNonce, m.getRecentToolParamNamesLocked()))
 	return sb.String()
+}
+
+// BuildStubToolFromMCPCachePublic is the exported wrapper for buildStubToolFromMCPCache.
+// Use this when pre-loading MCP stubs from outside the package (e.g., aireact).
+func BuildStubToolFromMCPCachePublic(fullName string, cfg *schema.MCPServerToolConfig) *aitool.Tool {
+	return buildStubToolFromMCPCache(fullName, cfg)
+}
+
+// buildStubToolFromMCPCache constructs a minimal aitool.Tool from cached MCP metadata.
+// The stub carries a real Callback that returns TOOL_INITIALIZING so the AI receives a
+// meaningful error and can fall back gracefully. If the MCP server comes back online,
+// the live tool (with a real network Callback) takes precedence via the in-memory tool
+// list populated by loadMCPServers.
+func buildStubToolFromMCPCache(fullName string, cfg *schema.MCPServerToolConfig) *aitool.Tool {
+	serverName := cfg.ServerName
+	toolName := cfg.ToolName
+
+	// Normalize description to match live tool format: [MCP:server] desc.
+	desc := cfg.Description
+	prefix := fmt.Sprintf("[MCP:%s] ", serverName)
+	if desc == "" {
+		desc = fmt.Sprintf("[MCP:%s] Tool from MCP server: %s (not yet connected)", serverName, serverName)
+	} else if !strings.HasPrefix(desc, prefix) {
+		desc = prefix + desc
+	}
+
+	opts := []aitool.ToolOption{
+		aitool.WithMCPPendingStub(true),
+		aitool.WithDescription(desc),
+		aitool.WithKeywords([]string{"mcp", serverName, toolName, "external", "remote"}),
+		aitool.WithVerboseName(fmt.Sprintf("%s (MCP:%s)", toolName, serverName)),
+		// Callback returns a retryable error so AI can degrade gracefully
+		// instead of crashing when the MCP server is still initializing.
+		aitool.WithSimpleCallback(func(params aitool.InvokeParams, stdout io.Writer, stderr io.Writer) (any, error) {
+			msg := fmt.Sprintf(
+				"MCP tool %q (server: %s) is not yet available — the MCP server is still connecting or unreachable. "+
+					"Please try a different approach or wait for the server to become ready.",
+				toolName, serverName,
+			)
+			fmt.Fprintln(stderr, msg)
+			return nil, utils.Errorf("%s %s", MCPToolInitializingErrPrefix, msg)
+		}),
+	}
+
+	// Reconstruct parameters from cached JSON.
+	if cfg.ParamsJSON != "" && cfg.ParamsJSON != "[]" {
+		type paramEntry struct {
+			Name        string `json:"name"`
+			Type        string `json:"type"`
+			Description string `json:"description"`
+			Default     string `json:"default"`
+			Required    bool   `json:"required"`
+		}
+		var entries []paramEntry
+		if err := json.Unmarshal([]byte(cfg.ParamsJSON), &entries); err == nil {
+			for _, e := range entries {
+				name := e.Name
+				paramOpts := []aitool.PropertyOption{
+					aitool.WithParam_Description(e.Description),
+				}
+				if e.Required {
+					paramOpts = append(paramOpts, aitool.WithParam_Required(true))
+				}
+				if e.Default != "" {
+					paramOpts = append(paramOpts, aitool.WithParam_Default(e.Default))
+				}
+				// Cached params are serialized as string type; numeric/boolean params
+				// will still work since MCP arguments are passed as interface{} values.
+				opts = append(opts, aitool.WithStringParam(name, paramOpts...))
+			}
+		}
+	}
+
+	tool := aitool.NewWithoutCallback(fullName, opts...)
+	return tool
 }

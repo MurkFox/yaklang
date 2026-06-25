@@ -36,6 +36,10 @@ type AiTask struct {
 	*Coordinator
 
 	*aicommon.AIStatefulTaskBase
+	// TaskId is a stable logical identifier for this plan task.
+	// It is generated when the plan tree is created and persists across index regeneration.
+	// NOTE: This is different from Index (hierarchical position like "1-2-3").
+	TaskId             string    `json:"task_id"`
 	Index              string    `json:"index"`
 	Name               string    `json:"name"`
 	Goal               string    `json:"goal"`
@@ -83,7 +87,6 @@ func (t *AiTask) GetUserInput() string {
 		}
 		return t.AIStatefulTaskBase.GetUserInput()
 	}
-	nonce := strings.ToLower(utils.RandStringBytes(6))
 
 	// 收集父任务链的输入（不包括当前任务）
 	var collectParentInputs func(task *AiTask, depth int) []string
@@ -100,7 +103,7 @@ func (t *AiTask) GetUserInput() string {
 
 		// 添加当前层父任务的输入
 		if task.ParentTask.AIStatefulTaskBase != nil {
-			input := task.ParentTask.AIStatefulTaskBase.GetUserInput()
+			input := stripPlanContextBlocks(task.ParentTask.AIStatefulTaskBase.GetUserInput())
 			if input != "" {
 				inputs = append(inputs, input)
 			}
@@ -118,7 +121,7 @@ func (t *AiTask) GetUserInput() string {
 	// 获取当前任务的输入
 	var currentInput string
 	if t.AIStatefulTaskBase != nil {
-		currentInput = t.AIStatefulTaskBase.GetUserInput()
+		currentInput = stripPlanContextBlocks(t.AIStatefulTaskBase.GetUserInput())
 	}
 
 	var rawUserInput string
@@ -127,6 +130,23 @@ func (t *AiTask) GetUserInput() string {
 	}
 
 	parentInputsJoined := strings.Join(parentInputs, "\n")
+
+	// nonce 反模式修复:
+	// 老实现是 nonce := strings.ToLower(utils.RandStringBytes(6))，每次调用
+	// PE-TASK 重新随机生成一次 nonce，让 <|PARENT_TASK_<nonce>|> /
+	// <|CURRENT_TASK_<nonce>|> / <|INSTRUCTION_<nonce>|> 三对标签每次都不同，
+	// 即使父任务链 + 当前任务 body 字节完全相同，整个 user-input 段也无法
+	// 被上游 prefix cache 命中。
+	//
+	// 新实现: 用 (rawUserInput, parentInputsJoined) 派生稳定 nonce，
+	// 让同一个 plan 周期内的所有 PE-TASK 子任务共用同一个 nonce。plan 重新
+	// 生成时, rawUserInput / parentInputsJoined 自然变化, nonce 随之变化,
+	// 不会污染新 plan 的缓存。
+	//
+	// 关键词: task user input nonce, plan scoped nonce, prefix cache,
+	//        反 RandStringBytes 反模式
+	nonce := aicommon.PlanScopedNonce(rawUserInput+"\n"+parentInputsJoined, "task_user_input")
+
 	parentBlock := ""
 	if parentInputsJoined != "" {
 		parentBlock = utils.MustRenderTemplate(`<|PARENT_TASK_{{ .nonce }}|>
@@ -167,6 +187,37 @@ func (t *AiTask) GetUserInput() string {
 	})
 }
 
+// GetUserInputSplitForCache 实现 aicommon.CacheableUserInputProvider, 把
+// PE-TASK 子任务的"完整 user input 块"全部归类为 frozenUserContext, rawQuery
+// 留空。
+//
+// 为什么 rawQuery 留空 (而非按用户原话拆出来):
+//   - PE-TASK 子任务执行时, 真正"本 turn 可变" 的内容在 dynamic 段的
+//     ReactiveData (PROGRESS_TASK + iter info + feedback) 里, USER_QUERY
+//     段对子任务执行不再增量提供信息。
+//   - 把用户原话也包进 frozenUserContext 一并冻结后, dynamic 段只剩
+//     reactive_data + injected_memory + extra_capabilities, 体积大幅下降,
+//     缓存边界更清晰。
+//
+// 普通 ReAct 路径 (ParentTask == nil): 用户原话不属于"可冻结历史", 让 task
+// 走老语义即可, 这里返回 (root user input, "")。
+//
+// 关键词: GetUserInputSplitForCache, PE-TASK frozen user context,
+//
+//	rawQuery 留空, prefix cache
+func (t *AiTask) GetUserInputSplitForCache() (rawQuery, frozenUserContext string) {
+	if utils.IsNil(t.ParentTask) {
+		// 普通 ReAct / root 任务: 用户原话保留在 dynamic 段, 不冻结
+		if t.AIStatefulTaskBase == nil {
+			return "", ""
+		}
+		return t.AIStatefulTaskBase.GetUserInput(), ""
+	}
+	// PE-TASK 子任务路径: 整个组合块 (RawUserInput + PARENT_TASK +
+	// CURRENT_TASK + INSTRUCTION) 一并冻结, dynamic 段不再渲染 USER_QUERY.
+	return "", t.GetUserInput()
+}
+
 func (t *AiTask) executed() bool {
 	if len(t.Subtasks) > 0 {
 		for _, subtask := range t.Subtasks {
@@ -199,6 +250,21 @@ func (t *AiTask) SetID(id string) {
 	if t.AIStatefulTaskBase != nil {
 		t.AIStatefulTaskBase.SetID(id)
 	}
+}
+
+// GetIndex returns the hierarchical plan position (e.g. "1-2-3") for UI grouping and prompts.
+// Stable logical identity is exposed via GetId()/TaskId instead.
+func (t *AiTask) GetIndex() string {
+	if t == nil {
+		return ""
+	}
+	if idx := strings.TrimSpace(t.Index); idx != "" {
+		return idx
+	}
+	if t.AIStatefulTaskBase != nil {
+		return t.AIStatefulTaskBase.GetIndex()
+	}
+	return ""
 }
 
 func (t *AiTask) GetSummary() string {
@@ -269,9 +335,12 @@ func (t *AiTask) MarshalJSON() ([]byte, error) {
 
 	// 创建一个不包含AICallback的结构体
 	return json.Marshal(struct {
+		TaskId               string    `json:"task_id,omitempty"`
 		Index                string    `json:"index"`
 		Name                 string    `json:"name"`
 		Goal                 string    `json:"goal"`
+		SemanticIdentifier   string    `json:"semantic_identifier"`
+		DependsOn            []string  `json:"depends_on,omitempty"`
 		Subtasks             []*AiTask `json:"subtasks,omitempty"`
 		Progress             string    `json:"progress"` // 添加进度字段
 		Summary              string    `json:"summary"`
@@ -283,9 +352,11 @@ func (t *AiTask) MarshalJSON() ([]byte, error) {
 		SuccessToolCallCount int       `json:"success_tool_call_count"`
 		FailToolCallCount    int       `json:"fail_tool_call_count"`
 	}{
+		TaskId:               t.TaskId,
 		Index:                t.Index,
 		Name:                 t.Name,
 		Goal:                 t.Goal,
+		DependsOn:            t.DependsOn,
 		Subtasks:             t.Subtasks,
 		Progress:             progress,
 		Summary:              t.GetSummary(),
@@ -296,6 +367,7 @@ func (t *AiTask) MarshalJSON() ([]byte, error) {
 		TotalToolCallCount:   int64(len(t.GetAllToolCallResults())),
 		SuccessToolCallCount: t.GetSuccessCallCount(),
 		FailToolCallCount:    t.GetFailCallCount(),
+		SemanticIdentifier:   t.SemanticIdentifier,
 	})
 }
 
@@ -303,6 +375,7 @@ func (t *AiTask) MarshalJSON() ([]byte, error) {
 func (t *AiTask) UnmarshalJSON(data []byte) error {
 	// 创建一个临时结构体，不包含AICallback
 	aux := struct {
+		TaskId   string    `json:"task_id,omitempty"`
 		Index    string    `json:"index"`
 		Name     string    `json:"name"`
 		Goal     string    `json:"goal"`
@@ -313,18 +386,35 @@ func (t *AiTask) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
+	t.TaskId = strings.TrimSpace(aux.TaskId)
 	t.Index = aux.Index
 	t.Name = aux.Name
 	t.Goal = aux.Goal
 	t.Subtasks = aux.Subtasks
-	t.AIStatefulTaskBase = aicommon.NewStatefulTaskBase(
-		fmt.Sprintf("pe-task-%s", t.Index),
-		aux.Goal,
-		t.Ctx,
-		nil)
+	if t.TaskId == "" {
+		// Backward compatibility for older persisted trees without task_id.
+		// Will be re-stabilized by Coordinator.ensureTaskTreeInitialized().
+		t.TaskId = fmt.Sprintf("pe-task-%s", t.Index)
+	}
+	t.AIStatefulTaskBase = aicommon.NewStatefulTaskBase(t.TaskId, aux.Goal, t.Ctx, nil)
 	return nil
 }
 
+// ExtractPlan 从 AI 原始响应中解析出任务计划（导出名为 aiagent.ExtractPlan）
+// 参数:
+//   - c: 协调器对象
+//   - rawResponse: AI 返回的原始文本
+//
+// 返回值:
+//   - 计划响应对象
+//   - 错误信息
+//
+// Example:
+// ```
+// // 需要可用的协调器与响应（示意性示例）
+// plan = aiagent.ExtractPlan(coordinator, rawResponse)~
+// dump(plan)
+// ```
 func ExtractPlan(c *Coordinator, rawResponse string) (*PlanResponse, error) {
 	at, err := ExtractTaskFromRawResponse(c, rawResponse)
 	if err != nil {
@@ -357,7 +447,6 @@ func _assignHierarchicalIndicesRecursive(currentTask *AiTask, currentIndex strin
 		return
 	}
 	currentTask.Index = currentIndex
-	currentTask.SetID(currentIndex)
 
 	for i, subTask := range currentTask.Subtasks {
 		// 子任务的索引是父任务索引加上自己的序号 (1-based)
@@ -461,4 +550,18 @@ func (t *AiTask) TaskContinueCount() int {
 		return reactLoop.GetCurrentIterationIndex()
 	}
 	return 0
+}
+
+func (t *AiTask) CanContinue() bool {
+	if t == nil {
+		return false
+	}
+	maxContinue := int64(0)
+	if t.Coordinator != nil {
+		maxContinue = t.Coordinator.MaxTaskContinue
+	}
+	if maxContinue <= 0 {
+		return true
+	}
+	return int64(t.TaskContinueCount()) < maxContinue
 }
